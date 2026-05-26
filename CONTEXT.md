@@ -13,36 +13,60 @@ The existing Python research core that plans research, gathers sources, builds c
 _Avoid_: Backend, server
 
 **Executa Wrapper**:
-The Anna stdio tool process that exposes the GPT Researcher Engine through JSON-RPC tool methods. It is a wrapper around the engine, not the engine itself.
+The previous MVP term for an Anna stdio tool process that wrapped research execution. For the refactored adapter, use Researcher Tool Backend when referring to the app's backend tool boundary.
 _Avoid_: FastAPI backend, web server
 
 **Anna App Shell**:
-The static SPA bundle loaded by Anna App Runtime to collect user input and display research results. It communicates through Anna host APIs rather than directly calling GPT Researcher's original HTTP/WebSocket endpoints.
+The static SPA bundle loaded by Anna App Runtime to collect user input, orchestrate frontend-owned research reasoning, and display research results. It communicates through Anna host APIs rather than directly calling GPT Researcher's original HTTP/WebSocket endpoints.
 _Avoid_: Original frontend, FastAPI static site
 
+**Researcher Tool Backend**:
+The independent Executa tool backend for the Anna Researcher App. It provides app-facing tool methods for local or large non-LLM work, and it is not the owner of LLM or Agent reasoning.
+_Avoid_: Executa Wrapper, FastAPI backend, GPT Researcher backend
+
+**Researcher Tool Protocol**:
+The Executa v2 stdio protocol boundary implemented by the Researcher Tool Backend. It supports v2 initialization for app tool calls but does not declare LLM sampling or Agent capabilities.
+_Avoid_: v1-only tool, backend sampling protocol, Agent-capable backend
+
+**Researcher Tool Project**:
+The standalone project directory that contains the Researcher Tool Backend source, tests, and packaging metadata. It is developed as an independent tool project rather than as source embedded inside an Anna App `executas` directory.
+_Avoid_: app executa source folder, copied backend, embedded tool implementation
+
+**App Executa Reference**:
+The minimal Anna App `executas` entry that points the app runtime at the Researcher Tool Project. It is a reference for discovery and launch, not the backend source of truth.
+_Avoid_: duplicated tool source, symlinked source tree, generated backend copy
+
 **Async Research Job**:
-A research run that starts in one Executa invocation and is observed by later invocations using a research identifier. One Anna App Adapter MVP can have many Async Research Jobs over time, and each job eventually produces one Research Result or a failure.
-_Avoid_: Synchronous run, blocking report generation
+A frontend-owned research run identified by a research identifier and backed by recoverable persisted data. The Researcher Tool Backend stores key backend step outputs, but it does not own the research advancement loop.
+_Avoid_: Backend-owned run, blocking report generation
 
 **Research Result**:
-The completed output of an Async Research Job, including the report text and selected metadata such as source URLs and costs. It is the user-facing product of the GPT Researcher Engine.
+The completed output of an Async Research Job, including the report text and selected metadata such as source URLs and costs. It is the user-facing product of Anna Researcher.
 _Avoid_: Raw logs, internal context
 
 **Executa Local Job Store**:
-The local storage owned by the Executa Wrapper for tracking Async Research Jobs and their Research Results. The Anna App Shell reads it only through tool methods, not by accessing files directly.
+The local storage owned by the Researcher Tool Backend for recoverable Async Research Job data and Research Results under `~/anna-workspace/.research`. The Anna App Shell reads and writes it only through App Tool Methods, not by accessing files directly.
 _Avoid_: Anna App Storage, browser storage, FastAPI report store
 
 **Research Tool Dispatcher**:
-The single tool method exposed by the Executa Wrapper for managing research actions such as starting a job, checking status, and reading a result. It uses an action parameter rather than separate tool methods for each operation.
-_Avoid_: Multiple research tools, endpoint-style tool methods
+The previous MVP term for a single action-dispatching tool method. For the refactored adapter, use App Tool Methods because the Researcher Tool Backend exposes explicit app-facing methods instead of an action parameter.
+_Avoid_: app-facing method contract, endpoint-style tool methods
+
+**App Tool Methods**:
+The explicit `app_*` tool methods exposed by the Researcher Tool Backend for the Anna App Shell. The refactored method set covers settings, research job creation and metadata updates, web search, context selection, result persistence, and single job retrieval; the old `research` action dispatcher is not part of the refactored contract.
+_Avoid_: action dispatcher, research endpoint, backend route
 
 **Single Active Job**:
 The MVP concurrency rule that one Executa Wrapper runs at most one Async Research Job at a time. A new start request while another job is running reports the current job instead of launching another.
 _Avoid_: Unlimited jobs, parallel research runs
 
 **Anna Sampling LLM**:
-The Anna-hosted LLM path used by the Executa Wrapper through protocol v2 sampling. It makes the Anna host responsible for model routing, billing, and quota instead of requiring the wrapper to own an external LLM API key.
-_Avoid_: External LLM, plugin-owned OpenAI key
+The Anna-hosted LLM path used by the Anna App Shell for research reasoning. It makes Anna responsible for model routing, billing, and quota instead of requiring the Researcher Tool Backend to own an external LLM API key.
+_Avoid_: External LLM, plugin-owned OpenAI key, tool-owned sampling path
+
+**Frontend LLM Completion**:
+The Anna App Shell's direct LLM completion path for bounded research reasoning. It is the preferred refactored path for role selection, query planning, and report writing when a multi-turn Agent session is not needed.
+_Avoid_: backend sampling, Agent session, external model key
 
 **Research Report Only**:
 The MVP report-type boundary where the adapter supports only the standard research report and excludes detailed, deep, resource, outline, and multi-agent reports. It keeps the first Anna Sampling LLM integration on the main report path.
@@ -53,52 +77,60 @@ The MVP source boundary where research uses web search plus optional domain filt
 _Avoid_: Source URL ingestion, local documents, hybrid sources, Azure sources
 
 **Tavily Required Credential**:
-The MVP search boundary where web retrieval depends on a Tavily API key supplied to the Executa Wrapper through credentials or local environment fallback. Without that credential, starting an Async Research Job is a configuration error.
-_Avoid_: Anonymous search fallback, retriever picker
+The search boundary where web retrieval depends on a Tavily API key configured by the app user and stored as local Researcher Tool Settings. Without that key, web search is a user-resolvable configuration error.
+_Avoid_: Anonymous search fallback, retriever picker, job-scoped Tavily key
+
+**Researcher Tool Settings**:
+Local per-machine settings owned by the Researcher Tool Backend under `~/anna-workspace/.research`. They may hold user-provided service keys such as Tavily, but they are not job records or frontend bundle state.
+_Avoid_: Anna platform credentials, job store data, browser storage
+
+**Masked Tool Setting**:
+A user-visible settings value that confirms local configuration without exposing the full secret. The Anna App Shell may display masked service-key previews, but complete keys should only flow from user input into an App Tool Method.
+_Avoid_: full credential echo, secret in UI state, secret in result data
 
 **LLM Boundary Adapter**:
 The MVP integration point where Anna Sampling LLM is connected at the GPT Researcher Engine's chat-completion boundary, keeping the original report flow mostly intact while replacing external model calls. It is narrower than a full LangChain provider and broader than an environment-variable proxy.
 _Avoid_: Full LLM provider rewrite, OpenAI-compatible proxy
 
 **Minimal Research Result**:
-The MVP shape of a Research Result: the completed markdown report, source URL evidence, job status, failure summary when relevant, and basic timestamps. It excludes generated document exports and full internal research context from the default user-facing result.
+The shape of a Research Result persisted by the Researcher Tool Backend: the completed markdown report, source URL evidence, job status, failure summary when relevant, and basic timestamps. It excludes generated document exports, full internal research context, and full history management from the default user-facing result.
 _Avoid_: File export bundle, debug context dump
 
 **Polling Job Observation**:
-The MVP communication pattern where the Anna App Shell starts an Async Research Job and then repeatedly invokes the Research Tool Dispatcher to read status or result. It replaces the original FastAPI WebSocket progress stream for the first migration slice.
+The previous MVP communication pattern where the Anna App Shell repeatedly invoked a backend dispatcher to advance or read a backend-owned job. In the refactored adapter, frontend-owned orchestration should use App Tool Methods for specific persisted data and backend work instead.
 _Avoid_: WebSocket progress stream, server-sent events, direct file reads from the app
 
 **Invoke-Advanced Research Job**:
-An Async Research Job that progresses through repeated short tool invocations. Each advancement performs a bounded slice of research work and may use the current invocation's Anna Sampling LLM authorization, instead of relying on one long-running background task.
-_Avoid_: Detached background research run, one invoke per full report
+The previous MVP behavior where a backend-owned Async Research Job progressed through repeated short tool invocations. For the refactored adapter, do not use this term for frontend-owned research orchestration.
+_Avoid_: frontend-owned research orchestration, detached background research run
 
 **Context Selector**:
-The research boundary that turns collected search results into the bounded context passed to report generation. It is intentionally provider-neutral so the MVP can start without embeddings and later switch to a local or hosted embedding selector.
+The research boundary that turns collected search results into the bounded context passed to frontend report generation. It is deterministic backend data processing, not LLM or Agent reasoning.
 _Avoid_: Hard-coded embedding compressor, prompt-level result dumping
 
 **Lexical Context Selector**:
-The MVP Context Selector implementation that ranks and trims web search results using deterministic lexical signals such as keyword overlap, title matches, URL deduplication, source limits, and context budget. It avoids external embedding credentials and local model dependencies.
+The Context Selector implementation that ranks and trims web search results using deterministic lexical signals such as keyword overlap, title matches, URL deduplication, source limits, and context budget. It avoids external embedding credentials and local model dependencies.
 _Avoid_: OpenAI embedding requirement, local embedding runtime
 
 **Anna Research Orchestrator**:
-The MVP research flow owned by the Executa Wrapper. It advances an Async Research Job through Anna-compatible stages while selectively reusing GPT Researcher concepts and components, instead of directly running the original monolithic research runtime.
-_Avoid_: Direct GPTResearcher runtime invocation, full backend port
+The frontend-owned research flow in the Anna App Shell. It coordinates Anna LLM or Agent calls with App Tool Methods instead of advancing a backend-owned research state machine.
+_Avoid_: backend orchestrator, direct GPTResearcher runtime invocation, full backend port
 
 **Adaptive Research Role**:
-The MVP behavior where the Anna Research Orchestrator uses Anna Sampling LLM to choose a research agent role for the query before planning searches and writing the report. It is kept as an explicit advancement stage rather than hidden inside a monolithic run.
+The research behavior where Frontend LLM Completion chooses a research role for the query before planning searches and writing the report. It remains an explicit frontend orchestration stage rather than hidden inside backend work.
 _Avoid_: Fixed-only researcher role, implicit role selection
 
 **Bounded Query Planning**:
-The MVP planning behavior where Anna Sampling LLM may generate a small structured set of search queries, while the original user query is always retained and invalid planning output falls back to the original query. It excludes iterative deep-research planning.
+The planning behavior where Frontend LLM Completion may generate a small structured set of search queries, while the original user query is always retained and invalid planning output falls back to the original query. It excludes iterative deep-research planning.
 _Avoid_: Unbounded query expansion, deep research planning
 
 **Tavily Summary Retrieval**:
-The MVP retrieval behavior where the Anna Research Orchestrator uses Tavily search results as the source text for context selection, without independently scraping each result URL. Source URLs are preserved as evidence, while full-page extraction is deferred.
+The retrieval behavior where the Researcher Tool Backend uses Tavily search results as the source text for context selection, without independently scraping each result URL. It may merge results from multiple frontend-planned search queries, and source URLs are preserved as evidence while full-page extraction is deferred.
 _Avoid_: Browser scraping, full-page extraction, image scraping
 
 **Core Research Actions**:
-The MVP action set for the Research Tool Dispatcher: start a job, advance the next bounded stage, read status, and read the final result. It excludes job history, cancellation, retry orchestration, and export management.
-_Avoid_: Full job management API, endpoint parity
+The previous MVP action set for the Research Tool Dispatcher. For the refactored adapter, use App Tool Methods and avoid modeling frontend-owned research orchestration as backend actions.
+_Avoid_: app method set, backend route set, full job management API
 
 **Single-Page Research Workbench**:
 The MVP Anna App Shell experience: one page for entering a research query, optionally constraining domains, observing job progress, and reading the markdown report with source URLs. It excludes report-type switching, exports, follow-up chat, history, and multi-job management.
@@ -129,7 +161,7 @@ The Bilingual App Shell UI message strategy where Chinese and English text live 
 _Avoid_: Remote language packs, backend-owned UI copy
 
 **Localized Status Mapping**:
-The Bilingual App Shell UI behavior where tool statuses, stages, and known error codes are translated in the frontend from stable protocol values. Raw backend messages remain available as fallback details but are not the primary localized copy.
+The Bilingual App Shell UI behavior where frontend research statuses, frontend stages, and known backend error codes are translated from stable values. Raw backend messages remain available as fallback details but are not the primary localized copy.
 _Avoid_: Backend-localized UI messages, locale-dependent tool contract
 
 **App Shell Frontend Boundaries**:
@@ -142,89 +174,41 @@ _Avoid_: Hand-written markdown-to-HTML, raw report HTML injection
 
 ## Example Dialogue
 
-Developer: "For the first release, are we building the full Anna-native app?"
+Developer: "Should the refactored Anna Researcher backend still own the research state machine?"
 
-Domain expert: "No. Build the Anna App Adapter MVP: an Anna App Shell calls an Executa Wrapper, and the wrapper invokes the GPT Researcher Engine to return a report."
+Domain expert: "No. The Anna Research Orchestrator is frontend-owned. The Researcher Tool Backend only performs app-facing backend work through App Tool Methods."
 
-Developer: "So the original FastAPI WebSocket progress stream is not required in the MVP?"
+Developer: "Should the Researcher Tool Backend call Anna Sampling LLM or Anna Agent?"
 
-Domain expert: "Correct. It can be replaced later after the Anna invocation path is proven."
+Domain expert: "No. Use Frontend LLM Completion from the Anna App Shell for role selection, query planning, and report writing."
 
-Developer: "Should the tool block until the report is done?"
+Developer: "Should the app keep the old `research` method with `action=start|advance|get_result`?"
 
-Domain expert: "No. It should create an Async Research Job and let the Anna App Shell poll for the Research Result."
+Domain expert: "No. The refactored contract is explicit App Tool Methods such as settings, search, context selection, and result persistence."
 
-Developer: "Where should the job record live in the MVP?"
+Developer: "Where does the tool source live?"
 
-Domain expert: "In the Executa Local Job Store. The UI should query it through the wrapper instead of reading files."
+Domain expert: "In the standalone Researcher Tool Project. The Anna App `executas` directory keeps only an App Executa Reference."
 
-Developer: "Should the wrapper expose separate tools for start and status?"
+Developer: "Where should user-provided Tavily configuration live?"
 
-Domain expert: "No. Use one Research Tool Dispatcher with an action parameter."
+Domain expert: "In Researcher Tool Settings under `~/anna-workspace/.research`; the UI can display only a Masked Tool Setting."
 
-Developer: "Can users start several research runs in parallel?"
+Developer: "Should search scrape every result page before context selection?"
 
-Domain expert: "Not in the MVP. The wrapper follows Single Active Job semantics."
+Domain expert: "No. Use Tavily Summary Retrieval and pass those results through the Lexical Context Selector."
 
-Developer: "Should the MVP use the original external LLM configuration?"
-
-Domain expert: "No. It should use Anna Sampling LLM for the core research generation path."
-
-Developer: "Should the first version support detailed and deep reports?"
+Developer: "Should the first refactored version support detailed and deep reports?"
 
 Domain expert: "No. It is Research Report Only."
 
-Developer: "Can the MVP research local PDFs?"
+Developer: "Can the app research local PDFs?"
 
 Domain expert: "No. It uses Web Research Sources only."
 
-Developer: "Should the MVP silently fall back to DuckDuckGo when Tavily is not configured?"
+Developer: "Should the result contract preserve the original backend's PDF, DOCX, MD, and JSON file outputs?"
 
-Domain expert: "No. Tavily is a required credential for MVP web retrieval."
-
-Developer: "Should Anna Sampling be implemented as a full LangChain model provider first?"
-
-Domain expert: "No. Use an LLM Boundary Adapter first so the Research Report Only path can call Anna Sampling without rewriting the whole LLM stack."
-
-Developer: "Should the first result contract preserve the original backend's PDF, DOCX, MD, and JSON file outputs?"
-
-Domain expert: "No. Use a Minimal Research Result first: markdown report plus source URL evidence and job metadata."
-
-Developer: "Should the Anna App Shell receive live progress through a push channel in the MVP?"
-
-Domain expert: "No. Use Polling Job Observation through the Research Tool Dispatcher."
-
-Developer: "Should the MVP start a detached background process that keeps using one sampling context until the report is finished?"
-
-Domain expert: "No. Use an Invoke-Advanced Research Job so every LLM slice runs inside a current Anna invocation."
-
-Developer: "Should the MVP keep the original embedding-based context compression?"
-
-Domain expert: "No. Define a Context Selector boundary and use a Lexical Context Selector first."
-
-Developer: "Should the MVP directly run the original GPTResearcher conduct_research flow?"
-
-Domain expert: "No. Use an Anna Research Orchestrator that reuses selected GPT Researcher assets while respecting Anna invocation and sampling constraints."
-
-Developer: "Should the MVP skip GPT Researcher's automatic agent role selection?"
-
-Domain expert: "No. Keep an Adaptive Research Role, but run it as a bounded Anna Research Orchestrator stage."
-
-Developer: "Should search planning be open-ended in the MVP?"
-
-Domain expert: "No. Use Bounded Query Planning so the Anna Research Orchestrator can keep sampling calls and retrieval work predictable."
-
-Developer: "Should the MVP scrape every Tavily result page before context selection?"
-
-Domain expert: "No. Use Tavily Summary Retrieval first and defer full-page extraction."
-
-Developer: "Should the MVP expose cancellation, listing, retry, and export actions?"
-
-Domain expert: "No. Use Core Research Actions first."
-
-Developer: "Can the MVP accept arbitrary source URLs if it does not scrape pages?"
-
-Domain expert: "No. Web Research Sources means web search with optional domain filtering, not source URL ingestion."
+Domain expert: "No. Persist a Minimal Research Result: markdown report plus source URL evidence and job metadata."
 
 Developer: "Should the first Anna App Shell port the original GPT Researcher frontend feature set?"
 

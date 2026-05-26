@@ -3,6 +3,7 @@ import { AnnaResearchApi, createStandaloneApi, type ResearchApi } from "./api/re
 import { LanguageToggle } from "./components/LanguageToggle";
 import { ReportView } from "./components/ReportView";
 import { ResearchForm } from "./components/ResearchForm";
+import { SettingsPanel } from "./components/SettingsPanel";
 import { StatusPanel } from "./components/StatusPanel";
 import { useResearchJob } from "./hooks/useResearchJob";
 import { useLocale } from "./i18n/useLocale";
@@ -59,9 +60,14 @@ export function App() {
     void research.start(query, domains);
   }
 
-  function advanceOnce() {
+  function saveTavilyKey(key: string) {
     setValidationMessage("");
-    void research.advanceOnce();
+    void research.updateSettings({ tavily_api_key: key });
+  }
+
+  function clearTavilyKey() {
+    setValidationMessage("");
+    void research.updateSettings({ clear_tavily_api_key: true });
   }
 
   return (
@@ -79,12 +85,13 @@ export function App() {
         </div>
       </header>
 
+      <SettingsPanel settings={research.settings} isBusy={research.isBusy} t={t} onSave={saveTavilyKey} onClear={clearTavilyKey} />
+
       <ResearchForm
         isBusy={research.isBusy}
-        canAdvance={research.canAdvance}
+        canStart={research.canStart}
         t={t}
         onStart={start}
-        onAdvance={advanceOnce}
         onValidationError={setValidationMessage}
       />
 

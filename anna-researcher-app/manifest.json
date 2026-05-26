@@ -7,7 +7,7 @@
   "required_executas": [
     {
       "tool_id": "tool-test-researcher-12345678",
-      "min_version": "0.1.0",
+      "min_version": "0.2.0",
       "version": "latest"
     }
   ],
@@ -40,7 +40,7 @@
       "tools": ["required:tool-test-researcher-12345678"],
       "chat": [],
       "artifact": [],
-      "llm": [],
+      "llm": ["complete"],
       "fs": [],
       "storage": [],
       "prefs": [],
@@ -60,4 +60,3 @@
     "user_id": 1
   }
 }
-

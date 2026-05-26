@@ -10,8 +10,6 @@ from .errors import ConfigurationError, RetrievalFailure
 
 
 class TavilySummaryRetriever:
-    """Tavily Summary Retrieval without page scraping."""
-
     endpoint = "https://api.tavily.com/search"
 
     def __init__(self, *, api_key: str | None = None, timeout: int = 60, fake: bool | None = None):
@@ -19,11 +17,22 @@ class TavilySummaryRetriever:
         self.timeout = timeout
         self.fake = fake if fake is not None else os.getenv("ANNA_RESEARCHER_FAKE_TAVILY") == "1"
 
+    def search_many(self, queries: list[str], *, query_domains: list[str] | None = None, max_results: int = 5) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        for query in queries:
+            for item in self.search(query, query_domains=query_domains, max_results=max_results):
+                url = str(item.get("url") or "")
+                if url and url not in seen_urls:
+                    merged.append(item)
+                    seen_urls.add(url)
+        return merged
+
     def search(self, query: str, *, query_domains: list[str] | None = None, max_results: int = 5) -> list[dict[str, Any]]:
         if self.fake:
             return self._fake_search(query, query_domains=query_domains, max_results=max_results)
         if not self.api_key:
-            raise ConfigurationError("TAVILY_API_KEY is not configured")
+            raise ConfigurationError("Tavily API key is not configured")
 
         payload = {
             "api_key": self.api_key,
@@ -50,9 +59,8 @@ class TavilySummaryRetriever:
         except Exception as exc:
             raise RetrievalFailure(f"Tavily request failed: {exc}") from exc
 
-        results = data.get("results") or []
         normalized: list[dict[str, Any]] = []
-        for item in results:
+        for item in data.get("results") or []:
             url = item.get("url") or item.get("href")
             content = item.get("content") or item.get("body") or ""
             if not url:

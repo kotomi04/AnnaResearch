@@ -4,14 +4,13 @@ import { parseDomains } from "../utils/domains";
 
 interface Props {
   isBusy: boolean;
-  canAdvance: boolean;
+  canStart: boolean;
   t(key: MessageKey): string;
   onStart(query: string, domains: string[]): void;
-  onAdvance(): void;
   onValidationError(message: string): void;
 }
 
-export function ResearchForm({ isBusy, canAdvance, t, onStart, onAdvance, onValidationError }: Props) {
+export function ResearchForm({ isBusy, canStart, t, onStart, onValidationError }: Props) {
   const [query, setQuery] = useState("");
   const [domains, setDomains] = useState("");
 
@@ -40,11 +39,8 @@ export function ResearchForm({ isBusy, canAdvance, t, onStart, onAdvance, onVali
         />
       </details>
       <div className="actions">
-        <button type="button" onClick={submit} disabled={isBusy}>
+        <button type="button" onClick={submit} disabled={isBusy || !canStart}>
           {isBusy ? t("startButtonBusy") : t("startButton")}
-        </button>
-        <button className="secondary" type="button" onClick={onAdvance} disabled={isBusy || !canAdvance}>
-          {t("advanceButton")}
         </button>
       </div>
     </section>

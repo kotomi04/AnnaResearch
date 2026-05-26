@@ -27,8 +27,6 @@ def domain_of(url: str) -> str:
 
 
 class LexicalContextSelector:
-    """Deterministic MVP Context Selector with no embeddings."""
-
     def __init__(self, *, max_sources: int = 10, max_per_domain: int = 3, context_budget: int = 24000):
         self.max_sources = max_sources
         self.max_per_domain = max_per_domain
@@ -59,14 +57,16 @@ class LexicalContextSelector:
             score = title_hits * 4 + content_hits + max(0, 2 - index * 0.05)
             if url in query:
                 score += 5
-            normalized = {
-                "query": result.get("query") or query,
-                "url": url,
-                "title": title or domain_of(url) or url,
-                "content": content.strip(),
-                "score": round(score, 4),
-            }
-            scored.append((score, normalized))
+            scored.append((
+                score,
+                {
+                    "query": result.get("query") or query,
+                    "url": url,
+                    "title": title or domain_of(url) or url,
+                    "content": content.strip(),
+                    "score": round(score, 4),
+                },
+            ))
 
         scored.sort(key=lambda item: item[0], reverse=True)
         per_domain: dict[str, int] = defaultdict(int)
@@ -94,11 +94,10 @@ class LexicalContextSelector:
             per_domain[domain] += 1
             remaining -= len(trimmed) + len(item["url"]) + len(item["title"]) + 80
 
-        context_parts = []
-        for i, item in enumerate(selected, 1):
-            context_parts.append(
-                f"[{i}] {item['title']}\nURL: {item['url']}\nQuery: {item['query']}\nContent: {item['content']}"
-            )
+        context_parts = [
+            f"[{index}] {item['title']}\nURL: {item['url']}\nQuery: {item['query']}\nContent: {item['content']}"
+            for index, item in enumerate(selected, 1)
+        ]
         return {
             "selected_sources": selected,
             "source_urls": [item["url"] for item in selected],

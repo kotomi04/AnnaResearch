@@ -1,0 +1,19 @@
+# Frontend-Owned Researcher Orchestration With Standalone Tool Backend
+
+The Anna Researcher refactor makes the Anna App Shell own research orchestration and LLM completion, while a standalone Researcher Tool Project provides only app-facing backend work through explicit `app_*` methods. This replaces the previous backend-owned `research` action dispatcher and tool-side Anna Sampling path because the app now needs direct control over bounded LLM stages, local Tavily settings, deterministic context selection, and result persistence without embedding Anna-specific backend code inside the app `executas` directory.
+
+**Consequences**
+
+The Researcher Tool Backend implements Executa v2 initialization but does not declare LLM sampling or Agent capabilities. The Anna App `executas` directory keeps only an App Executa Reference to the standalone tool project, and the app manifest must authorize frontend `anna.llm.complete` calls.
+
+Tool-side sampling and the previous backend orchestrator are not migrated into the standalone tool project. Only non-LLM backend capabilities such as settings, Tavily summary retrieval, lexical context selection, and persistence belong in the Researcher Tool Backend.
+
+Frontend report generation may pass the complete `selected_context` returned by lexical context selection to `anna.llm.complete`. All frontend LLM completion calls should omit `maxTokens` so Anna does not return an empty response when an internal token limit is exceeded; output shape should be controlled through prompts instead.
+
+Research jobs are created through an explicit app tool method and then updated by frontend-owned orchestration. Any generic job update method must be limited to approved app-owned metadata fields such as status, stage, progress, role, planned queries, and errors; it must not become an arbitrary local file or secret write surface.
+
+User-provided Tavily configuration is stored locally under `~/anna-workspace/.research` rather than in Anna platform credentials for this refactor. The stored key is local plaintext configuration for now, so the tool should avoid logging it, avoid copying it into job records, return only masked settings to the UI, and keep file permissions as restrictive as practical.
+
+Tests should lock the new boundary: the standalone tool describes only `app_*` methods and handles settings, search, context selection, and persistence; the frontend calls those methods, calls `anna.llm.complete` without `maxTokens`, gates research on Tavily settings, and the static bundle no longer contains the old `research` action dispatcher contract.
+
+The refactored tool keeps the existing minted tool id but should move to version `0.2.0` because removing the old `research` method is a breaking contract change. The Anna App manifest should require the same minimum version.

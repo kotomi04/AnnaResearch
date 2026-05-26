@@ -1,2 +1,0 @@
-"""Anna Researcher adapter modules."""
-

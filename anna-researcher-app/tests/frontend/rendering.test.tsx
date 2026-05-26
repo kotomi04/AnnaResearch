@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { ReportView } from "../../src/components/ReportView";
 import { ResearchForm } from "../../src/components/ResearchForm";
+import { SettingsPanel } from "../../src/components/SettingsPanel";
 import { createTranslator, localeStorageKey } from "../../src/i18n/messages";
 import { useLocale } from "../../src/i18n/useLocale";
 
@@ -36,7 +37,7 @@ describe("ResearchForm", () => {
     const t = createTranslator("en");
     const onStart = vi.fn();
     const onValidationError = vi.fn();
-    render(<ResearchForm isBusy={false} canAdvance={false} t={t} onStart={onStart} onAdvance={vi.fn()} onValidationError={onValidationError} />);
+    render(<ResearchForm isBusy={false} canStart={true} t={t} onStart={onStart} onValidationError={onValidationError} />);
 
     fireEvent.click(screen.getByRole("button", { name: "Start Research" }));
     expect(onValidationError).toHaveBeenCalledWith("Enter a research query.");
@@ -46,6 +47,21 @@ describe("ResearchForm", () => {
     fireEvent.change(screen.getByPlaceholderText("example.com, docs.example.com"), { target: { value: "example.com, docs.example.com" } });
     fireEvent.click(screen.getByRole("button", { name: "Start Research" }));
     expect(onStart).toHaveBeenCalledWith("Anna App", ["example.com", "docs.example.com"]);
+  });
+});
+
+describe("SettingsPanel", () => {
+  it("saves and clears Tavily settings", () => {
+    const t = createTranslator("en");
+    const onSave = vi.fn();
+    const onClear = vi.fn();
+    render(<SettingsPanel settings={{ tavily: { configured: true, masked: "tvly...test" } }} isBusy={false} t={t} onSave={onSave} onClear={onClear} />);
+
+    fireEvent.change(screen.getByLabelText("Tavily API Key"), { target: { value: "tvly-new-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Key" }));
+    expect(onSave).toHaveBeenCalledWith("tvly-new-key");
+    fireEvent.click(screen.getByRole("button", { name: "Clear Key" }));
+    expect(onClear).toHaveBeenCalled();
   });
 });
 

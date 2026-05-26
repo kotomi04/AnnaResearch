@@ -1,15 +1,10 @@
 [project]
 name = "tool-test-researcher-12345678"
-version = "0.1.0"
-description = "Anna Researcher Executa wrapper"
+version = "0.2.0"
+description = "Anna Researcher standalone Executa tool backend"
 requires-python = ">=3.10"
 authors = [{ name = "Anna Research" }]
 dependencies = []
-
-[project.optional-dependencies]
-dev = [
-  "pytest>=8",
-]
 
 [project.scripts]
 "tool-test-researcher-12345678" = "researcher_plugin:main"
@@ -20,5 +15,5 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 py-modules = ["researcher_plugin"]
-packages = ["researcher_adapter"]
+packages = ["researcher_tool"]
 

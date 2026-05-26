@@ -3,16 +3,15 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from pathlib import Path
 
-from conftest import PLUGIN_DIR, isolated_env
+from conftest import TOOL_DIR, isolated_env
 
 
 class PluginProcess:
     def __init__(self, tmp_path):
         self.proc = subprocess.Popen(
             [sys.executable, "researcher_plugin.py"],
-            cwd=PLUGIN_DIR,
+            cwd=TOOL_DIR,
             env=isolated_env(tmp_path),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -43,52 +42,44 @@ class PluginProcess:
         return response
 
 
-def test_describe_and_health(tmp_path):
+def test_describe_v2_app_methods_only(tmp_path):
     plugin = PluginProcess(tmp_path)
     try:
         init = plugin.call("initialize", {"protocolVersion": "2.0"})
         assert init["result"]["protocolVersion"] == "2.0"
+        assert init["result"]["client_capabilities"] == {}
         describe = plugin.call("describe")
         assert describe["result"]["name"] == "tool-test-researcher-12345678"
-        assert describe["result"]["host_capabilities"] == ["llm.sample"]
+        assert describe["result"]["version"] == "0.2.0"
+        assert "host_capabilities" not in describe["result"]
+        tools = [tool["name"] for tool in describe["result"]["tools"]]
+        assert "research" not in tools
+        assert all(name.startswith("app_") for name in tools)
         health = plugin.call("health")
         assert health["result"]["status"] == "healthy"
     finally:
         plugin.close()
 
 
-def test_full_fake_research_lifecycle(tmp_path):
+def test_settings_job_search_context_result_lifecycle(tmp_path):
     plugin = PluginProcess(tmp_path)
     try:
         plugin.call("initialize", {"protocolVersion": "2.0"})
-        start = plugin.call(
-            "invoke",
-            {"tool": "research", "arguments": {"action": "start", "query": "anna app adapter"}},
-        )
-        assert start["result"]["success"] is True
-        job = start["result"]["data"]["job"]
-        research_id = job["research_id"]
+        settings = plugin.call("invoke", {"tool": "app_update_settings", "arguments": {"tavily_api_key": "tvly-test-secret"}})
+        assert settings["result"]["success"] is True
+        assert settings["result"]["data"]["settings"]["tavily"]["configured"] is True
 
-        for _ in range(10):
-            advance = plugin.call(
-                "invoke",
-                {"tool": "research", "arguments": {"action": "advance", "research_id": research_id}, "invoke_id": "invoke-test"},
-            )
-            assert advance["result"]["success"] is True
-            job = advance["result"]["data"]["job"]
-            if job["status"] == "completed":
-                break
+        created = plugin.call("invoke", {"tool": "app_create_research_job", "arguments": {"query": "anna app adapter"}})
+        research_id = created["result"]["data"]["job"]["research_id"]
 
-        assert job["status"] == "completed"
-        result = plugin.call(
-            "invoke",
-            {"tool": "research", "arguments": {"action": "get_result", "research_id": research_id}},
-        )
-        assert result["result"]["success"] is True
-        payload = result["result"]["data"]["result"]
-        assert payload["report_type"] == "research_report"
-        assert payload["report_markdown"].startswith("# Research Report")
-        assert payload["source_urls"]
+        search = plugin.call("invoke", {"tool": "app_search_web", "arguments": {"research_id": research_id, "search_queries": ["anna app adapter"]}})
+        assert search["result"]["data"]["search_results"]
+
+        selected = plugin.call("invoke", {"tool": "app_select_context", "arguments": {"research_id": research_id}})
+        assert selected["result"]["data"]["selected_context"]
+
+        saved = plugin.call("invoke", {"tool": "app_save_research_result", "arguments": {"research_id": research_id, "report_markdown": "# Research Report"}})
+        assert saved["result"]["data"]["result"]["report_markdown"] == "# Research Report"
     finally:
         plugin.close()
 
