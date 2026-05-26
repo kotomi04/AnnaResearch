@@ -9,6 +9,8 @@ from typing import Any, Callable
 
 from .errors import SamplingFailure
 
+DEFAULT_SAMPLING_TIMEOUT_SECONDS = 30.0
+
 
 class SamplingClient:
     """Small Executa v2 reverse-RPC sampling client with fake mode."""
@@ -32,7 +34,7 @@ class SamplingClient:
         system_prompt: str | None = None,
         temperature: float | None = None,
         metadata: dict[str, Any] | None = None,
-        timeout: float = 90.0,
+        timeout: float = DEFAULT_SAMPLING_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         if self.fake:
             return fake_sampling_response(messages=messages, system_prompt=system_prompt, metadata=metadata)
@@ -147,4 +149,3 @@ def _message_text(message: dict[str, Any]) -> str:
 
 def _first_line(text: str) -> str:
     return (text.strip().splitlines() or ["Research topic"])[0][:120]
-

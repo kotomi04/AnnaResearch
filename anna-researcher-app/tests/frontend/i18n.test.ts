@@ -30,6 +30,8 @@ describe("localized status mapping", () => {
     const t = createTranslator("en");
     expect(localizedError({ code: "missing_tavily_credential", message: "TAVILY_API_KEY missing" }, t)).toContain("Missing Tavily credential");
     expect(localizedError({ code: "missing_tavily_credential", message: "TAVILY_API_KEY missing" }, t)).toContain("Technical details");
+    expect(localizedError({ code: "sampling_error", message: "sampling/createMessage timed out after 45.0s" }, t)).toContain("Anna Sampling failed");
+    expect(localizedError({ code: "tool_failed", message: "executa timed out" }, t)).toContain("Research tool invocation failed");
   });
 
   it("falls back for unknown values", () => {

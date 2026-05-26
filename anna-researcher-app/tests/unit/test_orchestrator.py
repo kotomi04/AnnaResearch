@@ -3,7 +3,7 @@ import asyncio
 from researcher_adapter.context_selector import LexicalContextSelector
 from researcher_adapter.job_store import JobStore
 from researcher_adapter.orchestrator import AnnaResearchOrchestrator
-from researcher_adapter.sampling_llm import SamplingClient
+from researcher_adapter.sampling_llm import DEFAULT_SAMPLING_TIMEOUT_SECONDS, SamplingClient
 from researcher_adapter.tavily_retrieval import TavilySummaryRetriever
 
 
@@ -50,3 +50,6 @@ def test_orchestrator_missing_tavily_credential_fails_when_not_fake(tmp_path, mo
     assert job["status"] == "failed"
     assert job["error"]["code"] == "configuration_error"
 
+
+def test_sampling_timeout_is_below_default_invoke_timeout():
+    assert DEFAULT_SAMPLING_TIMEOUT_SECONDS < 45

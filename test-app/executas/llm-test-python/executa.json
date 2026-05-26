@@ -1,0 +1,5 @@
+{
+  "tool_id": "tool-test-llm-sampling-12345678",
+  "type": "python",
+  "enabled": true
+}

@@ -14,8 +14,12 @@ const statusKeys: Record<string, MessageKey> = {
 const errorCodeKeys: Record<string, MessageKey> = {
   missing_tavily_credential: "errorMissingTavily",
   tavily_missing_credential: "errorMissingTavily",
+  sampling_error: "errorSamplingFailed",
   sampling_failed: "errorSamplingFailed",
+  timeout: "errorSamplingFailed",
   retrieval_failed: "errorRetrievalFailed",
+  retrieval_error: "errorRetrievalFailed",
+  tool_failed: "errorToolFailed",
   not_ready: "errorNotReady",
   invalid_action: "errorInvalidAction",
 };

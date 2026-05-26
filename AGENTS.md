@@ -47,6 +47,7 @@ Anna App Shell
 - 不要把任意 `source_urls` ingestion 加回 MVP；第一版只支持 web search 和可选 domain filter。
 - 不要实现 PDF/DOCX 导出、历史列表、取消/重试、多任务并发、聊天追问，除非新的 issue 明确要求。
 - stdout 只能输出 JSON-RPC 协议帧；调试日志必须写 stderr。
+- 开发 Anna LLM / Agent 调用链时，必须先读 `docs/anna/tool-calls-llm-agent-latest.md`，按其中最新方案实现；尤其注意 `invoke_id`、`sampling_token` 在 `params.context` 中，不要按旧文档写成顶层 `params.invoke_id` / `params.sampling_token`。
 - 修改用户已有改动时要谨慎。不要 revert 不是自己做的改动。
 
 ## 开发位置
@@ -207,6 +208,7 @@ ANNA_RESEARCHER_JOBS_ID=jobs-local
 ## 进一步阅读
 
 - `CONTEXT.md`：领域语言和已确认决策。
+- `docs/anna/tool-calls-llm-agent-latest.md`：Anna App / Executa Tool 调用 Anna LLM 与 Agent 的最新实现方案。
 - `anna-executa-examples/docs/protocol-spec.zh-CN.md`：Executa JSON-RPC 协议。
 - `anna-executa-examples/docs/sampling.zh-CN.md`：Anna Sampling LLM。
 - `anna-executa-examples/examples/anna-app-focus-flow/`：Anna App + Executa 结构参考。

@@ -17,7 +17,7 @@ from researcher_adapter.dispatcher import ResearchDispatcher  # noqa: E402
 from researcher_adapter.errors import InvalidActionError, NotReadyError  # noqa: E402
 from researcher_adapter.job_store import JobStore  # noqa: E402
 from researcher_adapter.orchestrator import AnnaResearchOrchestrator  # noqa: E402
-from researcher_adapter.sampling_llm import SamplingClient  # noqa: E402
+from researcher_adapter.sampling_llm import DEFAULT_SAMPLING_TIMEOUT_SECONDS, SamplingClient  # noqa: E402
 from researcher_adapter.tavily_retrieval import TavilySummaryRetriever  # noqa: E402
 
 
@@ -161,6 +161,10 @@ def test_bundle_contract():
     assert_true("tool-test-researcher-12345678" in manifest, "manifest should reference tool")
 
 
+def test_sampling_timeout_budget():
+    assert_true(DEFAULT_SAMPLING_TIMEOUT_SECONDS < 45, "sampling timeout should return before frontend RPC timeout")
+
+
 def main():
     tests = [
         ("selector", lambda tmp: test_selector()),
@@ -168,6 +172,7 @@ def main():
         ("dispatcher", test_dispatcher),
         ("plugin_contract", test_plugin_contract),
         ("bundle_contract", lambda tmp: test_bundle_contract()),
+        ("sampling_timeout_budget", lambda tmp: test_sampling_timeout_budget()),
     ]
     with tempfile.TemporaryDirectory() as root:
         root_path = Path(root)
