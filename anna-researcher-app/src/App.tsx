@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import type React from "react";
 import { connectAnnaRuntime } from "./api/annaRuntime";
 import { AnnaResearchApi, createStandaloneApi, type ResearchApi } from "./api/researchApi";
 import { LanguageToggle } from "./components/LanguageToggle";
@@ -12,8 +13,10 @@ import {
 import { ResearchTimeline } from "./components/ResearchTimeline";
 import { StatusPanel } from "./components/StatusPanel";
 import { MAX_RESEARCH_ITERATIONS, useResearchJob } from "./hooks/useResearchJob";
+import type { FocusCandidate, RoleCandidate } from "./hooks/useResearchJob";
 import { useLocale } from "./i18n/useLocale";
 import { localizedError, localizedJobMessage } from "./i18n/status";
+import type { ReportSection } from "./types";
 
 export function App() {
   const { locale, setLocale, t } = useLocale();
@@ -25,6 +28,8 @@ export function App() {
   const [selectedSourceId, setSelectedSourceId] = useState("");
   const [briefNameDraft, setBriefNameDraft] = useState("");
   const [researchNeedDraft, setResearchNeedDraft] = useState("");
+  const [selectedFocusIds, setSelectedFocusIds] = useState<string[]>([]);
+  const [regenInstruction, setRegenInstruction] = useState("");
 
   useEffect(() => {
     let cancelled = false;
@@ -70,6 +75,46 @@ export function App() {
     setValidationMessage("");
     setAppPage("result");
     void research.start(formatResearchQuery(input, locale));
+  }
+
+  function updateRoleCandidate(index: number, patch: Partial<RoleCandidate>) {
+    research.setRoleCandidates(research.roleCandidates.map((candidate, idx) => (idx === index ? { ...candidate, ...patch } : candidate)));
+  }
+
+  function updateFocusCandidate(index: number, patch: Partial<FocusCandidate>) {
+    research.setFocusCandidates(research.focusCandidates.map((candidate, idx) => (idx === index ? { ...candidate, ...patch } : candidate)));
+  }
+
+  function updateOutlineSection(index: number, patch: Partial<ReportSection>) {
+    research.setOutlineDraft(research.outlineDraft.map((section, idx) => (idx === index ? { ...section, ...patch } : section)));
+  }
+
+  function addOutlineSection() {
+    if (research.outlineDraft.length >= 8) return;
+    research.setOutlineDraft([
+      ...research.outlineDraft,
+      {
+        id: `section-${research.outlineDraft.length + 1}`,
+        title: locale === "zh-CN" ? "新段落" : "New section",
+        outline: locale === "zh-CN" ? "补充这一段需要研究的内容。" : "Describe what this section should research.",
+        allowed_source_ids: research.sources.filter((source) => source.enabled && source.credential_status === "configured").slice(0, 1).map((source) => source.id),
+        max_iterations: 5,
+      },
+    ]);
+  }
+
+  function deleteOutlineSection(index: number) {
+    if (research.outlineDraft.length <= 1) return;
+    research.setOutlineDraft(research.outlineDraft.filter((_, idx) => idx !== index).map((section, idx) => ({ ...section, id: `section-${idx + 1}` })));
+  }
+
+  function toggleSectionSource(index: number, sourceId: string) {
+    const section = research.outlineDraft[index];
+    if (!section) return;
+    const current = new Set(section.allowed_source_ids);
+    if (current.has(sourceId)) current.delete(sourceId);
+    else current.add(sourceId);
+    updateOutlineSection(index, { allowed_source_ids: Array.from(current).sort() });
   }
 
   function showLastResult() {
@@ -213,14 +258,188 @@ export function App() {
                 </button>
               </div>
               <StatusPanel job={research.job} message={message} isError={isMessageError} t={t} />
-              <ResearchTimeline iterations={research.job?.iterations} t={t} />
-              <ReportView result={sourceResult} t={t} />
+              {research.phase === "role_review" ? (
+                <ReviewPanel
+                  title={locale === "zh-CN" ? "选择研究角色" : "Choose Research Role"}
+                  actionLabel={locale === "zh-CN" ? "重新生成角色" : "Regenerate roles"}
+                  instruction={regenInstruction}
+                  onInstructionChange={setRegenInstruction}
+                  onRegenerate={() => research.regenerateRoles(regenInstruction)}
+                >
+                  <div className="card-grid">
+                    {research.roleCandidates.map((candidate, index) => (
+                      <article className="option-card" key={index}>
+                        <label>
+                          {locale === "zh-CN" ? "角色名称" : "Role"}
+                          <input value={candidate.server} onChange={(event) => updateRoleCandidate(index, { server: event.target.value })} />
+                        </label>
+                        <label>
+                          {locale === "zh-CN" ? "角色提示词" : "Role prompt"}
+                          <textarea value={candidate.agent_role_prompt} onChange={(event) => updateRoleCandidate(index, { agent_role_prompt: event.target.value })} />
+                        </label>
+                        {candidate.rationale ? <p className="muted">{candidate.rationale}</p> : null}
+                        <button type="button" onClick={() => research.confirmRole(candidate)}>
+                          {locale === "zh-CN" ? "选择这个角色" : "Use this role"}
+                        </button>
+                      </article>
+                    ))}
+                  </div>
+                </ReviewPanel>
+              ) : research.phase === "focus_review" ? (
+                <ReviewPanel
+                  title={locale === "zh-CN" ? "选择研究重点" : "Choose Research Focuses"}
+                  actionLabel={locale === "zh-CN" ? "重新生成重点" : "Regenerate focuses"}
+                  instruction={regenInstruction}
+                  onInstructionChange={setRegenInstruction}
+                  onRegenerate={() => research.regenerateFocuses(regenInstruction)}
+                >
+                  <div className="card-grid">
+                    {research.focusCandidates.map((candidate, index) => {
+                      const checked = selectedFocusIds.includes(candidate.id);
+                      return (
+                        <article className="option-card" key={candidate.id}>
+                          <label className="checkbox-row">
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() => {
+                                setSelectedFocusIds((ids) => checked ? ids.filter((id) => id !== candidate.id) : [...ids, candidate.id].slice(0, 5));
+                              }}
+                            />
+                            {locale === "zh-CN" ? "选择" : "Select"}
+                          </label>
+                          <textarea value={candidate.text} onChange={(event) => updateFocusCandidate(index, { text: event.target.value })} />
+                          {candidate.rationale ? <p className="muted">{candidate.rationale}</p> : null}
+                        </article>
+                      );
+                    })}
+                  </div>
+                  <button
+                    type="button"
+                    disabled={selectedFocusIds.length < 1 || selectedFocusIds.length > 5}
+                    onClick={() => research.confirmFocuses(research.focusCandidates.filter((focus) => selectedFocusIds.includes(focus.id)).map((focus) => focus.text))}
+                  >
+                    {locale === "zh-CN" ? "确认研究重点" : "Confirm focuses"}
+                  </button>
+                </ReviewPanel>
+              ) : research.phase === "outline_review" ? (
+                <ReviewPanel
+                  title={locale === "zh-CN" ? "确认研究大纲" : "Confirm Research Outline"}
+                  actionLabel={locale === "zh-CN" ? "重新生成大纲" : "Regenerate outline"}
+                  instruction={regenInstruction}
+                  onInstructionChange={setRegenInstruction}
+                  onRegenerate={() => research.regenerateOutline(regenInstruction)}
+                >
+                  <div className="outline-list">
+                    {research.outlineDraft.map((section, index) => (
+                      <article className="option-card" key={section.id}>
+                        <div className="section-card-header">
+                          <strong>{section.id}</strong>
+                          <button type="button" className="secondary small-button" onClick={() => deleteOutlineSection(index)}>
+                            {locale === "zh-CN" ? "删除" : "Delete"}
+                          </button>
+                        </div>
+                        <label>
+                          {locale === "zh-CN" ? "标题" : "Title"}
+                          <input value={section.title} onChange={(event) => updateOutlineSection(index, { title: event.target.value })} />
+                        </label>
+                        <label>
+                          {locale === "zh-CN" ? "大纲内容" : "Outline"}
+                          <textarea value={section.outline} onChange={(event) => updateOutlineSection(index, { outline: event.target.value })} />
+                        </label>
+                        <label>
+                          {locale === "zh-CN" ? "最大迭代次数" : "Max iterations"}
+                          <input
+                            type="number"
+                            min={1}
+                            max={10}
+                            value={section.max_iterations}
+                            onChange={(event) => updateOutlineSection(index, { max_iterations: Number(event.target.value) })}
+                          />
+                        </label>
+                        <div className="source-chip-list">
+                          {research.sources.filter((source) => source.enabled && source.credential_status === "configured").map((source) => (
+                            <label className="checkbox-row" key={source.id}>
+                              <input
+                                type="checkbox"
+                                checked={section.allowed_source_ids.includes(source.id)}
+                                onChange={() => toggleSectionSource(index, source.id)}
+                              />
+                              {source.name}
+                            </label>
+                          ))}
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                  <div className="button-row">
+                    <button type="button" className="secondary" onClick={addOutlineSection} disabled={research.outlineDraft.length >= 8}>
+                      {locale === "zh-CN" ? "添加段落" : "Add section"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!isOutlineConfirmable(research.outlineDraft)}
+                      onClick={() => research.confirmOutlineAndRun(research.outlineDraft)}
+                    >
+                      {locale === "zh-CN" ? "确认大纲并开始研究" : "Confirm outline and research"}
+                    </button>
+                  </div>
+                </ReviewPanel>
+              ) : (
+                <>
+                  <ResearchTimeline iterations={mergedIterations(research.job)} t={t} />
+                  <ReportView result={sourceResult} t={t} />
+                </>
+              )}
             </section>
           )}
         </div>
       </section>
     </main>
   );
+}
+
+function ReviewPanel(props: {
+  title: string;
+  actionLabel: string;
+  instruction: string;
+  children: React.ReactNode;
+  onInstructionChange(value: string): void;
+  onRegenerate(): void;
+}) {
+  return (
+    <section className="guided-panel">
+      <div className="guided-panel-header">
+        <h2>{props.title}</h2>
+        <div className="regen-controls">
+          <input
+            value={props.instruction}
+            placeholder="Optional regeneration instruction"
+            onChange={(event) => props.onInstructionChange(event.target.value)}
+          />
+          <button type="button" className="secondary" onClick={props.onRegenerate}>
+            {props.actionLabel}
+          </button>
+        </div>
+      </div>
+      {props.children}
+    </section>
+  );
+}
+
+function isOutlineConfirmable(sections: ReportSection[]): boolean {
+  return sections.length >= 1 && sections.length <= 8 && sections.every((section) =>
+    section.title.trim() &&
+    section.outline.trim() &&
+    section.allowed_source_ids.length >= 1 &&
+    section.max_iterations >= 1 &&
+    section.max_iterations <= 10
+  );
+}
+
+function mergedIterations(job: { iterations?: unknown[]; section_iterations?: Record<string, unknown[]> } | null | undefined) {
+  if (!job?.section_iterations) return job?.iterations as Parameters<typeof ResearchTimeline>[0]["iterations"];
+  return Object.values(job.section_iterations).flat() as Parameters<typeof ResearchTimeline>[0]["iterations"];
 }
 
 export function formatResearchQuery(input: { briefName: string; researchNeed: string }, locale: string): string {

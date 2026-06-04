@@ -44,6 +44,46 @@ _Avoid_: Backend-owned run, blocking report generation
 The completed output of an Async Research Job, including the report text and selected metadata such as source URLs and costs. It is the user-facing product of Anna Researcher.
 _Avoid_: Raw logs, internal context
 
+**Sectioned Research Job**:
+An Async Research Job whose final Research Result is assembled from multiple user-confirmed report sections. The job remains one user-facing research run; sections are parts of that run rather than independent jobs.
+_Avoid_: Multiple jobs per report, separate report jobs, backend-owned section runs
+
+**Report Section**:
+A user-visible part of a Sectioned Research Job, with a title, outline content, allowed Research Sources, and its own research iteration limit. Each Report Section produces section-level evidence and markdown that later contributes to the final Research Result.
+_Avoid_: Independent research job, hidden subtask, generic paragraph
+
+**Report Section Set**:
+The user-confirmed collection of Report Sections in a Confirmed Research Outline. Outline planning defaults to four to six sections, while the user may confirm one to eight sections; each section has a user-adjustable iteration limit from one to ten, defaulting to five.
+_Avoid_: Unlimited outline, fixed single-section report, global-only iteration limit
+
+**Serial Section Research**:
+The Sectioned Research Job behavior where Report Sections are researched one at a time in the user-confirmed outline order. The Anna Research Orchestrator completes one section's evidence gathering and section markdown before moving to the next section.
+_Avoid_: Parallel section research, background section fan-out, unordered section runs
+
+**Section Failure Stops Job**:
+The failure behavior where a Report Section that cannot produce section markdown causes the containing Sectioned Research Job to fail and stops later sections from running. Individual Research Source call errors may still be recorded inside a section before the section itself fails.
+_Avoid_: Partial success report, skipped failed section, silent incomplete report
+
+**Section Summary**:
+A compact summary of a completed Report Section used for final report framing. It captures the section's key findings without replacing the section markdown or becoming a new evidence source.
+_Avoid_: Full section rewrite, hidden final context, raw evidence dump
+
+**Section Writer Output**:
+The structured section-generation output that contains both section markdown and a Section Summary from one Frontend LLM Completion call. If structured parsing fails, the app may fall back to treating the model text as section markdown and deriving a minimal summary.
+_Avoid_: Separate required summary call, markdown-only section contract, final-report rewrite input
+
+**Report Framing**:
+The final Frontend LLM Completion step that generates a report title, introduction, and conclusion from the original query, confirmed focuses, outline titles, and Section Summaries. It does not receive or rewrite all section markdown.
+_Avoid_: Final full-report rewrite, second research pass, section content regeneration
+
+**Assembled Research Report**:
+The final Research Result markdown produced by code-level assembly of Report Framing output and section markdown in the Confirmed Research Outline order.
+_Avoid_: LLM-rewritten final report, unordered section bundle, template-only report
+
+**Allowed Research Sources**:
+The strict Report Section-level whitelist of Research Sources that the Anna Research Orchestrator may use while researching that section. It is not a soft recommendation; sources outside the whitelist are unavailable for that section's Research Step Decisions.
+_Avoid_: Recommended sources, preferred sources, global enabled sources
+
 **Executa Local Job Store**:
 The local storage owned by the Researcher Tool Backend for recoverable Async Research Job data and Research Results under `~/anna-workspace/.research`. The Anna App Shell reads and writes it only through App Tool Methods, not by accessing files directly.
 _Avoid_: Anna App Storage, browser storage, FastAPI report store
@@ -55,6 +95,10 @@ _Avoid_: app-facing method contract, endpoint-style tool methods
 **App Tool Methods**:
 The explicit `app_*` tool methods exposed by the Researcher Tool Backend for the Anna App Shell. The refactored method set covers settings, research job creation and metadata updates, web search, context selection, result persistence, and single job retrieval; the old `research` action dispatcher is not part of the refactored contract.
 _Avoid_: action dispatcher, research endpoint, backend route
+
+**Sectioned Research App Tool Methods**:
+The explicit App Tool Methods used to persist and process Sectioned Research Job data such as the confirmed research plan, section iterations, section context selection, and section results. They avoid turning generic job metadata updates into an arbitrary write surface.
+_Avoid_: Generic section blob update, frontend-owned file schema writes, action-style section dispatcher
 
 **Single Active Job**:
 The MVP concurrency rule that one Executa Wrapper runs at most one Async Research Job at a time. A new start request while another job is running reports the current job instead of launching another.
@@ -97,7 +141,7 @@ The shape of a Research Result persisted by the Researcher Tool Backend: the com
 _Avoid_: File export bundle, debug context dump
 
 **Local Result Transfer Server**:
-A local transfer boundary used by the Anna App Shell and Researcher Tool Backend when a Research Result payload is too large for the Researcher Tool Protocol. It keeps App Tool Methods for control messages while leaving the Executa Local Job Store as the owner of persisted job records and results.
+A local transfer boundary used by the Anna App Shell and Researcher Tool Backend when a research payload is too large for the Researcher Tool Protocol. It covers completed Research Results, selected context, Section Writer Output, and assembled sectioned reports. It keeps App Tool Methods for control messages while leaving the Executa Local Job Store as the owner of persisted job records and results.
 _Avoid_: public web API, replacement backend, direct file access from the app shell
 
 **Polling Job Observation**:
@@ -124,6 +168,34 @@ _Avoid_: backend orchestrator, direct GPTResearcher runtime invocation, full bac
 The research behavior where Frontend LLM Completion chooses a research role for the query before planning searches and writing the report. It remains an explicit frontend orchestration stage rather than hidden inside backend work.
 _Avoid_: Fixed-only researcher role, implicit role selection
 
+**Confirmed Research Role**:
+The user-selected and optionally edited Adaptive Research Role that becomes part of the Async Research Job. LLM-generated role candidates are draft UI options until the user confirms one.
+_Avoid_: Role candidate, automatic role, hidden role choice
+
+**Research Role Candidate Set**:
+The draft set of Adaptive Research Role options generated by Frontend LLM Completion for user review. The default set contains three candidates, and the user confirms exactly one role before Research Focus generation.
+_Avoid_: Multiple active roles, persisted role candidates, hidden automatic role
+
+**Research Focus**:
+A user-confirmed emphasis for a Sectioned Research Job. Research Focus entries guide outline generation and section research, while LLM-generated focus candidates remain draft UI options until confirmed.
+_Avoid_: Query plan, search query, hidden brainstorming note
+
+**Research Focus Candidate Set**:
+The draft set of Research Focus options generated by Frontend LLM Completion for user review. The default set contains five candidates, and the user confirms one to five entries before outline planning.
+_Avoid_: Persisted focus record, unlimited brainstorming list, hidden prompt-only focus
+
+**Confirmed Research Outline**:
+The user-confirmed set of Report Sections for a Sectioned Research Job. It is the report structure that section-level research follows after the user has edited or accepted it.
+_Avoid_: Draft outline, generated-only outline, final report markdown
+
+**Confirmed-Only Recovery**:
+The recovery boundary where a Sectioned Research Job restores only user-confirmed role, focus, outline, section progress, and result data from persisted state. Unconfirmed LLM-generated candidate sets are draft UI state and may be regenerated after refresh.
+_Avoid_: Persisted candidate drafts, backend-owned draft recovery, hidden autosaved brainstorm
+
+**Two-Step Outline Planning**:
+The outline planning behavior where Frontend LLM Completion first drafts Report Sections from the confirmed role and Research Focus entries, then assigns Allowed Research Sources to those sections in a separate completion using the available Research Sources.
+_Avoid_: One-shot outline/source generation, per-section source prompt loop, backend outline planner
+
 **Bounded Query Planning**:
 The planning behavior where Frontend LLM Completion may generate a small structured set of search queries, while the original user query is always retained and invalid planning output falls back to the original query. It excludes iterative deep-research planning.
 _Avoid_: Unbounded query expansion, deep research planning
@@ -140,6 +212,10 @@ _Avoid_: Multi-source per-iteration call, free-form LLM tool call
 **Research Step Log**:
 The compact running summary of completed Research Step Decision calls fed back into the next decision prompt. Each entry records the iteration index, the Research Source identifier, the query, the result count, and the top result titles, so the LLM can avoid duplicate calls without re-reading raw results. It is not the persisted Research Result and is not exposed as user copy.
 _Avoid_: Raw retrieval payload, full LLM transcript
+
+**Section Research Step Log**:
+The Research Step Log scoped to one Report Section. Duplicate Research Step Decisions are prevented within a section, while the same Research Source and query may be valid in another section.
+_Avoid_: Job-wide duplicate log, cross-section query ban, global research log
 
 **Tavily Summary Retrieval**:
 The retrieval behavior where the Researcher Tool Backend uses Tavily search results as the source text for context selection, without independently scraping each result URL. It may merge results from multiple frontend-planned search queries, and source URLs are preserved as evidence while full-page extraction is deferred.

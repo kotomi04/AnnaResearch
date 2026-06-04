@@ -109,6 +109,47 @@ export interface IterationEntry {
   appended_at?: string;
 }
 
+export interface ConfirmedResearchRole {
+  server: string;
+  agent_role_prompt: string;
+}
+
+export interface ReportSection {
+  id: string;
+  title: string;
+  outline: string;
+  allowed_source_ids: string[];
+  max_iterations: number;
+}
+
+export interface SectionContext {
+  selected_context?: string;
+  selected_sources?: SearchResult[];
+  source_urls: string[];
+  selected_at?: string;
+  selected_context_chars?: number;
+  selected_sources_count?: number;
+}
+
+export interface SectionResult {
+  section_id: string;
+  status: string;
+  section_markdown?: string;
+  section_markdown_chars?: number;
+  section_summary: string;
+  source_urls: string[];
+  error?: ResearchError | null;
+  completed_at?: string | null;
+  updated_at?: string;
+}
+
+export interface ReportFraming {
+  title: string;
+  introduction: string;
+  conclusion: string;
+  created_at?: string;
+}
+
 export interface ResearchJob {
   research_id?: string;
   status?: ResearchStatus;
@@ -141,12 +182,24 @@ export interface ResearchJob {
   max_iterations?: number;
   enabled_sources?: string[];
   schema_version?: number;
+  workflow?: string;
+  confirmed_role?: ConfirmedResearchRole | null;
+  confirmed_focuses?: string[];
+  confirmed_outline?: ReportSection[];
+  active_section_index?: number | null;
+  section_iterations?: Record<string, IterationEntry[]>;
+  section_selected_context?: Record<string, SectionContext>;
+  section_results?: Record<string, SectionResult>;
+  report_framing?: ReportFraming | null;
+  assembled_result?: Record<string, unknown> | null;
+  result_transfer?: ResultTransferDescriptor;
 }
 
 export interface ResearchResult {
   research_id?: string;
   report_type?: string;
   report_markdown?: string;
+  report_markdown_chars?: number;
   source_urls?: string[];
   sources?: SearchResult[];
   status?: string;
@@ -210,4 +263,14 @@ export interface AnnaRuntimeGlobal {
   connect(): Promise<AnnaRuntimeApi>;
 }
 
-export type ResearchPhase = "idle" | "settings_required" | "starting" | "running" | "loading_result" | "completed" | "failed";
+export type ResearchPhase =
+  | "idle"
+  | "settings_required"
+  | "starting"
+  | "role_review"
+  | "focus_review"
+  | "outline_review"
+  | "running"
+  | "loading_result"
+  | "completed"
+  | "failed";

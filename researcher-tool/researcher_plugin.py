@@ -17,6 +17,9 @@ APP_METHODS = [
     "app_update_settings",
     "app_create_research_job",
     "app_update_research_job",
+    "app_save_confirmed_research_role",
+    "app_save_confirmed_research_focuses",
+    "app_save_confirmed_research_outline",
     "app_get_research_job",
     "app_list_research_sources",
     "app_update_research_source_credential",
@@ -25,7 +28,13 @@ APP_METHODS = [
     "app_delete_research_source",
     "app_test_research_source",
     "app_call_research_source",
+    "app_call_section_research_source",
     "app_select_context",
+    "app_select_section_context",
+    "app_save_section_result",
+    "app_fail_section",
+    "app_save_report_framing",
+    "app_save_assembled_research_result",
     "app_save_research_result",
 ]
 

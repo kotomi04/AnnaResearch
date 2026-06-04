@@ -2,6 +2,9 @@ import {
   TOOL_ID,
   type AnnaRuntimeApi,
   type IterationEntry,
+  type ConfirmedResearchRole,
+  type ReportFraming,
+  type ReportSection,
   type ResearchJob,
   type ResearchResult,
   type ResearchSourceTestResult,
@@ -41,6 +44,7 @@ interface ContextResponse extends JobResponse {
   selected_context?: string;
   selected_sources?: SearchResult[];
   source_urls?: string[];
+  context_transfer?: ResultTransferDescriptor;
 }
 
 interface ResultResponse extends JobResponse {
@@ -69,6 +73,29 @@ export interface ResearchApi {
     source_id: string;
     queries: string[];
   }): Promise<CallSourceResponse>;
+  saveConfirmedResearchRole(researchId: string, role: ConfirmedResearchRole): Promise<ResearchJob>;
+  saveConfirmedResearchFocuses(researchId: string, focuses: string[]): Promise<ResearchJob>;
+  saveConfirmedResearchOutline(researchId: string, sections: ReportSection[]): Promise<ResearchJob>;
+  callSectionResearchSource(input: {
+    research_id: string;
+    section_id: string;
+    iteration: number;
+    source_id: string;
+    queries: string[];
+  }): Promise<CallSourceResponse>;
+  selectSectionContext(input: { research_id: string; section_id: string }): Promise<ContextResponse>;
+  saveSectionResult(input: {
+    research_id: string;
+    section_id: string;
+    section_markdown: string;
+    section_summary: string;
+    source_urls?: string[];
+    status?: string;
+    error?: unknown;
+  }): Promise<ResearchJob>;
+  failSection(input: { research_id: string; section_id: string; error: unknown }): Promise<ResearchJob>;
+  saveReportFraming(input: { research_id: string; framing: ReportFraming }): Promise<ResearchJob>;
+  saveAssembledResearchResult(input: { research_id: string; report_markdown: string; source_urls?: string[] }): Promise<ResearchJob>;
   selectContext(input: {
     research_id: string;
     search_queries?: string[];
@@ -143,7 +170,10 @@ export class AnnaResearchApi implements ResearchApi {
 
   async getResearchJob(researchId?: string): Promise<ResearchJob | null> {
     const response = (await this.call("app_get_research_job", researchId ? { research_id: researchId } : {})) as JobResponse;
-    return response.job ?? null;
+    const job = response.job ?? null;
+    if (!job?.result_transfer) return job;
+    const data = await fetchTransfer<ResultResponse>(job.result_transfer);
+    return { ...job, result: data.result ?? job.result };
   }
 
   async callResearchSource(input: {
@@ -155,12 +185,75 @@ export class AnnaResearchApi implements ResearchApi {
     return (await this.call("app_call_research_source", input)) as CallSourceResponse;
   }
 
+  async saveConfirmedResearchRole(researchId: string, role: ConfirmedResearchRole): Promise<ResearchJob> {
+    return requireJob(await this.call("app_save_confirmed_research_role", { research_id: researchId, role }));
+  }
+
+  async saveConfirmedResearchFocuses(researchId: string, focuses: string[]): Promise<ResearchJob> {
+    return requireJob(await this.call("app_save_confirmed_research_focuses", { research_id: researchId, focuses }));
+  }
+
+  async saveConfirmedResearchOutline(researchId: string, sections: ReportSection[]): Promise<ResearchJob> {
+    return requireJob(await this.call("app_save_confirmed_research_outline", { research_id: researchId, sections }));
+  }
+
+  async callSectionResearchSource(input: {
+    research_id: string;
+    section_id: string;
+    iteration: number;
+    source_id: string;
+    queries: string[];
+  }): Promise<CallSourceResponse> {
+    return (await this.call("app_call_section_research_source", input)) as CallSourceResponse;
+  }
+
+  async selectSectionContext(input: { research_id: string; section_id: string }): Promise<ContextResponse> {
+    const response = (await this.call("app_select_section_context", input)) as ContextResponse;
+    if (!response.context_transfer?.url) return response;
+    const context = await fetchTransfer<ContextResponse>(response.context_transfer);
+    return { ...response, ...context, job: response.job };
+  }
+
+  async saveSectionResult(input: {
+    research_id: string;
+    section_id: string;
+    section_markdown: string;
+    section_summary: string;
+    source_urls?: string[];
+    status?: string;
+    error?: unknown;
+  }): Promise<ResearchJob> {
+    const response = (await this.call("app_save_section_result", { research_id: input.research_id, section_id: input.section_id })) as TransferResponse;
+    if (!response.transfer?.url) throw new Error("Section result save response did not include a transfer URL.");
+    const data = await fetchTransfer<ResultResponse & { section_result?: unknown }>(response.transfer, input);
+    return requireJob(data);
+  }
+
+  async failSection(input: { research_id: string; section_id: string; error: unknown }): Promise<ResearchJob> {
+    return requireJob(await this.call("app_fail_section", input));
+  }
+
+  async saveReportFraming(input: { research_id: string; framing: ReportFraming }): Promise<ResearchJob> {
+    return requireJob(await this.call("app_save_report_framing", input));
+  }
+
+  async saveAssembledResearchResult(input: { research_id: string; report_markdown: string; source_urls?: string[] }): Promise<ResearchJob> {
+    const response = (await this.call("app_save_assembled_research_result", { research_id: input.research_id })) as TransferResponse;
+    if (!response.transfer?.url) throw new Error("Assembled result save response did not include a transfer URL.");
+    const data = await fetchTransfer<ResultResponse>(response.transfer, input);
+    const job = requireJob(data);
+    return { ...job, result: data.result ?? job.result };
+  }
+
   async selectContext(input: {
     research_id: string;
     search_queries?: string[];
     search_results?: SearchResult[];
   }): Promise<ContextResponse> {
-    return (await this.call("app_select_context", input)) as ContextResponse;
+    const response = (await this.call("app_select_context", input)) as ContextResponse;
+    if (!response.context_transfer?.url) return response;
+    const context = await fetchTransfer<ContextResponse>(response.context_transfer);
+    return { ...response, ...context, job: response.job };
   }
 
   async saveResearchResult(input: { research_id: string }): Promise<ResultTransferDescriptor> {
@@ -170,17 +263,7 @@ export class AnnaResearchApi implements ResearchApi {
   }
 
   async uploadResearchResult(transfer: ResultTransferDescriptor, input: { report_markdown: string; source_urls?: string[] }): Promise<ResultResponse> {
-    const response = await fetch(transfer.url, {
-      method: transfer.method || "POST",
-      headers: { "Content-Type": transfer.content_type || "application/json" },
-      body: JSON.stringify(input),
-    });
-    const data = await response.json().catch(() => null);
-    if (!response.ok) {
-      const message = data?.message || data?.error || `Research result transfer failed with HTTP ${response.status}.`;
-      throw new Error(message);
-    }
-    return data as ResultResponse;
+    return fetchTransfer<ResultResponse>(transfer, input);
   }
 
   complete(request: Parameters<AnnaRuntimeApi["llm"]["complete"]>[0]) {
@@ -197,6 +280,22 @@ export class AnnaResearchApi implements ResearchApi {
     }
     return maybe && "data" in maybe ? maybe.data : response;
   }
+}
+
+async function fetchTransfer<T>(transfer: ResultTransferDescriptor, input?: unknown): Promise<T> {
+  const method = transfer.method || (input === undefined ? "GET" : "POST");
+  const init: RequestInit = { method };
+  if (input !== undefined) {
+    init.headers = { "Content-Type": transfer.content_type || "application/json" };
+    init.body = JSON.stringify(input);
+  }
+  const response = await fetch(transfer.url, init);
+  const data = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message = data?.message || data?.error || `Research transfer failed with HTTP ${response.status}.`;
+    throw new Error(message);
+  }
+  return data as T;
 }
 
 export function createStandaloneApi(): ResearchApi {
@@ -216,6 +315,15 @@ export function createStandaloneApi(): ResearchApi {
     updateResearchJob: fail,
     getResearchJob: fail,
     callResearchSource: fail,
+    saveConfirmedResearchRole: fail,
+    saveConfirmedResearchFocuses: fail,
+    saveConfirmedResearchOutline: fail,
+    callSectionResearchSource: fail,
+    selectSectionContext: fail,
+    saveSectionResult: fail,
+    failSection: fail,
+    saveReportFraming: fail,
+    saveAssembledResearchResult: fail,
     selectContext: fail,
     saveResearchResult: fail,
     uploadResearchResult: fail,

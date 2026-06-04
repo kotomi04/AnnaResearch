@@ -1,6 +1,10 @@
 # Iterative Research Loop Owned By Anna App Shell, Not Anna Agent
 
+Status: superseded by ADR-0006
+
 The Anna Research Orchestrator drives an Iterative Research Loop owned by the Anna App Shell, alternating one Research Step Decision call against `anna.llm.complete` with one Research Source call per iteration, accumulating a Research Step Log until the LLM emits a finish decision or a safety cap of five iterations is reached. The loop is implemented as plain frontend code rather than delegated to `anna.agent.session`. The decision is made now because the loop shape determines the structure of the progress UI, the failure-handling layer, the job store schema's `iterations[]` array, and the format of evidence assembly that flows into the Lexical Context Selector; switching to an Anna Agent session later would require rewriting all of those layers.
+
+This decision described the original single-loop research flow. The frontend-owned, non-Agent boundary remains accepted, but the single report-level loop and global five-iteration cap are superseded by ADR-0006's guided Sectioned Research Job model.
 
 **Consequences**
 

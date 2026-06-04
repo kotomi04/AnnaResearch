@@ -104,10 +104,33 @@ class AppDispatcher:
             if not isinstance(updates, dict):
                 raise ValidationError("updates must be an object")
             return {"job": status_view(self.jobs.update_metadata(research_id, updates))}
+        if method == "app_save_confirmed_research_role":
+            research_id = required_string(args, "research_id")
+            role = args.get("role")
+            if not isinstance(role, dict):
+                raise ValidationError("role must be an object")
+            return {"job": status_view(self.jobs.save_confirmed_role(research_id, role))}
+        if method == "app_save_confirmed_research_focuses":
+            research_id = required_string(args, "research_id")
+            focuses = args.get("focuses")
+            if not isinstance(focuses, list):
+                raise ValidationError("focuses must be an array")
+            return {"job": status_view(self.jobs.save_confirmed_focuses(research_id, focuses))}
+        if method == "app_save_confirmed_research_outline":
+            research_id = required_string(args, "research_id")
+            sections = args.get("sections")
+            if not isinstance(sections, list):
+                raise ValidationError("sections must be an array")
+            return {"job": compact_job_view(self.jobs.save_confirmed_outline(research_id, sections))}
         if method == "app_get_research_job":
             research_id = str(args.get("research_id") or "").strip()
             job = self.jobs.load(research_id) if research_id else self.jobs.load_latest()
-            return {"job": compact_job_view(job) if job else None}
+            if not job:
+                return {"job": None}
+            view = compact_job_view(job)
+            if job.get("report_markdown"):
+                view["result_transfer"] = self.transfer_server.result_descriptor(str(job.get("research_id")), method="GET")
+            return {"job": view}
         if method == "app_list_research_sources":
             return {"sources": self.registry.list_views()}
         if method == "app_update_research_source_credential":
@@ -122,8 +145,28 @@ class AppDispatcher:
             return self._test_source(args)
         if method == "app_call_research_source":
             return self._call_source(args)
+        if method == "app_call_section_research_source":
+            return self._call_section_source(args)
         if method == "app_select_context":
             return self._select_context(args)
+        if method == "app_select_section_context":
+            return self._select_section_context(args)
+        if method == "app_save_section_result":
+            return self._save_section_result(args)
+        if method == "app_fail_section":
+            research_id = required_string(args, "research_id")
+            section_id = required_string(args, "section_id")
+            return {"job": compact_job_view(self.jobs.fail_section(research_id, section_id, args.get("error")))}
+        if method == "app_save_report_framing":
+            research_id = required_string(args, "research_id")
+            framing = args.get("framing")
+            if not isinstance(framing, dict):
+                raise ValidationError("framing must be an object")
+            return {"job": compact_job_view(self.jobs.save_report_framing(research_id, framing))}
+        if method == "app_save_assembled_research_result":
+            research_id = required_string(args, "research_id")
+            self.jobs.load(research_id)
+            return {"transfer": self.transfer_server.assembled_result_descriptor(research_id)}
         if method == "app_save_research_result":
             return self._save_result(args)
         raise ValidationError(f"unknown app method: {method}")
@@ -294,6 +337,91 @@ class AppDispatcher:
             },
         }
 
+    def _call_section_source(self, args: dict[str, Any]) -> dict[str, Any]:
+        research_id = required_string(args, "research_id")
+        section_id = required_string(args, "section_id")
+        source_id = required_string(args, "source_id")
+        iteration = int(args.get("iteration") or 0)
+        queries = normalize_queries(args.get("queries"))
+        if not queries:
+            raise ValidationError("queries is required")
+        job = self.jobs.load(research_id)
+        section = _find_section(job, section_id)
+        allowed = set(section.get("allowed_source_ids") or [])
+        if source_id not in allowed:
+            raise ValidationError(
+                "source is not allowed for section",
+                data={"section_id": section_id, "source_id": source_id, "allowed_source_ids": sorted(allowed)},
+            )
+        try:
+            definition = self.registry.get_definition(source_id)
+        except Exception as exc:
+            raise ValidationError(f"unknown source: {source_id}") from exc
+
+        token = self._token_for(source_id)
+        if not token:
+            raise ConfigurationError(f"credential missing for source: {source_id}")
+
+        accepted_queries: list[str] = []
+        for query in queries:
+            normalized = normalize_query_for_dedup(query)
+            if not normalized:
+                continue
+            if self.jobs.has_section_called(research_id, section_id, source_id, normalized):
+                raise ValidationError(
+                    "duplicate section source call rejected",
+                    data={"section_id": section_id, "source_id": source_id, "query": query, "reason": "duplicate"},
+                )
+            accepted_queries.append(query)
+        if not accepted_queries:
+            raise ValidationError("queries must contain at least one new entry")
+
+        call_summaries: list[dict[str, Any]] = []
+        raw_results: list[dict[str, Any]] = []
+        first_error: str | None = None
+        for query in accepted_queries:
+            result = self.executor.call(definition, query)
+            error_code = result.error if result.error not in (None, "empty_result") else None
+            if error_code and first_error is None:
+                first_error = error_code
+            summary = {
+                "source_id": result.source_id,
+                "source_name": result.source_name,
+                "query": result.query,
+                "results_count": len(result.items),
+                "top_titles": [str(item.get("title") or "") for item in result.items[:3]],
+                "duration_ms": result.duration_ms,
+                "error": result.error,
+                "items": result.items,
+            }
+            call_summaries.append(summary)
+            raw_results.extend(result.items)
+
+        job = self.jobs.append_section_iteration(
+            research_id,
+            section_id=section_id,
+            iteration=iteration,
+            source_id=source_id,
+            source_name=str(definition.get("name") or source_id),
+            queries=accepted_queries,
+            source_calls=call_summaries,
+            raw_results=raw_results,
+        )
+        return {
+            "job": compact_job_view(job),
+            "source_call": {
+                "section_id": section_id,
+                "source_id": source_id,
+                "source_name": str(definition.get("name") or source_id),
+                "queries": accepted_queries,
+                "results_count": len(raw_results),
+                "top_titles": [str(item.get("title") or "") for item in raw_results[:3]],
+                "duration_ms": sum(int(c.get("duration_ms") or 0) for c in call_summaries),
+                "error": first_error,
+                "calls": [{k: v for k, v in c.items() if k != "items"} for c in call_summaries],
+            },
+        }
+
     def _select_context(self, args: dict[str, Any]) -> dict[str, Any]:
         research_id = required_string(args, "research_id")
         job = self.jobs.load(research_id)
@@ -304,7 +432,36 @@ class AppDispatcher:
             search_results=search_results,
         )
         job = self.jobs.save_selected_context(research_id, selected)
-        return {"job": status_view(job), **selected}
+        return {"job": status_view(job), "context_transfer": self.transfer_server.context_descriptor(research_id)}
+
+    def _select_section_context(self, args: dict[str, Any]) -> dict[str, Any]:
+        research_id = required_string(args, "research_id")
+        section_id = required_string(args, "section_id")
+        job = self.jobs.load(research_id)
+        section = _find_section(job, section_id)
+        iterations = (job.get("section_iterations") or {}).get(section_id, []) or []
+        search_results = [
+            item
+            for iteration in iterations
+            for item in (iteration.get("raw_results") or [])
+        ]
+        search_queries = sorted({query for iteration in iterations for query in (iteration.get("queries") or [])})
+        selected = self.selector.select(
+            query=f"{job.get('query')}\n\nSection: {section.get('title')}\n{section.get('outline')}",
+            search_queries=search_queries or [job.get("query")],
+            search_results=search_results,
+        )
+        job = self.jobs.save_section_selected_context(research_id, section_id, selected)
+        return {
+            "job": compact_job_view(job),
+            "context_transfer": self.transfer_server.section_context_descriptor(research_id, section_id),
+        }
+
+    def _save_section_result(self, args: dict[str, Any]) -> dict[str, Any]:
+        research_id = required_string(args, "research_id")
+        section_id = required_string(args, "section_id")
+        _find_section(self.jobs.load(research_id), section_id)
+        return {"transfer": self.transfer_server.section_result_descriptor(research_id, section_id)}
 
     def _save_result(self, args: dict[str, Any]) -> dict[str, Any]:
         research_id = required_string(args, "research_id")
@@ -324,6 +481,13 @@ def required_string(args: dict[str, Any], key: str) -> str:
     if not value:
         raise ValidationError(f"{key} is required")
     return value
+
+
+def _find_section(job: dict[str, Any], section_id: str) -> dict[str, Any]:
+    for section in job.get("confirmed_outline") or []:
+        if str(section.get("id") or "") == section_id:
+            return section
+    raise ValidationError("unknown section_id", data={"section_id": section_id})
 
 
 def normalize_queries(value: Any) -> list[str]:

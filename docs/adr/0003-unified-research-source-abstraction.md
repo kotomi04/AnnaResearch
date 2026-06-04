@@ -12,4 +12,10 @@ Built-in and User-Configured entries are listed together by `app_list_research_s
 
 Job records persist an `iterations[]` array where each iteration names one `source_id`. The job schema does not have separate Tavily-only fields. Older job files that predate the unified schema are not migrated; they are surfaced as legacy in the UI and excluded from continued orchestration.
 
+Sectioned Research Jobs keep the same unified Research Source abstraction, but scope source use and duplicate prevention to Report Sections. Each Report Section carries Allowed Research Sources as a strict whitelist, and section-level Research Step Decisions may only choose from that whitelist. The same `(source_id, normalized_query)` may be valid in another section, so duplicate-call prevention must use Section Research Step Log scope rather than a job-wide query ban.
+
+Lexical Context Selector remains source-agnostic but runs per section in the sectioned workflow. Each section's selected context is built from that section's normalized source results, then the section writer produces section markdown and a Section Summary. Final Report Framing uses Section Summaries rather than raw source results or all section contexts.
+
 Tests must lock the unified boundary: a User-Configured Research Source and the Tavily Built-in Research Source produce identical downstream behavior in the Lexical Context Selector, both flow through `app_call_research_source`, and both are listed by `app_list_research_sources` with the same envelope of fields modulo `kind` and `definition`.
+
+Sectioned workflow tests must additionally lock that source assignment produces only known configured source IDs, section calls reject sources outside a section's Allowed Research Sources, and identical source/query pairs are rejected within one section while remaining legal across different sections.

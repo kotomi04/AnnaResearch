@@ -93,15 +93,19 @@ def test_call_research_source_context_result(tmp_path: Path):
     assert_true(call["source_call"]["results_count"] > 0, "call should return synthetic results")
     assert_true(all("items" not in c for c in call["source_call"]["calls"]), "items must be stripped from public payload")
     selected = dispatcher.dispatch("app_select_context", {"research_id": research_id})
-    assert_true(bool(selected["selected_context"]), "context should be selected")
-    assert_true("[来源:" in selected["selected_context"], "context items must carry source prefix")
+    assert_true("selected_context" not in selected, "context should not return through stdio")
+    context = get_json(selected["context_transfer"]["url"])
+    assert_true(bool(context["selected_context"]), "context should be selected")
+    assert_true("[来源:" in context["selected_context"], "context items must carry source prefix")
     transfer = dispatcher.dispatch("app_save_research_result", {"research_id": research_id})["transfer"]
     assert_true(transfer["method"] == "POST", "save should return transfer descriptor")
-    saved = post_json(transfer["url"], {"report_markdown": "# Research Report\n\nDone", "source_urls": selected["source_urls"]})
+    saved = post_json(transfer["url"], {"report_markdown": "# Research Report\n\nDone", "source_urls": context["source_urls"]})
     assert_true(saved["result"]["report_markdown"].startswith("# Research Report"), "result should persist")
     assert_true("sources" not in saved["result"], "http result should be compact")
     loaded = dispatcher.dispatch("app_get_research_job", {"research_id": research_id})["job"]
-    assert_true(loaded["result"]["report_markdown"].startswith("# Research Report"), "loaded job should include result")
+    assert_true("report_markdown" not in loaded["result"], "loaded job should not include full result markdown")
+    restored = get_json(loaded["result_transfer"]["url"])
+    assert_true(restored["result"]["report_markdown"].startswith("# Research Report"), "result transfer should restore markdown")
     assert_true("search_results" not in loaded, "loaded job should be compact")
     assert_true(loaded["iterations"], "loaded job should expose iterations")
     assert_true(all("raw_results" not in it for it in loaded["iterations"]), "raw_results must never leave the backend")
@@ -123,6 +127,59 @@ def test_result_transfer_http(tmp_path: Path):
         raise AssertionError("blank report should fail")
     except urllib.error.HTTPError as exc:
         assert_true(exc.code == 400, "blank report should return 400")
+
+
+def test_section_large_payload_transfer(tmp_path: Path):
+    os.environ["ANNA_RESEARCHER_FAKE_TAVILY"] = "1"
+    dispatcher = make_dispatcher(tmp_path)
+    job = dispatcher.dispatch("app_create_research_job", {"query": "anna section"})["job"]
+    research_id = job["research_id"]
+    dispatcher.dispatch(
+        "app_save_confirmed_research_outline",
+        {
+            "research_id": research_id,
+            "sections": [
+                {
+                    "id": "section-1",
+                    "title": "Section One",
+                    "outline": "Cover Anna section evidence.",
+                    "allowed_source_ids": ["tavily"],
+                    "max_iterations": 1,
+                }
+            ],
+        },
+    )
+    dispatcher.dispatch(
+        "app_call_section_research_source",
+        {"research_id": research_id, "section_id": "section-1", "iteration": 1, "source_id": "tavily", "queries": ["anna section"]},
+    )
+    selected = dispatcher.dispatch("app_select_section_context", {"research_id": research_id, "section_id": "section-1"})
+    assert_true("selected_context" not in selected, "section context should not return through stdio")
+    section_context = get_json(selected["context_transfer"]["url"])
+    assert_true(bool(section_context["selected_context"]), "section context transfer should return context")
+    assert_true("selected_context" not in selected["job"]["section_selected_context"]["section-1"], "job view should not include section context text")
+    section_transfer = dispatcher.dispatch("app_save_section_result", {"research_id": research_id, "section_id": "section-1"})["transfer"]
+    section_saved = post_json(
+        section_transfer["url"],
+        {
+            "section_markdown": "## Section One\n\n" + ("large section. " * 200),
+            "section_summary": "large section summary",
+            "source_urls": section_context["source_urls"],
+            "status": "completed",
+        },
+    )
+    assert_true(section_saved["section_result"]["section_markdown"].startswith("## Section One"), "section result transfer should save markdown")
+    loaded = dispatcher.dispatch("app_get_research_job", {"research_id": research_id})["job"]
+    assert_true("section_markdown" not in loaded["section_results"]["section-1"], "job view should not include section markdown")
+    assembled_transfer = dispatcher.dispatch("app_save_assembled_research_result", {"research_id": research_id})["transfer"]
+    assembled = post_json(
+        assembled_transfer["url"],
+        {"report_markdown": "# Final\n\n" + ("assembled report. " * 200), "source_urls": section_context["source_urls"]},
+    )
+    assert_true(assembled["result"]["report_markdown"].startswith("# Final"), "assembled result transfer should save final report")
+    final_job = dispatcher.dispatch("app_get_research_job", {"research_id": research_id})["job"]
+    assert_true("report_markdown" not in final_job["result"], "final job view should not include full report")
+    assert_true(final_job["result_transfer"]["method"] == "GET", "final job should expose result read transfer")
 
 
 def test_call_research_source_requires_credential(tmp_path: Path):
@@ -228,6 +285,12 @@ def post_json(url: str, payload: dict):
         return json.loads(response.read().decode("utf-8"))
 
 
+def get_json(url: str):
+    request = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 def test_bundle_contract():
     bundle_js = "\n".join(path.read_text(encoding="utf-8") for path in (APP_ROOT / "bundle").glob("assets/*.js"))
     manifest = (APP_ROOT / "manifest.json").read_text(encoding="utf-8")
@@ -246,6 +309,7 @@ def main():
         ("job_shell", test_job_shell),
         ("call_research_source", test_call_research_source_context_result),
         ("result_transfer_http", test_result_transfer_http),
+        ("section_large_payload_transfer", test_section_large_payload_transfer),
         ("call_requires_credential", test_call_research_source_requires_credential),
         ("selector", lambda tmp: test_selector()),
         ("plugin_contract", test_plugin_contract),

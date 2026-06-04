@@ -2,7 +2,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { MAX_RESEARCH_ITERATIONS, useResearchJob } from "../../src/hooks/useResearchJob";
 import type { ResearchApi } from "../../src/api/researchApi";
-import type { ResearchSourceView, SourceCallResult } from "../../src/types";
+import type { ConfirmedResearchRole, ReportFraming, ReportSection, ResearchSourceView, SourceCallResult } from "../../src/types";
 
 type LlmReply = string;
 
@@ -126,6 +126,82 @@ function makeApi(options: ApiOptions = {}) {
         },
       };
     },
+    async saveConfirmedResearchRole(researchId: string, role: ConfirmedResearchRole) {
+      calls.push(["saveConfirmedResearchRole", researchId, role]);
+      return { research_id: researchId, status: "created", stage: "brainstorm_focus", progress: 15, query: "anna", confirmed_role: role };
+    },
+    async saveConfirmedResearchFocuses(researchId: string, focuses: string[]) {
+      calls.push(["saveConfirmedResearchFocuses", researchId, focuses]);
+      return { research_id: researchId, status: "created", stage: "plan_outline", progress: 25, query: "anna", confirmed_focuses: focuses };
+    },
+    async saveConfirmedResearchOutline(researchId: string, sections: ReportSection[]) {
+      calls.push(["saveConfirmedResearchOutline", researchId, sections]);
+      return { research_id: researchId, status: "running", stage: "section_research", progress: 35, query: "anna", confirmed_outline: sections };
+    },
+    async callSectionResearchSource(input) {
+      calls.push(["callSectionResearchSource", input]);
+      const override = callOverrides[callIndex] ?? {};
+      callIndex++;
+      return {
+        job: {
+          research_id: input.research_id,
+          status: "running",
+          stage: "section_research",
+          progress: 50 + input.iteration * 5,
+          iteration: input.iteration,
+          section_iterations: {},
+        },
+        source_call: {
+          source_id: input.source_id,
+          source_name: input.source_id === "custom" ? "Custom" : "Tavily",
+          queries: input.queries,
+          results_count: override.results_count ?? input.queries.length,
+          top_titles: override.top_titles ?? input.queries.map((q) => `Title for ${q}`),
+          duration_ms: 5,
+          error: override.error ?? null,
+          calls: override.calls ?? input.queries.map((q) => ({
+            source_id: input.source_id,
+            source_name: input.source_id === "custom" ? "Custom" : "Tavily",
+            query: q,
+            results_count: 1,
+            top_titles: [`Title for ${q}`],
+            duration_ms: 5,
+            error: null,
+          })),
+        },
+      };
+    },
+    async selectSectionContext(input) {
+      calls.push(["selectSectionContext", input]);
+      return {
+        job: { research_id: input.research_id, status: "running", stage: "select_context", progress: 88 },
+        selected_context: `FULL CONTEXT ${input.section_id}`,
+        selected_sources: [],
+        source_urls: [`https://example.com/${input.section_id}`],
+      };
+    },
+    async saveSectionResult(input) {
+      calls.push(["saveSectionResult", input]);
+      return { research_id: input.research_id, status: "running", stage: "section_research", progress: 80 };
+    },
+    async failSection(input) {
+      calls.push(["failSection", input]);
+      return { research_id: input.research_id, status: "failed", stage: "failed", error: { message: "failed" } };
+    },
+    async saveReportFraming(input: { research_id: string; framing: ReportFraming }) {
+      calls.push(["saveReportFraming", input]);
+      return { research_id: input.research_id, status: "running", stage: "assemble_report", progress: 96, report_framing: input.framing };
+    },
+    async saveAssembledResearchResult(input) {
+      calls.push(["saveAssembledResearchResult", input]);
+      return {
+        research_id: input.research_id,
+        status: "completed",
+        stage: "completed",
+        progress: 100,
+        result: { report_markdown: input.report_markdown, source_urls: input.source_urls },
+      };
+    },
     async selectContext(input) {
       calls.push(["selectContext", input]);
       return {
@@ -163,9 +239,28 @@ function makeApi(options: ApiOptions = {}) {
   return { api, calls, llmCalls };
 }
 
-const ROLE_REPLY = '{"server":"Researcher","agent_role_prompt":"Use sources."}';
-const FINISH_REPLY = '{"type":"finish"}';
-const REPORT_REPLY = "# Done\n\nUses FULL CONTEXT";
+const ROLE_REPLY = '{"roles":[{"server":"Researcher","agent_role_prompt":"Use sources.","rationale":"good"},{"server":"Analyst","agent_role_prompt":"Analyze sources."},{"server":"Expert","agent_role_prompt":"Expert sources."}]}';
+const FOCUS_REPLY = '{"focuses":[{"text":"focus one"},{"text":"focus two"},{"text":"focus three"},{"text":"focus four"},{"text":"focus five"}]}';
+const OUTLINE_REPLY = '{"sections":[{"title":"Section One","outline":"Cover one.","max_iterations":2},{"title":"Section Two","outline":"Cover two.","max_iterations":1},{"title":"Section Three","outline":"Cover three.","max_iterations":1},{"title":"Section Four","outline":"Cover four.","max_iterations":1}]}';
+const ASSIGN_REPLY = '{"sections":[{"id":"section-1","allowed_source_ids":["tavily"]},{"id":"section-2","allowed_source_ids":["tavily"]},{"id":"section-3","allowed_source_ids":["tavily"]},{"id":"section-4","allowed_source_ids":["tavily"]}]}';
+const DECISION_REPLY = '{"type":"call_source","queries":["anna query"]}';
+const SECTION_REPLY = '{"section_markdown":"## Section One\\n\\nUses FULL CONTEXT","section_summary":"section summary"}';
+const FRAMING_REPLY = '{"title":"Done","introduction":"Intro","conclusion":"Conclusion"}';
+
+async function planToOutline(result: ReturnType<typeof renderHook<ReturnType<typeof useResearchJob>, unknown>>["result"]) {
+  await act(async () => {
+    await result.current.start("anna");
+  });
+  await waitFor(() => expect(result.current.phase).toBe("role_review"));
+  await act(async () => {
+    await result.current.confirmRole(result.current.roleCandidates[0]);
+  });
+  await waitFor(() => expect(result.current.phase).toBe("focus_review"));
+  await act(async () => {
+    await result.current.confirmFocuses(["focus one"]);
+  });
+  await waitFor(() => expect(result.current.phase).toBe("outline_review"));
+}
 
 describe("useResearchJob (iterative loop)", () => {
   it("gates research when no research source credential is configured", async () => {
@@ -180,13 +275,29 @@ describe("useResearchJob (iterative loop)", () => {
     expect(calls.some((call) => Array.isArray(call) && call[0] === "createResearchJob")).toBe(false);
   });
 
-  it("runs a single iteration then finishes when the decision says finish", async () => {
+  it("generates role candidates and waits for user confirmation", async () => {
+    const { api, llmCalls } = makeApi({ llmReplies: [ROLE_REPLY] });
+    const { result } = renderHook(() => useResearchJob(api));
+
+    await waitFor(() => expect(result.current.phase).toBe("idle"));
+    await act(async () => {
+      await result.current.start("anna");
+    });
+
+    expect(result.current.phase).toBe("role_review");
+    expect(result.current.roleCandidates).toHaveLength(3);
+    expect(result.current.roleCandidates[0]).toMatchObject({ server: "Researcher", agent_role_prompt: "Use sources." });
+    expect(llmCalls).toHaveLength(1);
+    expect(JSON.stringify(llmCalls[0])).toContain("roles");
+  });
+
+  it("confirms role and focus candidates before outline generation", async () => {
     const { api, calls, llmCalls } = makeApi({
       llmReplies: [
         ROLE_REPLY,
-        '{"type":"call_source","queries":["anna query","second query"]}',
-        FINISH_REPLY,
-        REPORT_REPLY,
+        FOCUS_REPLY,
+        OUTLINE_REPLY,
+        ASSIGN_REPLY,
       ],
     });
     const { result } = renderHook(() => useResearchJob(api));
@@ -194,77 +305,68 @@ describe("useResearchJob (iterative loop)", () => {
     await waitFor(() => expect(result.current.phase).toBe("idle"));
     await act(async () => {
       await result.current.start("anna");
+    });
+
+    await act(async () => {
+      await result.current.confirmRole(result.current.roleCandidates[0]);
+    });
+    expect(result.current.phase).toBe("focus_review");
+    expect(result.current.focusCandidates).toHaveLength(5);
+    await act(async () => {
+      await result.current.confirmFocuses(["focus one", "focus two"]);
+    });
+    expect(result.current.phase).toBe("outline_review");
+    expect(result.current.outlineDraft).toHaveLength(4);
+    expect(result.current.outlineDraft[0].allowed_source_ids).toEqual(["tavily"]);
+    expect(llmCalls).toHaveLength(4);
+    expect(calls.some((call) => Array.isArray(call) && call[0] === "saveConfirmedResearchRole")).toBe(true);
+    expect(calls.some((call) => Array.isArray(call) && call[0] === "saveConfirmedResearchFocuses")).toBe(true);
+    expect(JSON.stringify(calls)).not.toContain("query_domains");
+    expect(JSON.stringify(calls)).not.toContain("search_index");
+    expect(JSON.stringify(calls)).not.toContain("search_total");
+  });
+
+  it("runs confirmed outline through section source calls, section writer, framing, and final assembly", async () => {
+    const { api, calls } = makeApi({
+      llmReplies: [
+        ROLE_REPLY,
+        FOCUS_REPLY,
+        OUTLINE_REPLY,
+        ASSIGN_REPLY,
+        DECISION_REPLY,
+        '{"type":"finish"}',
+        SECTION_REPLY,
+        '{"type":"finish"}',
+        SECTION_REPLY.replace("Section One", "Section Two"),
+        '{"type":"finish"}',
+        SECTION_REPLY.replace("Section One", "Section Three"),
+        '{"type":"finish"}',
+        SECTION_REPLY.replace("Section One", "Section Four"),
+        FRAMING_REPLY,
+      ],
+    });
+    const { result } = renderHook(() => useResearchJob(api));
+
+    await waitFor(() => expect(result.current.phase).toBe("idle"));
+    await planToOutline(result);
+    await act(async () => {
+      await result.current.confirmOutlineAndRun(result.current.outlineDraft);
     });
 
     expect(result.current.phase).toBe("completed");
     expect(result.current.result?.report_markdown).toContain("# Done");
-    expect(llmCalls).toHaveLength(4);
-
-    const callSourceCalls = calls.filter((call) => Array.isArray(call) && call[0] === "callResearchSource");
-    expect(callSourceCalls).toHaveLength(1);
-    expect(callSourceCalls[0]).toEqual([
-      "callResearchSource",
-      { research_id: "r1", iteration: 1, source_id: "tavily", queries: ["anna query", "second query"] },
-    ]);
-
-    const decisionMessages = JSON.stringify(llmCalls[1]);
-    expect(decisionMessages).toContain("call_source");
-    expect(decisionMessages).toContain("finish");
-    expect(decisionMessages).toContain("Iteration: 1/5");
-    expect(JSON.stringify(calls)).not.toContain("query_domains");
-    expect(JSON.stringify(calls)).not.toContain("search_index");
-    expect(JSON.stringify(calls)).not.toContain("search_total");
-    expect(JSON.stringify(calls.find((call) => Array.isArray(call) && call[0] === "saveResearchResult"))).not.toContain(
-      "report_markdown",
-    );
+    expect(result.current.result?.report_markdown).toContain("## Section One");
+    expect(result.current.result?.report_markdown).toContain("## Conclusion");
+    const callSourceCalls = calls.filter((call) => Array.isArray(call) && call[0] === "callSectionResearchSource");
+    expect(callSourceCalls.length).toBeGreaterThanOrEqual(1);
+    expect((callSourceCalls[0] as unknown[])[1]).toMatchObject({ section_id: "section-1", source_id: "tavily", queries: ["anna query"] });
+    expect(calls.some((call) => Array.isArray(call) && call[0] === "selectSectionContext")).toBe(true);
+    expect(calls.some((call) => Array.isArray(call) && call[0] === "saveSectionResult")).toBe(true);
+    expect(calls.some((call) => Array.isArray(call) && call[0] === "saveReportFraming")).toBe(true);
+    expect(calls.some((call) => Array.isArray(call) && call[0] === "saveAssembledResearchResult")).toBe(true);
   });
 
-  it("iterates multiple times when the LLM keeps requesting more searches, capped at MAX_RESEARCH_ITERATIONS", async () => {
-    const replies = [ROLE_REPLY];
-    for (let i = 1; i <= MAX_RESEARCH_ITERATIONS; i++) {
-      replies.push(JSON.stringify({ type: "call_source", queries: [`q${i}`] }));
-    }
-    replies.push(REPORT_REPLY);
-    const { api, calls } = makeApi({ llmReplies: replies });
-    const { result } = renderHook(() => useResearchJob(api));
-
-    await waitFor(() => expect(result.current.phase).toBe("idle"));
-    await act(async () => {
-      await result.current.start("anna");
-    });
-
-    expect(result.current.phase).toBe("completed");
-    const callSourceCalls = calls.filter((call) => Array.isArray(call) && call[0] === "callResearchSource");
-    expect(callSourceCalls).toHaveLength(MAX_RESEARCH_ITERATIONS);
-    expect((callSourceCalls[0] as unknown[])[1]).toMatchObject({ iteration: 1, queries: ["q1"] });
-    expect((callSourceCalls[MAX_RESEARCH_ITERATIONS - 1] as unknown[])[1]).toMatchObject({
-      iteration: MAX_RESEARCH_ITERATIONS,
-    });
-  });
-
-  it("skips duplicate queries and finishes when the LLM keeps repeating them", async () => {
-    const { api, calls, llmCalls } = makeApi({
-      llmReplies: [
-        ROLE_REPLY,
-        '{"type":"call_source","queries":["anna query"]}',
-        '{"type":"call_source","queries":["Anna Query","anna query"]}',
-        REPORT_REPLY,
-      ],
-    });
-    const { result } = renderHook(() => useResearchJob(api));
-
-    await waitFor(() => expect(result.current.phase).toBe("idle"));
-    await act(async () => {
-      await result.current.start("anna");
-    });
-
-    expect(result.current.phase).toBe("completed");
-    const callSourceCalls = calls.filter((call) => Array.isArray(call) && call[0] === "callResearchSource");
-    expect(callSourceCalls).toHaveLength(1);
-    expect(llmCalls).toHaveLength(4);
-  });
-
-  it("calls a non-default source when the decision picks one from the enabled set", async () => {
+  it("uses a section-level allowed non-default source when the decision picks it", async () => {
     const tavily: ResearchSourceView = {
       id: "tavily",
       name: "Tavily",
@@ -287,28 +389,38 @@ describe("useResearchJob (iterative loop)", () => {
       sources: [tavily, custom],
       llmReplies: [
         ROLE_REPLY,
+        FOCUS_REPLY,
+        OUTLINE_REPLY,
+        '{"sections":[{"id":"section-1","allowed_source_ids":["custom"]},{"id":"section-2","allowed_source_ids":["tavily"]},{"id":"section-3","allowed_source_ids":["tavily"]},{"id":"section-4","allowed_source_ids":["tavily"]}]}',
         '{"type":"call_source","source_id":"custom","queries":["focused query"]}',
-        FINISH_REPLY,
-        REPORT_REPLY,
+        SECTION_REPLY,
+        '{"type":"finish"}',
+        SECTION_REPLY,
+        '{"type":"finish"}',
+        SECTION_REPLY,
+        '{"type":"finish"}',
+        SECTION_REPLY,
+        FRAMING_REPLY,
       ],
     });
     const { result } = renderHook(() => useResearchJob(api));
 
     await waitFor(() => expect(result.current.phase).toBe("idle"));
+    await planToOutline(result);
     await act(async () => {
-      await result.current.start("anna");
+      await result.current.confirmOutlineAndRun(result.current.outlineDraft);
     });
 
     expect(result.current.phase).toBe("completed");
-    const callSourceCalls = calls.filter((call) => Array.isArray(call) && call[0] === "callResearchSource");
-    expect(callSourceCalls).toHaveLength(1);
+    const callSourceCalls = calls.filter((call) => Array.isArray(call) && call[0] === "callSectionResearchSource");
+    expect(callSourceCalls.length).toBeGreaterThanOrEqual(1);
     expect((callSourceCalls[0] as unknown[])[1]).toMatchObject({ source_id: "custom", queries: ["focused query"] });
-    const sourcesList = JSON.stringify(llmCalls[1]);
-    expect(sourcesList).toContain("tavily");
+    const sourcesList = JSON.stringify(llmCalls[4]);
     expect(sourcesList).toContain("custom");
+    expect(sourcesList).not.toContain("tavily (Tavily)");
   });
 
-  it("ignores an unknown source_id and falls back to the first enabled source", async () => {
+  it("falls back to the section whitelist when the decision returns an unknown source_id", async () => {
     const tavily: ResearchSourceView = {
       id: "tavily",
       name: "Tavily",
@@ -322,19 +434,29 @@ describe("useResearchJob (iterative loop)", () => {
       sources: [tavily],
       llmReplies: [
         ROLE_REPLY,
+        FOCUS_REPLY,
+        OUTLINE_REPLY,
+        ASSIGN_REPLY,
         '{"type":"call_source","source_id":"unknown","queries":["anna fallback"]}',
-        FINISH_REPLY,
-        REPORT_REPLY,
+        SECTION_REPLY,
+        '{"type":"finish"}',
+        SECTION_REPLY,
+        '{"type":"finish"}',
+        SECTION_REPLY,
+        '{"type":"finish"}',
+        SECTION_REPLY,
+        FRAMING_REPLY,
       ],
     });
     const { result } = renderHook(() => useResearchJob(api));
 
     await waitFor(() => expect(result.current.phase).toBe("idle"));
+    await planToOutline(result);
     await act(async () => {
-      await result.current.start("anna");
+      await result.current.confirmOutlineAndRun(result.current.outlineDraft);
     });
 
-    const callSourceCalls = calls.filter((call) => Array.isArray(call) && call[0] === "callResearchSource");
+    const callSourceCalls = calls.filter((call) => Array.isArray(call) && call[0] === "callSectionResearchSource");
     expect((callSourceCalls[0] as unknown[])[1]).toMatchObject({ source_id: "tavily" });
   });
 
@@ -366,24 +488,26 @@ describe("useResearchJob (iterative loop)", () => {
     ]);
   });
 
-  it("falls back to using the raw query when the first decision returns invalid JSON", async () => {
+  it("falls back to using the section title when the first section decision returns invalid JSON", async () => {
     const { api, calls } = makeApi({
-      llmReplies: [ROLE_REPLY, "not json", FINISH_REPLY, REPORT_REPLY],
+      llmReplies: [ROLE_REPLY, FOCUS_REPLY, OUTLINE_REPLY, ASSIGN_REPLY, "not json", SECTION_REPLY, '{"type":"finish"}', SECTION_REPLY, '{"type":"finish"}', SECTION_REPLY, '{"type":"finish"}', SECTION_REPLY, FRAMING_REPLY],
     });
     const { result } = renderHook(() => useResearchJob(api));
 
     await waitFor(() => expect(result.current.phase).toBe("idle"));
+    await planToOutline(result);
     await act(async () => {
-      await result.current.start("anna");
+      await result.current.confirmOutlineAndRun(result.current.outlineDraft);
     });
 
-    const callSourceCalls = calls.filter((call) => Array.isArray(call) && call[0] === "callResearchSource");
-    expect(callSourceCalls).toHaveLength(1);
+    const callSourceCalls = calls.filter((call) => Array.isArray(call) && call[0] === "callSectionResearchSource");
+    expect(callSourceCalls.length).toBeGreaterThanOrEqual(1);
     expect((callSourceCalls[0] as unknown[])[1]).toMatchObject({
       research_id: "r1",
+      section_id: "section-1",
       iteration: 1,
       source_id: "tavily",
-      queries: ["anna"],
+      queries: ["Section One"],
     });
   });
 });

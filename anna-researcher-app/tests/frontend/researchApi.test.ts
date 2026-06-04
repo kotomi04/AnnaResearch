@@ -84,7 +84,10 @@ describe("AnnaResearchApi", () => {
             };
           }
           if (request.method === "app_select_context") {
-            return { success: true, data: { selected_context: "context", selected_sources: [], source_urls: [] } };
+            return {
+              success: true,
+              data: { context_transfer: { method: "GET", url: "http://127.0.0.1:43123/contexts/r1", content_type: "application/json" } },
+            };
           }
           if (request.method === "app_save_research_result") {
             return {
@@ -107,6 +110,12 @@ describe("AnnaResearchApi", () => {
     const fetchCalls: unknown[] = [];
     globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
       fetchCalls.push([url, init]);
+      if (String(url).includes("/contexts/")) {
+        return new Response(JSON.stringify({ selected_context: "context", selected_sources: [], source_urls: ["https://example.com/context"] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
       return new Response(
         JSON.stringify({ result: { report_markdown: "# Report", source_urls: ["https://example.com"] } }),
         { status: 200, headers: { "Content-Type": "application/json" } },
@@ -143,8 +152,91 @@ describe("AnnaResearchApi", () => {
         { tool_id: TOOL_ID, method: "app_select_context", args: { research_id: "r1" } },
         { tool_id: TOOL_ID, method: "app_save_research_result", args: { research_id: "r1" } },
       ]);
-      expect(fetchCalls).toHaveLength(1);
-      expect(JSON.stringify(fetchCalls[0])).toContain("# Report");
+      expect(fetchCalls).toHaveLength(2);
+      expect(fetchCalls[0]).toEqual(["http://127.0.0.1:43123/contexts/r1", { method: "GET" }]);
+      expect(JSON.stringify(fetchCalls[1])).toContain("# Report");
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("keeps section and assembled large payloads out of tool invoke arguments", async () => {
+    const calls: unknown[] = [];
+    const anna: AnnaRuntimeApi = {
+      tools: {
+        async invoke(request) {
+          calls.push(request);
+          if (request.method === "app_select_section_context") {
+            return {
+              success: true,
+              data: {
+                job: { research_id: "r1" },
+                context_transfer: { method: "GET", url: "http://127.0.0.1:43123/section-contexts/r1/section-1", content_type: "application/json" },
+              },
+            };
+          }
+          if (request.method === "app_save_section_result") {
+            return {
+              success: true,
+              data: {
+                transfer: { method: "POST", url: "http://127.0.0.1:43123/section-results/r1/section-1", content_type: "application/json" },
+              },
+            };
+          }
+          if (request.method === "app_save_assembled_research_result") {
+            return {
+              success: true,
+              data: {
+                transfer: { method: "POST", url: "http://127.0.0.1:43123/assembled-research-results/r1", content_type: "application/json" },
+              },
+            };
+          }
+          return { success: true, data: { job: { research_id: "r1" } } };
+        },
+      },
+      llm: {
+        async complete() {
+          return { content: { type: "text", text: "{}" } };
+        },
+      },
+    };
+    const oldFetch = globalThis.fetch;
+    const fetchCalls: unknown[] = [];
+    globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+      fetchCalls.push([url, init]);
+      if (String(url).includes("/section-contexts/")) {
+        return new Response(JSON.stringify({ selected_context: "section context", selected_sources: [], source_urls: ["https://example.com/s"] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          job: { research_id: "r1", status: "completed" },
+          result: { report_markdown: "# Final", source_urls: ["https://example.com/s"] },
+          section_result: { section_markdown: "## Section", section_summary: "summary" },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    try {
+      const api = new AnnaResearchApi(anna);
+      await api.selectSectionContext({ research_id: "r1", section_id: "section-1" });
+      await api.saveSectionResult({
+        research_id: "r1",
+        section_id: "section-1",
+        section_markdown: "## Section",
+        section_summary: "summary",
+        source_urls: ["https://example.com/s"],
+        status: "completed",
+      });
+      await api.saveAssembledResearchResult({ research_id: "r1", report_markdown: "# Final", source_urls: ["https://example.com/s"] });
+
+      expect(JSON.stringify(calls)).not.toContain("## Section");
+      expect(JSON.stringify(calls)).not.toContain("# Final");
+      expect(JSON.stringify(fetchCalls)).toContain("## Section");
+      expect(JSON.stringify(fetchCalls)).toContain("# Final");
     } finally {
       globalThis.fetch = oldFetch;
     }

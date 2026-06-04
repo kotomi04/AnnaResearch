@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ResearchApi } from "../api/researchApi";
 import type {
+  ConfirmedResearchRole,
   IterationEntry,
+  ReportFraming,
+  ReportSection,
   ResearchJob,
   ResearchPhase,
   ResearchResult,
@@ -11,6 +14,16 @@ import type {
 } from "../types";
 
 export const MAX_RESEARCH_ITERATIONS = 5;
+
+export interface RoleCandidate extends ConfirmedResearchRole {
+  rationale?: string;
+}
+
+export interface FocusCandidate {
+  id: string;
+  text: string;
+  rationale?: string;
+}
 
 interface DecideCallSource {
   type: "call_source";
@@ -32,6 +45,9 @@ export function useResearchJob(api: ResearchApi) {
   const [sources, setSources] = useState<ResearchSourceView[]>([]);
   const [phase, setPhase] = useState<ResearchPhase>("idle");
   const [error, setError] = useState<unknown>(null);
+  const [roleCandidates, setRoleCandidates] = useState<RoleCandidate[]>([]);
+  const [focusCandidates, setFocusCandidates] = useState<FocusCandidate[]>([]);
+  const [outlineDraft, setOutlineDraft] = useState<ReportSection[]>([]);
   const runIdRef = useRef(0);
 
   const refreshSources = useCallback(async () => {
@@ -54,23 +70,17 @@ export function useResearchJob(api: ResearchApi) {
       try {
         const [nextSettings, nextSources] = await Promise.all([api.getSettings(), api.listResearchSources()]);
         if (cancelled) return;
-        setError(null);
         setSettings(nextSettings);
         setSources(nextSources);
         const latest = await api.getResearchJob();
         if (cancelled) return;
+        setError(null);
+        setJob(latest);
+        setResult(latest?.result || null);
         const ready = hasConfiguredSource(nextSources);
-        if (latest) {
-          setJob(latest);
-          if (latest.result) {
-            setResult(latest.result);
-            setPhase(latest.status === "completed" ? "completed" : "idle");
-          } else {
-            setPhase(ready ? "idle" : "settings_required");
-          }
-        } else {
-          setPhase(ready ? "idle" : "settings_required");
-        }
+        if (!ready) setPhase("settings_required");
+        else if (latest?.status === "completed" && latest.result) setPhase("completed");
+        else setPhase("idle");
       } catch (err) {
         if (!cancelled) {
           setError(err);
@@ -90,183 +100,197 @@ export function useResearchJob(api: ResearchApi) {
       if (!updated.some((source) => source.id === next.id)) updated.push(next);
       setSources(updated);
       const ready = hasConfiguredSource(updated);
-      setPhase(ready ? "idle" : "settings_required");
+      if (!ready) setPhase("settings_required");
       return updated;
     },
     [sources],
   );
 
   const updateSourceCredential = useCallback(
-    async (input: { id: string; credential?: string; clear?: boolean }) => {
-      const next = await api.updateResearchSourceCredential(input);
-      applySourceUpdate(next);
-      return next;
-    },
+    async (input: { id: string; credential?: string; clear?: boolean }) => applySourceUpdate(await api.updateResearchSourceCredential(input)),
     [api, applySourceUpdate],
   );
 
   const setSourceEnabled = useCallback(
-    async (input: { id: string; enabled: boolean }) => {
-      const next = await api.setResearchSourceEnabled(input);
-      applySourceUpdate(next);
-      return next;
-    },
+    async (input: { id: string; enabled: boolean }) => applySourceUpdate(await api.setResearchSourceEnabled(input)),
     [api, applySourceUpdate],
   );
 
   const upsertSource = useCallback(
-    async (input: { definition: Record<string, unknown>; credential?: string }) => {
-      const next = await api.upsertResearchSource(input);
-      applySourceUpdate(next);
-      return next;
-    },
+    async (input: { definition: Record<string, unknown>; credential?: string }) => applySourceUpdate(await api.upsertResearchSource(input)),
     [api, applySourceUpdate],
   );
 
   const deleteSource = useCallback(
     async (input: { id: string }) => {
-      const result = await api.deleteResearchSource(input);
+      const deleted = await api.deleteResearchSource(input);
       const remaining = sources.filter((source) => source.id !== input.id);
       setSources(remaining);
-      const ready = hasConfiguredSource(remaining);
-      setPhase(ready ? "idle" : "settings_required");
-      return result;
+      if (!hasConfiguredSource(remaining)) setPhase("settings_required");
+      return deleted;
     },
     [api, sources],
   );
 
   const testSource = useCallback(
-    async (input: { id: string; definition: Record<string, unknown>; query: string }): Promise<ResearchSourceTestResult> => {
-      return api.testResearchSource(input);
-    },
+    async (input: { id: string; definition: Record<string, unknown>; query: string }): Promise<ResearchSourceTestResult> => api.testResearchSource(input),
     [api],
   );
 
   const start = useCallback(
-    async (query: string) => {
+    async (query: string, regenerationInstruction = "") => {
       const runId = runIdRef.current + 1;
       runIdRef.current = runId;
       setPhase("starting");
       setError(null);
       setResult(null);
+      setFocusCandidates([]);
+      setOutlineDraft([]);
       try {
         const current = await refreshSettings();
         if (!hasConfiguredSource(current.sources)) {
           setPhase("settings_required");
           return;
         }
-        let job = await api.createResearchJob({ query });
+        const nextJob = await api.createResearchJob({ query });
         if (runId !== runIdRef.current) return;
-        setJob(job);
-        setPhase("running");
-
-        job = await updateJob(api, job, { status: "running", stage: "select_role", progress: 10 });
-        setJob(job);
-        const role = await selectRole(api, query);
-        const enabledSources = readyEnabledSources(current.sources);
-        if (enabledSources.length === 0) throw new Error("No enabled research source is configured.");
-        const enabledSourceIds = enabledSources.map((source) => source.id);
-        const defaultSourceId = enabledSourceIds[0];
-
-        job = await updateJob(api, job, {
-          agent_name: role.agent_name,
-          agent_role_prompt: role.agent_role_prompt,
-          stage: "decide_next_action",
-          iteration: 0,
-          max_iterations: MAX_RESEARCH_ITERATIONS,
-          enabled_sources: enabledSourceIds,
-          progress: 20,
-        });
-        setJob(job);
+        setJob(nextJob);
+        const candidates = await generateRoleCandidates(api, query, regenerationInstruction);
         if (runId !== runIdRef.current) return;
-
-        const calledNormalized = new Map<string, Set<string>>();
-        const localIterations: IterationEntry[] = [];
-
-        for (let iteration = 1; iteration <= MAX_RESEARCH_ITERATIONS; iteration++) {
-          job = await updateJob(api, job, {
-            stage: "decide_next_action",
-            iteration,
-            progress: progressForIteration(iteration),
-          });
-          setJob(job);
-          if (runId !== runIdRef.current) return;
-
-          const decision = await decideNextAction({
-            api,
-            query,
-            rolePrompt: role.agent_role_prompt,
-            iteration,
-            maxIterations: MAX_RESEARCH_ITERATIONS,
-            enabledSources,
-            history: localIterations,
-          });
-          if (decision.type !== "call_source") break;
-
-          const requestedSourceId = decision.source_id && enabledSourceIds.includes(decision.source_id)
-            ? decision.source_id
-            : defaultSourceId;
-          const seenForSource = calledNormalized.get(requestedSourceId) ?? new Set<string>();
-          const newQueries = uniqueNewQueries(decision.queries, seenForSource);
-          calledNormalized.set(requestedSourceId, seenForSource);
-          if (newQueries.length === 0) break;
-
-          job = await updateJob(api, job, {
-            stage: "search_next_query",
-            iteration,
-            progress: progressForIteration(iteration) + 5,
-          });
-          setJob(job);
-
-          const call = await api.callResearchSource({
-            research_id: requiredResearchId(job),
-            iteration,
-            source_id: requestedSourceId,
-            queries: newQueries,
-          });
-          if (call.job) job = call.job;
-          if (call.source_call) {
-            localIterations.push({
-              iteration,
-              source_id: call.source_call.source_id,
-              source_name: call.source_call.source_name,
-              queries: call.source_call.queries,
-              results_count: call.source_call.results_count,
-              source_calls: call.source_call.calls,
-            });
-          }
-          setJob(job);
-          if (runId !== runIdRef.current) return;
-        }
-
-        job = await updateJob(api, job, { stage: "select_context", progress: 88 });
-        setJob(job);
-
-        const selected = await api.selectContext({ research_id: requiredResearchId(job) });
-        if (selected.job) job = selected.job;
-        setJob({ ...job, stage: "write_report", progress: 94 });
-
-        const report = await writeReport(
-          api,
-          query,
-          role.agent_role_prompt,
-          selected.selected_context || job.selected_context || "",
-        );
-        const transfer = await api.saveResearchResult({ research_id: requiredResearchId(job) });
-        const saved = await api.uploadResearchResult(transfer, {
-          report_markdown: report,
-          source_urls: selected.source_urls || job.source_urls || [],
-        });
-        if (saved.job) job = saved.job;
-        setJob(job);
-        setResult(saved.result || job.result || null);
-        setPhase("completed");
+        setRoleCandidates(candidates);
+        setPhase("role_review");
       } catch (err) {
         setError(err);
         setPhase("failed");
       }
     },
     [api, refreshSettings],
+  );
+
+  const regenerateRoles = useCallback(
+    async (instruction = "") => {
+      const query = job?.query || "";
+      if (!query) return;
+      setPhase("starting");
+      try {
+        setRoleCandidates(await generateRoleCandidates(api, query, instruction));
+        setPhase("role_review");
+      } catch (err) {
+        setError(err);
+        setPhase("failed");
+      }
+    },
+    [api, job?.query],
+  );
+
+  const confirmRole = useCallback(
+    async (role: ConfirmedResearchRole) => {
+      if (!job?.research_id) throw new Error("Research job is missing research_id.");
+      try {
+        const saved = await api.saveConfirmedResearchRole(job.research_id, role);
+        setJob({ ...job, ...saved, confirmed_role: role });
+        const candidates = await generateFocusCandidates(api, job.query || "", role);
+        setFocusCandidates(candidates);
+        setPhase("focus_review");
+      } catch (err) {
+        setError(err);
+        setPhase("failed");
+      }
+    },
+    [api, job],
+  );
+
+  const regenerateFocuses = useCallback(
+    async (instruction = "") => {
+      const role = job?.confirmed_role;
+      if (!job?.query || !role) return;
+      setPhase("starting");
+      try {
+        setFocusCandidates(await generateFocusCandidates(api, job.query, role, instruction));
+        setPhase("focus_review");
+      } catch (err) {
+        setError(err);
+        setPhase("failed");
+      }
+    },
+    [api, job?.confirmed_role, job?.query],
+  );
+
+  const confirmFocuses = useCallback(
+    async (focuses: string[]) => {
+      if (!job?.research_id || !job.confirmed_role) throw new Error("Research job is not ready for focus confirmation.");
+      try {
+        const saved = await api.saveConfirmedResearchFocuses(job.research_id, focuses);
+        setJob({ ...job, ...saved, confirmed_focuses: focuses });
+        const outline = await generateOutlineDraft(api, job.query || "", job.confirmed_role, focuses);
+        const assigned = await assignAllowedSources(api, outline, readyEnabledSources(sources));
+        setOutlineDraft(assigned);
+        setPhase("outline_review");
+      } catch (err) {
+        setError(err);
+        setPhase("failed");
+      }
+    },
+    [api, job, sources],
+  );
+
+  const regenerateOutline = useCallback(
+    async (instruction = "") => {
+      if (!job?.query || !job.confirmed_role || !job.confirmed_focuses?.length) return;
+      setPhase("starting");
+      try {
+        const outline = await generateOutlineDraft(api, job.query, job.confirmed_role, job.confirmed_focuses, instruction);
+        setOutlineDraft(await assignAllowedSources(api, outline, readyEnabledSources(sources), instruction));
+        setPhase("outline_review");
+      } catch (err) {
+        setError(err);
+        setPhase("failed");
+      }
+    },
+    [api, job?.confirmed_focuses, job?.confirmed_role, job?.query, sources],
+  );
+
+  const confirmOutlineAndRun = useCallback(
+    async (sections: ReportSection[]) => {
+      if (!job?.research_id || !job.confirmed_role || !job.confirmed_focuses) throw new Error("Research job is not ready for outline confirmation.");
+      const runId = runIdRef.current + 1;
+      runIdRef.current = runId;
+      setPhase("running");
+      try {
+        let currentJob = await api.saveConfirmedResearchOutline(job.research_id, sections);
+        setJob(currentJob);
+        const sectionResults: Array<{ section: ReportSection; markdown: string; summary: string; sourceUrls: string[] }> = [];
+        for (let index = 0; index < sections.length; index++) {
+          const section = sections[index];
+          currentJob = await updateJob(api, currentJob, {
+            status: "running",
+            stage: "section_research",
+            active_section_index: index,
+            progress: Math.min(90, 35 + Math.round((index / sections.length) * 50)),
+          });
+          setJob(currentJob);
+          if (runId !== runIdRef.current) return;
+          const sectionResult = await runSection({ api, job: currentJob, section, role: job.confirmed_role, focuses: job.confirmed_focuses, sources: readyEnabledSources(sources) });
+          sectionResults.push({ section, ...sectionResult });
+          currentJob = (await api.getResearchJob(job.research_id)) || currentJob;
+          setJob(currentJob);
+        }
+        currentJob = await updateJob(api, currentJob, { stage: "report_framing", progress: 94 });
+        setJob(currentJob);
+        const framing = await generateReportFraming(api, job.query || "", job.confirmed_focuses, sections, sectionResults);
+        currentJob = await api.saveReportFraming({ research_id: job.research_id, framing });
+        const reportMarkdown = assembleReport(framing, sectionResults);
+        const sourceUrls = sortedUnique(sectionResults.flatMap((section) => section.sourceUrls));
+        currentJob = await api.saveAssembledResearchResult({ research_id: job.research_id, report_markdown: reportMarkdown, source_urls: sourceUrls });
+        setJob(currentJob);
+        setResult(currentJob.result || { research_id: job.research_id, report_markdown: reportMarkdown, source_urls: sourceUrls, status: "completed" });
+        setPhase("completed");
+      } catch (err) {
+        setError(err);
+        setPhase("failed");
+      }
+    },
+    [api, job, sources],
   );
 
   return {
@@ -276,6 +300,12 @@ export function useResearchJob(api: ResearchApi) {
     sources,
     phase,
     error,
+    roleCandidates,
+    focusCandidates,
+    outlineDraft,
+    setRoleCandidates,
+    setFocusCandidates,
+    setOutlineDraft,
     isBusy: phase === "starting" || phase === "running" || phase === "loading_result",
     canStart: hasConfiguredSource(sources),
     refreshSettings,
@@ -286,6 +316,12 @@ export function useResearchJob(api: ResearchApi) {
     deleteSource,
     testSource,
     start,
+    regenerateRoles,
+    confirmRole,
+    regenerateFocuses,
+    confirmFocuses,
+    regenerateOutline,
+    confirmOutlineAndRun,
   };
 }
 
@@ -306,84 +342,189 @@ function requiredResearchId(job: ResearchJob): string {
   return job.research_id;
 }
 
-function progressForIteration(iteration: number): number {
-  return Math.min(80, 25 + iteration * 12);
+function progressForIteration(iteration: number, maxIterations: number): number {
+  return Math.min(85, 40 + Math.round((iteration / Math.max(1, maxIterations)) * 35));
 }
 
-function normalizeForDedup(query: string): string {
-  return query.toLowerCase().split(/\s+/).filter(Boolean).join(" ");
-}
-
-function uniqueNewQueries(queries: unknown, called: Set<string>): string[] {
-  if (!Array.isArray(queries)) return [];
-  const out: string[] = [];
-  for (const raw of queries) {
-    const text = String(raw || "").trim();
-    if (!text) continue;
-    const norm = normalizeForDedup(text);
-    if (!norm || called.has(norm)) continue;
-    called.add(norm);
-    out.push(text.slice(0, 180));
-    if (out.length >= 3) break;
-  }
-  return out;
-}
-
-async function selectRole(api: ResearchApi, query: string): Promise<{ agent_name: string; agent_role_prompt: string }> {
+async function generateRoleCandidates(api: ResearchApi, query: string, instruction = ""): Promise<RoleCandidate[]> {
   const text = await completeText(api, [
     {
       role: "user",
       content: {
         type: "text",
-        text: `Choose a research agent role for this task. Return JSON with keys "server" and "agent_role_prompt" only.\n\nTask: ${query}`,
+        text:
+          "Generate exactly 3 possible research roles for this task. Return strict JSON only: " +
+          '{"roles":[{"server":"...","agent_role_prompt":"...","rationale":"..."}]}.\n' +
+          "Each agent_role_prompt must be specific and source-grounded.\n" +
+          (instruction ? `Regeneration requirement: ${instruction}\n` : "") +
+          `Task:\n${query}`,
       },
     },
   ]);
   const parsed = parseJsonObject(text);
-  return {
-    agent_name: String(parsed?.server || "Default Research Assistant"),
-    agent_role_prompt: String(
-      parsed?.agent_role_prompt || "You are an objective research assistant who writes structured, source-grounded reports.",
-    ),
-  };
+  const roles = Array.isArray(parsed?.roles) ? parsed.roles : [];
+  const candidates = roles.map(normalizeRoleCandidate).filter(Boolean) as RoleCandidate[];
+  return padRoles(candidates).slice(0, 3);
+}
+
+async function generateFocusCandidates(api: ResearchApi, query: string, role: ConfirmedResearchRole, instruction = ""): Promise<FocusCandidate[]> {
+  const text = await completeText(api, [
+    {
+      role: "system",
+      content: { type: "text", text: role.agent_role_prompt },
+    },
+    {
+      role: "user",
+      content: {
+        type: "text",
+        text:
+          'Generate exactly 5 research focus candidates. Return strict JSON only: {"focuses":[{"text":"...","rationale":"..."}]}.\n' +
+          (instruction ? `Regeneration requirement: ${instruction}\n` : "") +
+          `Task:\n${query}`,
+      },
+    },
+  ]);
+  const parsed = parseJsonObject(text);
+  const focuses = Array.isArray(parsed?.focuses) ? parsed.focuses : [];
+  const candidates = focuses
+    .map((item, index) => ({ id: `focus-${index + 1}`, text: String(item?.text || item || "").trim(), rationale: String(item?.rationale || "").trim() }))
+    .filter((item) => item.text);
+  return padFocuses(candidates).slice(0, 5);
+}
+
+async function generateOutlineDraft(api: ResearchApi, query: string, role: ConfirmedResearchRole, focuses: string[], instruction = ""): Promise<ReportSection[]> {
+  const text = await completeText(api, [
+    { role: "system", content: { type: "text", text: role.agent_role_prompt } },
+    {
+      role: "user",
+      content: {
+        type: "text",
+        text:
+          'Draft 4 to 6 report sections. Return strict JSON only: {"sections":[{"title":"...","outline":"...","max_iterations":5}]}.\n' +
+          "Do not assign sources in this call.\n" +
+          (instruction ? `Regeneration requirement: ${instruction}\n` : "") +
+          `Task:\n${query}\n\nResearch focuses:\n${focuses.map((focus) => `- ${focus}`).join("\n")}`,
+      },
+    },
+  ]);
+  const parsed = parseJsonObject(text);
+  const sections = Array.isArray(parsed?.sections) ? parsed.sections : [];
+  const normalized = sections.map(normalizeSectionDraft).filter(Boolean) as ReportSection[];
+  return padSections(normalized).slice(0, 6);
+}
+
+async function assignAllowedSources(api: ResearchApi, sections: ReportSection[], sources: ResearchSourceView[], instruction = ""): Promise<ReportSection[]> {
+  if (!sources.length) throw new Error("No enabled research source is configured.");
+  const sourceBlock = sources.map((source) => `- ${source.id}: ${source.name} ${source.description || ""}`).join("\n");
+  const text = await completeText(api, [
+    {
+      role: "user",
+      content: {
+        type: "text",
+        text:
+          'Assign allowed research sources for every section. Return strict JSON only: {"sections":[{"id":"section-1","allowed_source_ids":["source-id"]}]}.\n' +
+          "Use only source ids from the available list. Every section needs at least one allowed source.\n" +
+          (instruction ? `Regeneration requirement: ${instruction}\n` : "") +
+          `Available sources:\n${sourceBlock}\n\nSections:\n${JSON.stringify(sections.map(({ id, title, outline }) => ({ id, title, outline })))}`,
+      },
+    },
+  ]);
+  const parsed = parseJsonObject(text);
+  const assignments = new Map<string, string[]>();
+  const valid = new Set(sources.map((source) => source.id));
+  for (const item of Array.isArray(parsed?.sections) ? parsed.sections : []) {
+    const ids = Array.isArray(item?.allowed_source_ids) ? item.allowed_source_ids.map(String).filter((id) => valid.has(id)) : [];
+    if (item?.id && ids.length) assignments.set(String(item.id), sortedUnique(ids));
+  }
+  const fallback = sources[0].id;
+  return sections.map((section) => ({ ...section, allowed_source_ids: assignments.get(section.id) || [fallback] }));
+}
+
+async function runSection(input: {
+  api: ResearchApi;
+  job: ResearchJob;
+  section: ReportSection;
+  role: ConfirmedResearchRole;
+  focuses: string[];
+  sources: ResearchSourceView[];
+}): Promise<{ markdown: string; summary: string; sourceUrls: string[] }> {
+  const { api, job, section, role, focuses, sources } = input;
+  const allowedSources = sources.filter((source) => section.allowed_source_ids.includes(source.id));
+  if (!allowedSources.length) throw new Error(`Section has no configured allowed source: ${section.title}`);
+  const history: IterationEntry[] = [];
+  for (let iteration = 1; iteration <= section.max_iterations; iteration++) {
+    await updateJob(api, job, { stage: "section_research", iteration, progress: progressForIteration(iteration, section.max_iterations) });
+    const decision = await decideNextAction({
+      api,
+      query: job.query || "",
+      rolePrompt: role.agent_role_prompt,
+      section,
+      focuses,
+      iteration,
+      maxIterations: section.max_iterations,
+      enabledSources: allowedSources,
+      history,
+    });
+    if (decision.type !== "call_source") break;
+    const sourceId = allowedSources.some((source) => source.id === decision.source_id) ? String(decision.source_id) : allowedSources[0].id;
+    const queries = uniqueQueries(decision.queries.length ? decision.queries : [section.title]);
+    if (!queries.length) break;
+    const call = await api.callSectionResearchSource({
+      research_id: requiredResearchId(job),
+      section_id: section.id,
+      iteration,
+      source_id: sourceId,
+      queries,
+    });
+    if (call.source_call) {
+      history.push({
+        iteration,
+        source_id: call.source_call.source_id,
+        source_name: call.source_call.source_name,
+        queries: call.source_call.queries,
+        results_count: call.source_call.results_count,
+        source_calls: call.source_call.calls,
+      });
+    }
+    if (call.source_call?.error && iteration >= section.max_iterations) break;
+  }
+  const selected = await api.selectSectionContext({ research_id: requiredResearchId(job), section_id: section.id });
+  const writer = await writeSection(api, job.query || "", role, focuses, section, selected.selected_context || "");
+  const sourceUrls = selected.source_urls || [];
+  await api.saveSectionResult({
+    research_id: requiredResearchId(job),
+    section_id: section.id,
+    section_markdown: writer.markdown,
+    section_summary: writer.summary,
+    source_urls: sourceUrls,
+    status: "completed",
+  });
+  return { ...writer, sourceUrls };
 }
 
 async function decideNextAction(input: {
   api: ResearchApi;
   query: string;
   rolePrompt: string;
+  section: ReportSection;
+  focuses: string[];
   iteration: number;
   maxIterations: number;
   enabledSources: ResearchSourceView[];
   history: IterationEntry[];
 }): Promise<Decision> {
-  const { api, query, rolePrompt, iteration, maxIterations, enabledSources, history } = input;
-  const defaultSourceId = enabledSources[0]?.id || "";
-  const sourcesBlock = enabledSources
-    .map((source) => `- ${source.id} (${source.name})`)
-    .join("\n");
-  const historyBlock = history.length
-    ? history
-        .map((entry) => {
-          const titles = entry.source_calls
-            .flatMap((call) => call.top_titles)
-            .filter(Boolean)
-            .slice(0, 5)
-            .join(" | ");
-          return `- iteration ${entry.iteration} via ${entry.source_name}: queries=${JSON.stringify(entry.queries)} results=${entry.results_count} titles=${titles}`;
-        })
-        .join("\n")
-    : "(no prior iterations)";
+  const { api, query, rolePrompt, section, focuses, iteration, maxIterations, enabledSources, history } = input;
+  const sourcesBlock = enabledSources.map((source) => `- ${source.id} (${source.name})`).join("\n");
+  const historyBlock = history.length ? history.map((entry) => `- iteration ${entry.iteration}: ${entry.queries.join(", ")} (${entry.results_count} results)`).join("\n") : "(no prior iterations)";
   const text = await completeText(api, [
     {
       role: "system",
       content: {
         type: "text",
         text:
-          (rolePrompt || "You are an objective research assistant.") +
-          "\n\nDecide the next research step. Reply with strict JSON only.\n" +
-          'Return either {"type":"call_source","source_id":"<id>","queries":[...]} to gather more context, or {"type":"finish"} when you have enough to write the report.\n' +
-          "Pick a source_id from the available list. Avoid repeating prior queries. Prefer finishing once you have enough breadth and depth.",
+          rolePrompt +
+          "\n\nDecide the next research step for one report section. Reply with strict JSON only. " +
+          'Return {"type":"call_source","source_id":"<allowed-id>","queries":["..."]} or {"type":"finish"}.',
       },
     },
     {
@@ -391,55 +532,84 @@ async function decideNextAction(input: {
       content: {
         type: "text",
         text:
-          `Task: ${query}\n` +
-          `Available sources:\n${sourcesBlock}\n` +
-          `Iteration: ${iteration}/${maxIterations}\n` +
-          `Prior iterations:\n${historyBlock}\n\n` +
-          'Return JSON: {"type":"call_source","source_id":"<id>","queries":["..."]} OR {"type":"finish"}.',
+          `Task:\n${query}\n\nSection: ${section.title}\n${section.outline}\n\nFocuses:\n${focuses.map((focus) => `- ${focus}`).join("\n")}\n\n` +
+          `Allowed sources:\n${sourcesBlock}\nIteration: ${iteration}/${maxIterations}\nPrior iterations:\n${historyBlock}`,
       },
     },
   ]);
   const parsed = parseJsonObject(text);
-  const type = String(parsed?.type || "").trim();
-  if (type === "call_source") {
-    const queries = Array.isArray(parsed?.queries) ? (parsed!.queries as unknown[]) : [];
-    const normalized = queries
-      .map((entry) => String(entry || "").trim())
-      .filter((entry): entry is string => Boolean(entry));
-    const requestedId = String(parsed?.source_id || "").trim();
-    const sourceId = enabledSources.some((s) => s.id === requestedId) ? requestedId : defaultSourceId;
-    if (iteration === 1 && normalized.length === 0) {
-      return { type: "call_source", source_id: sourceId, queries: [query] };
-    }
-    return { type: "call_source", source_id: sourceId, queries: normalized };
+  if (parsed?.type === "call_source") {
+    const queries = Array.isArray(parsed.queries) ? parsed.queries.map(String).filter(Boolean) : [];
+    return { type: "call_source", source_id: String(parsed.source_id || ""), queries };
   }
-  if (type === "finish") return { type: "finish" };
-  if (iteration === 1) return { type: "call_source", source_id: defaultSourceId, queries: [query] };
+  if (iteration === 1) return { type: "call_source", source_id: enabledSources[0]?.id, queries: [section.title] };
   return { type: "finish" };
 }
 
-async function writeReport(api: ResearchApi, query: string, rolePrompt: string, selectedContext: string): Promise<string> {
+async function writeSection(
+  api: ResearchApi,
+  query: string,
+  role: ConfirmedResearchRole,
+  focuses: string[],
+  section: ReportSection,
+  selectedContext: string,
+): Promise<{ markdown: string; summary: string }> {
   const text = await completeText(api, [
-    {
-      role: "system",
-      content: {
-        type: "text",
-        text:
-          (rolePrompt || "You are an objective research assistant.") +
-          "\n\nContext items below carry a [来源: <name>] prefix; you may optionally attribute facts to specific sources but are not required to label every paragraph.",
-      },
-    },
+    { role: "system", content: { type: "text", text: role.agent_role_prompt } },
     {
       role: "user",
       content: {
         type: "text",
-        text: `Write a concise markdown research_report for: ${query}\n\nUse only the provided context. Include clear headings and cite sources by URL when useful.\n\nContext:\n${selectedContext}`,
+        text:
+          'Write one report section. Return strict JSON only: {"section_markdown":"...","section_summary":"..."}.\n' +
+          "Use only the provided context. The markdown should include the section heading and cite URLs when useful.\n\n" +
+          `Task:\n${query}\n\nFocuses:\n${focuses.map((focus) => `- ${focus}`).join("\n")}\n\nSection: ${section.title}\n${section.outline}\n\nContext:\n${selectedContext}`,
       },
     },
   ]);
-  const report = text.trim();
-  if (!report) throw new Error("Anna LLM returned an empty report.");
-  return report;
+  const parsed = parseJsonObject(text);
+  const markdown = String(parsed?.section_markdown || "").trim();
+  const summary = String(parsed?.section_summary || "").trim();
+  if (markdown) return { markdown, summary: summary || deriveSummary(markdown) };
+  const fallback = text.trim();
+  if (!fallback) throw new Error(`Anna LLM returned an empty section for ${section.title}.`);
+  return { markdown: fallback, summary: deriveSummary(fallback) };
+}
+
+async function generateReportFraming(
+  api: ResearchApi,
+  query: string,
+  focuses: string[],
+  sections: ReportSection[],
+  results: Array<{ section: ReportSection; summary: string }>,
+): Promise<ReportFraming> {
+  const text = await completeText(api, [
+    {
+      role: "user",
+      content: {
+        type: "text",
+        text:
+          'Generate report framing only. Return strict JSON only: {"title":"...","introduction":"...","conclusion":"..."}.\n' +
+          "Do not rewrite section bodies.\n\n" +
+          `Task:\n${query}\n\nFocuses:\n${focuses.map((focus) => `- ${focus}`).join("\n")}\n\n` +
+          `Outline titles:\n${sections.map((section) => `- ${section.title}`).join("\n")}\n\n` +
+          `Section summaries:\n${results.map((result) => `- ${result.section.title}: ${result.summary}`).join("\n")}`,
+      },
+    },
+  ]);
+  const parsed = parseJsonObject(text);
+  return {
+    title: String(parsed?.title || "Research Report").trim(),
+    introduction: String(parsed?.introduction || `This report addresses ${query}.`).trim(),
+    conclusion: String(parsed?.conclusion || "The sections above summarize the available evidence.").trim(),
+  };
+}
+
+function assembleReport(framing: ReportFraming, results: Array<{ markdown: string }>): string {
+  return [`# ${framing.title || "Research Report"}`, framing.introduction, ...results.map((result) => result.markdown), "## Conclusion", framing.conclusion]
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 async function completeText(api: ResearchApi, messages: Parameters<ResearchApi["complete"]>[0]["messages"]): Promise<string> {
@@ -462,6 +632,68 @@ function parseJsonObject(text: string): Record<string, unknown> | null {
       return null;
     }
   }
+}
+
+function normalizeRoleCandidate(item: unknown): RoleCandidate | null {
+  const data = item as Record<string, unknown>;
+  const server = String(data?.server || "").trim();
+  const prompt = String(data?.agent_role_prompt || "").trim();
+  if (!server || !prompt) return null;
+  return { server, agent_role_prompt: prompt, rationale: String(data?.rationale || "").trim() };
+}
+
+function normalizeSectionDraft(item: unknown, index: number): ReportSection | null {
+  const data = item as Record<string, unknown>;
+  const title = String(data?.title || "").trim();
+  const outline = String(data?.outline || data?.content || "").trim();
+  if (!title || !outline) return null;
+  const max = Math.max(1, Math.min(10, Number(data?.max_iterations || 5)));
+  return { id: `section-${index + 1}`, title, outline, allowed_source_ids: [], max_iterations: max };
+}
+
+function padRoles(roles: RoleCandidate[]): RoleCandidate[] {
+  const out = [...roles];
+  while (out.length < 3) {
+    out.push({
+      server: `Research Role ${out.length + 1}`,
+      agent_role_prompt: "You are an objective research assistant who writes structured, source-grounded reports.",
+      rationale: "Fallback role generated because Anna LLM output was incomplete.",
+    });
+  }
+  return out;
+}
+
+function padFocuses(focuses: FocusCandidate[]): FocusCandidate[] {
+  const out = [...focuses];
+  while (out.length < 5) out.push({ id: `focus-${out.length + 1}`, text: `Research focus ${out.length + 1}` });
+  return out;
+}
+
+function padSections(sections: ReportSection[]): ReportSection[] {
+  const out = [...sections];
+  while (out.length < 4) {
+    out.push({
+      id: `section-${out.length + 1}`,
+      title: `Section ${out.length + 1}`,
+      outline: "Cover the most relevant evidence for this part of the research task.",
+      allowed_source_ids: [],
+      max_iterations: 5,
+    });
+  }
+  return out.map((section, index) => ({ ...section, id: `section-${index + 1}` }));
+}
+
+function uniqueQueries(queries: unknown): string[] {
+  if (!Array.isArray(queries)) return [];
+  return sortedUnique(queries.map((query) => String(query || "").trim()).filter(Boolean)).slice(0, 3);
+}
+
+function sortedUnique(items: string[]): string[] {
+  return Array.from(new Set(items.filter(Boolean))).sort();
+}
+
+function deriveSummary(markdown: string): string {
+  return markdown.replace(/[#*_>`\[\]()]/g, "").split(/\s+/).filter(Boolean).slice(0, 60).join(" ");
 }
 
 export type UseResearchJobReturn = ReturnType<typeof useResearchJob>;

@@ -1044,6 +1044,104 @@ button.danger {
   background: var(--green-soft);
 }
 
+.guided-panel {
+  display: grid;
+  gap: 18px;
+}
+
+.guided-panel-header {
+  display: grid;
+  gap: 12px;
+}
+
+.guided-panel-header h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 20px;
+  line-height: 1.25;
+}
+
+.regen-controls {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto;
+  gap: 10px;
+}
+
+.card-grid,
+.outline-list {
+  display: grid;
+  gap: 12px;
+}
+
+.card-grid {
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.option-card {
+  display: grid;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+  background: #fff;
+}
+
+.option-card label {
+  display: grid;
+  gap: 6px;
+  color: #4f5868;
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.option-card input,
+.option-card textarea,
+.regen-controls input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 11px;
+  color: var(--text);
+  background: #fff;
+  font: inherit;
+}
+
+.option-card textarea {
+  min-height: 96px;
+  resize: vertical;
+}
+
+.muted {
+  margin: 0;
+  color: #6b7280;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.checkbox-row {
+  display: flex !important;
+  grid-template-columns: none !important;
+  align-items: center;
+  gap: 8px !important;
+}
+
+.checkbox-row input {
+  width: auto;
+}
+
+.section-card-header,
+.button-row,
+.source-chip-list {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.section-card-header {
+  justify-content: space-between;
+}
+
 @media (max-width: 860px) {
   .workbench {
     width: calc(100vw - 24px);
@@ -1113,6 +1211,10 @@ button.danger {
   }
 
   .result-band {
+    grid-template-columns: 1fr;
+  }
+
+  .regen-controls {
     grid-template-columns: 1fr;
   }
 }
