@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -14,9 +15,12 @@ from .views import compact_job_view, result_view, section_result_view
 
 RESULT_PATH_RE = re.compile(r"^/research-results/([^/]+)$")
 ASSEMBLED_RESULT_PATH_RE = re.compile(r"^/assembled-research-results/([^/]+)$")
+JOB_PATH_RE = re.compile(r"^/jobs/([^/]+)$")
+REPORT_FRAMING_PATH_RE = re.compile(r"^/report-framings/([^/]+)$")
 CONTEXT_PATH_RE = re.compile(r"^/contexts/([^/]+)$")
 SECTION_CONTEXT_PATH_RE = re.compile(r"^/section-contexts/([^/]+)/([^/]+)$")
 SECTION_RESULT_PATH_RE = re.compile(r"^/section-results/([^/]+)/([^/]+)$")
+SOURCE_TEST_PATH_RE = re.compile(r"^/source-tests/([^/]+)$")
 
 
 class LocalResultTransferServer:
@@ -25,6 +29,7 @@ class LocalResultTransferServer:
         self._lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self._source_tests: dict[str, dict[str, Any]] = {}
 
     def descriptor(self, research_id: str) -> dict[str, str]:
         return self.result_descriptor(research_id)
@@ -44,6 +49,24 @@ class LocalResultTransferServer:
         return {
             "method": "POST",
             "url": f"http://{host}:{port}/assembled-research-results/{research_id}",
+            "content_type": "application/json",
+        }
+
+    def report_framing_descriptor(self, research_id: str) -> dict[str, str]:
+        server = self._ensure_started()
+        host, port = server.server_address[:2]
+        return {
+            "method": "POST",
+            "url": f"http://{host}:{port}/report-framings/{research_id}",
+            "content_type": "application/json",
+        }
+
+    def job_descriptor(self, research_id: str) -> dict[str, str]:
+        server = self._ensure_started()
+        host, port = server.server_address[:2]
+        return {
+            "method": "GET",
+            "url": f"http://{host}:{port}/jobs/{research_id}",
             "content_type": "application/json",
         }
 
@@ -74,6 +97,18 @@ class LocalResultTransferServer:
             "content_type": "application/json",
         }
 
+    def source_test_descriptor(self, result: dict[str, Any]) -> dict[str, str]:
+        server = self._ensure_started()
+        test_id = uuid.uuid4().hex
+        with self._lock:
+            self._source_tests[test_id] = result
+        host, port = server.server_address[:2]
+        return {
+            "method": "GET",
+            "url": f"http://{host}:{port}/source-tests/{test_id}",
+            "content_type": "application/json",
+        }
+
     def _ensure_started(self) -> ThreadingHTTPServer:
         with self._lock:
             if self._server is not None:
@@ -88,6 +123,7 @@ class LocalResultTransferServer:
 
     def _make_handler(self):
         jobs = self.jobs
+        source_tests = self._source_tests
 
         class ResultTransferHandler(BaseHTTPRequestHandler):
             server_version = "AnnaResearcherResultTransfer/0.1"
@@ -112,6 +148,8 @@ class LocalResultTransferServer:
                         result = save_http_result(jobs, route["research_id"], body)
                     elif route["kind"] == "assembled_result":
                         result = save_http_assembled_result(jobs, route["research_id"], body)
+                    elif route["kind"] == "report_framing":
+                        result = save_http_report_framing(jobs, route["research_id"], body)
                     elif route["kind"] == "section_result":
                         result = save_http_section_result(jobs, route["research_id"], route["section_id"], body)
                     else:
@@ -136,10 +174,14 @@ class LocalResultTransferServer:
                 try:
                     if route["kind"] == "result":
                         result = get_http_result(jobs, route["research_id"])
+                    elif route["kind"] == "job":
+                        result = get_http_job(jobs, route["research_id"])
                     elif route["kind"] == "context":
                         result = get_http_context(jobs, route["research_id"])
                     elif route["kind"] == "section_context":
                         result = get_http_section_context(jobs, route["research_id"], route["section_id"])
+                    elif route["kind"] == "source_test":
+                        result = get_http_source_test(source_tests, route["test_id"])
                     else:
                         self._method_not_allowed()
                         return
@@ -174,6 +216,8 @@ class LocalResultTransferServer:
                 for kind, pattern in (
                     ("assembled_result", ASSEMBLED_RESULT_PATH_RE),
                     ("result", RESULT_PATH_RE),
+                    ("job", JOB_PATH_RE),
+                    ("report_framing", REPORT_FRAMING_PATH_RE),
                     ("context", CONTEXT_PATH_RE),
                 ):
                     match = pattern.match(path)
@@ -193,6 +237,9 @@ class LocalResultTransferServer:
                         "research_id": unquote(match.group(1)).strip(),
                         "section_id": unquote(match.group(2)).strip(),
                     }
+                match = SOURCE_TEST_PATH_RE.match(path)
+                if match:
+                    return {"kind": "source_test", "test_id": unquote(match.group(1)).strip()}
                 return None
 
             def _read_json_body(self) -> dict[str, Any]:
@@ -263,6 +310,14 @@ def save_http_assembled_result(jobs: JobStore, research_id: str, body: dict[str,
     return {"job": compact_job_view(job), "result": compact_result_view(job)}
 
 
+def save_http_report_framing(jobs: JobStore, research_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    framing = body.get("framing") if isinstance(body.get("framing"), dict) else body
+    if not isinstance(framing, dict):
+        raise ValidationError("framing must be an object")
+    job = jobs.save_report_framing(research_id, framing)
+    return {"job": compact_job_view(job)}
+
+
 def save_http_section_result(jobs: JobStore, research_id: str, section_id: str, body: dict[str, Any]) -> dict[str, Any]:
     status = str(body.get("status") or "completed")
     markdown = str(body.get("section_markdown") or "")
@@ -287,6 +342,10 @@ def get_http_result(jobs: JobStore, research_id: str) -> dict[str, Any]:
     return {"job": compact_job_view(job), "result": compact_result_view(job)}
 
 
+def get_http_job(jobs: JobStore, research_id: str) -> dict[str, Any]:
+    return {"job": compact_job_view(jobs.load(research_id))}
+
+
 def get_http_context(jobs: JobStore, research_id: str) -> dict[str, Any]:
     job = jobs.load(research_id)
     return {
@@ -307,6 +366,13 @@ def get_http_section_context(jobs: JobStore, research_id: str, section_id: str) 
         "source_urls": context.get("source_urls") or [],
         "selected_at": context.get("selected_at"),
     }
+
+
+def get_http_source_test(source_tests: dict[str, dict[str, Any]], test_id: str) -> dict[str, Any]:
+    result = source_tests.get(test_id)
+    if not result:
+        raise NotFoundError(f"source test result not found: {test_id}")
+    return {"test": result}
 
 
 def compact_result_view(job: dict[str, Any]) -> dict[str, Any]:

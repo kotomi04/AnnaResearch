@@ -192,6 +192,7 @@ export interface ResearchJob {
   section_results?: Record<string, SectionResult>;
   report_framing?: ReportFraming | null;
   assembled_result?: Record<string, unknown> | null;
+  job_transfer?: ResultTransferDescriptor;
   result_transfer?: ResultTransferDescriptor;
 }
 

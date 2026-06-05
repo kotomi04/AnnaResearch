@@ -127,7 +127,8 @@ class AppDispatcher:
             job = self.jobs.load(research_id) if research_id else self.jobs.load_latest()
             if not job:
                 return {"job": None}
-            view = compact_job_view(job)
+            view = status_view(job)
+            view["job_transfer"] = self.transfer_server.job_descriptor(str(job.get("research_id")))
             if job.get("report_markdown"):
                 view["result_transfer"] = self.transfer_server.result_descriptor(str(job.get("research_id")), method="GET")
             return {"job": view}
@@ -156,13 +157,11 @@ class AppDispatcher:
         if method == "app_fail_section":
             research_id = required_string(args, "research_id")
             section_id = required_string(args, "section_id")
-            return {"job": compact_job_view(self.jobs.fail_section(research_id, section_id, args.get("error")))}
+            return {"job": status_view(self.jobs.fail_section(research_id, section_id, args.get("error")))}
         if method == "app_save_report_framing":
             research_id = required_string(args, "research_id")
-            framing = args.get("framing")
-            if not isinstance(framing, dict):
-                raise ValidationError("framing must be an object")
-            return {"job": compact_job_view(self.jobs.save_report_framing(research_id, framing))}
+            self.jobs.load(research_id)
+            return {"transfer": self.transfer_server.report_framing_descriptor(research_id)}
         if method == "app_save_assembled_research_result":
             research_id = required_string(args, "research_id")
             self.jobs.load(research_id)
@@ -248,17 +247,16 @@ class AppDispatcher:
             raise ConfigurationError(f"credential missing for source: {source_id}")
 
         result = self.executor.test(test_definition, query)
-        return {
-            "test": {
-                "source_id": result.source_id,
-                "source_name": result.source_name,
-                "query": result.query,
-                "duration_ms": result.duration_ms,
-                "pages": result.pages,
-                "extracted": result.extracted,
-                "error": result.error,
-            }
+        test = {
+            "source_id": result.source_id,
+            "source_name": result.source_name,
+            "query": result.query,
+            "duration_ms": result.duration_ms,
+            "pages": result.pages,
+            "extracted": result.extracted,
+            "error": result.error,
         }
+        return {"test_transfer": self.transfer_server.source_test_descriptor(test)}
 
     def _call_source(self, args: dict[str, Any]) -> dict[str, Any]:
         research_id = required_string(args, "research_id")
@@ -408,7 +406,7 @@ class AppDispatcher:
             raw_results=raw_results,
         )
         return {
-            "job": compact_job_view(job),
+            "job": status_view(job),
             "source_call": {
                 "section_id": section_id,
                 "source_id": source_id,
@@ -453,7 +451,7 @@ class AppDispatcher:
         )
         job = self.jobs.save_section_selected_context(research_id, section_id, selected)
         return {
-            "job": compact_job_view(job),
+            "job": status_view(job),
             "context_transfer": self.transfer_server.section_context_descriptor(research_id, section_id),
         }
 

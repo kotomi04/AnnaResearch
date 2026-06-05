@@ -47,7 +47,9 @@ def test_job_shell(tmp_path: Path):
     created = dispatcher.dispatch("app_create_research_job", {"query": "Anna App"})
     job = created["job"]
     assert_true(job["research_id"].startswith("research_"), "job should have id")
-    loaded = dispatcher.dispatch("app_get_research_job", {})["job"]
+    loaded_status = dispatcher.dispatch("app_get_research_job", {})["job"]
+    assert_true("schema_version" not in loaded_status, "get job stdio latest should be status-only")
+    loaded = get_json(loaded_status["job_transfer"]["url"])["job"]
     assert_true(loaded["research_id"] == job["research_id"], "latest job should load")
     assert_true(loaded["schema_version"] == 2, "loaded job should advertise v2")
     updated = dispatcher.dispatch(
@@ -102,9 +104,14 @@ def test_call_research_source_context_result(tmp_path: Path):
     saved = post_json(transfer["url"], {"report_markdown": "# Research Report\n\nDone", "source_urls": context["source_urls"]})
     assert_true(saved["result"]["report_markdown"].startswith("# Research Report"), "result should persist")
     assert_true("sources" not in saved["result"], "http result should be compact")
-    loaded = dispatcher.dispatch("app_get_research_job", {"research_id": research_id})["job"]
+    immediate = dispatcher.dispatch("app_get_research_job", {"research_id": research_id})["job"]
+    assert_true("iterations" not in immediate, "get job stdio response should be status-only")
+    assert_true("source_urls" not in immediate, "get job stdio response should not include source urls")
+    assert_true(immediate["job_transfer"]["method"] == "GET", "get job should expose job transfer")
+    loaded = get_json(immediate["job_transfer"]["url"])["job"]
     assert_true("report_markdown" not in loaded["result"], "loaded job should not include full result markdown")
-    restored = get_json(loaded["result_transfer"]["url"])
+    assert_true(immediate["result_transfer"]["method"] == "GET", "completed job status should expose result transfer")
+    restored = get_json(immediate["result_transfer"]["url"])
     assert_true(restored["result"]["report_markdown"].startswith("# Research Report"), "result transfer should restore markdown")
     assert_true("search_results" not in loaded, "loaded job should be compact")
     assert_true(loaded["iterations"], "loaded job should expose iterations")
@@ -114,6 +121,9 @@ def test_call_research_source_context_result(tmp_path: Path):
 def test_result_transfer_http(tmp_path: Path):
     dispatcher = make_dispatcher(tmp_path)
     job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
+    immediate = dispatcher.dispatch("app_get_research_job", {"research_id": job["research_id"]})["job"]
+    assert_true(immediate["job_transfer"]["url"].startswith("http://127.0.0.1:"), "job transfer should use local http")
+    assert_true(get_json(immediate["job_transfer"]["url"])["job"]["research_id"] == job["research_id"], "job transfer should return compact job")
     first = dispatcher.dispatch("app_save_research_result", {"research_id": job["research_id"]})["transfer"]
     second = dispatcher.dispatch("app_save_research_result", {"research_id": job["research_id"]})["transfer"]
     assert_true(first["url"] == second["url"], "transfer server should be singleton")
@@ -157,7 +167,7 @@ def test_section_large_payload_transfer(tmp_path: Path):
     assert_true("selected_context" not in selected, "section context should not return through stdio")
     section_context = get_json(selected["context_transfer"]["url"])
     assert_true(bool(section_context["selected_context"]), "section context transfer should return context")
-    assert_true("selected_context" not in selected["job"]["section_selected_context"]["section-1"], "job view should not include section context text")
+    assert_true("section_selected_context" not in selected["job"], "section context stdio job should be status-only")
     section_transfer = dispatcher.dispatch("app_save_section_result", {"research_id": research_id, "section_id": "section-1"})["transfer"]
     section_saved = post_json(
         section_transfer["url"],
@@ -169,17 +179,39 @@ def test_section_large_payload_transfer(tmp_path: Path):
         },
     )
     assert_true(section_saved["section_result"]["section_markdown"].startswith("## Section One"), "section result transfer should save markdown")
-    loaded = dispatcher.dispatch("app_get_research_job", {"research_id": research_id})["job"]
+    framing_transfer = dispatcher.dispatch(
+        "app_save_report_framing",
+        {"research_id": research_id},
+    )["transfer"]
+    assert_true(framing_transfer["method"] == "POST", "report framing should return transfer descriptor")
+    framing_saved = post_json(
+        framing_transfer["url"],
+        {
+            "framing": {
+                "title": "Final",
+                "introduction": "Intro " + ("large intro. " * 200),
+                "conclusion": "Conclusion " + ("large conclusion. " * 200),
+            },
+        },
+    )
+    assert_true(framing_saved["job"]["stage"] == "assemble_report", "report framing transfer should update stage")
+    assert_true(framing_saved["job"]["report_framing"]["title"] == "Final", "report framing transfer should save framing")
+    loaded_immediate = dispatcher.dispatch("app_get_research_job", {"research_id": research_id})["job"]
+    loaded = get_json(loaded_immediate["job_transfer"]["url"])["job"]
     assert_true("section_markdown" not in loaded["section_results"]["section-1"], "job view should not include section markdown")
+    failed_status = dispatcher.dispatch("app_fail_section", {"research_id": research_id, "section_id": "section-1", "error": {"message": "boom"}})["job"]
+    assert_true(failed_status["status"] == "failed", "section failure should update status")
+    assert_true("section_results" not in failed_status, "section failure stdio response should be status-only")
     assembled_transfer = dispatcher.dispatch("app_save_assembled_research_result", {"research_id": research_id})["transfer"]
     assembled = post_json(
         assembled_transfer["url"],
         {"report_markdown": "# Final\n\n" + ("assembled report. " * 200), "source_urls": section_context["source_urls"]},
     )
     assert_true(assembled["result"]["report_markdown"].startswith("# Final"), "assembled result transfer should save final report")
-    final_job = dispatcher.dispatch("app_get_research_job", {"research_id": research_id})["job"]
+    final_immediate = dispatcher.dispatch("app_get_research_job", {"research_id": research_id})["job"]
+    final_job = get_json(final_immediate["job_transfer"]["url"])["job"]
     assert_true("report_markdown" not in final_job["result"], "final job view should not include full report")
-    assert_true(final_job["result_transfer"]["method"] == "GET", "final job should expose result read transfer")
+    assert_true(final_immediate["result_transfer"]["method"] == "GET", "final job should expose result read transfer")
 
 
 def test_call_research_source_requires_credential(tmp_path: Path):
@@ -198,6 +230,21 @@ def test_call_research_source_requires_credential(tmp_path: Path):
     finally:
         if old is not None:
             os.environ["ANNA_RESEARCHER_FAKE_TAVILY"] = old
+
+
+def test_source_test_transfer(tmp_path: Path):
+    os.environ["ANNA_RESEARCHER_FAKE_TAVILY"] = "1"
+    dispatcher = make_dispatcher(tmp_path)
+    result = dispatcher.dispatch(
+        "app_test_research_source",
+        {"id": "tavily", "definition": dispatcher.registry.get_definition("tavily"), "query": "anna"},
+    )
+    assert_true("test" not in result, "source test should not return debug payload through stdio")
+    transfer = result["test_transfer"]
+    assert_true(transfer["method"] == "GET", "source test should return read transfer")
+    test = get_json(transfer["url"])["test"]
+    assert_true(test["source_id"] == "tavily", "source test transfer should return result")
+    assert_true("pages" in test, "source test transfer should include debug pages")
 
 
 def test_selector():
@@ -311,6 +358,7 @@ def main():
         ("result_transfer_http", test_result_transfer_http),
         ("section_large_payload_transfer", test_section_large_payload_transfer),
         ("call_requires_credential", test_call_research_source_requires_credential),
+        ("source_test_transfer", test_source_test_transfer),
         ("selector", lambda tmp: test_selector()),
         ("plugin_contract", test_plugin_contract),
         ("bundle_contract", lambda tmp: test_bundle_contract()),

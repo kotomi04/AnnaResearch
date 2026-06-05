@@ -34,6 +34,7 @@ interface SourceResponse {
 
 interface SourceTestResponse {
   test?: ResearchSourceTestResult;
+  test_transfer?: ResultTransferDescriptor;
 }
 
 interface CallSourceResponse extends JobResponse {
@@ -156,6 +157,10 @@ export class AnnaResearchApi implements ResearchApi {
 
   async testResearchSource(input: { id: string; definition: Record<string, unknown>; query: string }): Promise<ResearchSourceTestResult> {
     const response = (await this.call("app_test_research_source", input)) as SourceTestResponse;
+    if (response.test_transfer?.url) {
+      const data = await fetchTransfer<SourceTestResponse>(response.test_transfer);
+      if (data.test) return data.test;
+    }
     if (!response.test) throw new Error("Source test did not return a test result.");
     return response.test;
   }
@@ -170,7 +175,11 @@ export class AnnaResearchApi implements ResearchApi {
 
   async getResearchJob(researchId?: string): Promise<ResearchJob | null> {
     const response = (await this.call("app_get_research_job", researchId ? { research_id: researchId } : {})) as JobResponse;
-    const job = response.job ?? null;
+    let job = response.job ?? null;
+    if (job?.job_transfer?.url) {
+      const data = await fetchTransfer<JobResponse>(job.job_transfer);
+      job = data.job ?? job;
+    }
     if (!job?.result_transfer) return job;
     const data = await fetchTransfer<ResultResponse>(job.result_transfer);
     return { ...job, result: data.result ?? job.result };
@@ -234,7 +243,9 @@ export class AnnaResearchApi implements ResearchApi {
   }
 
   async saveReportFraming(input: { research_id: string; framing: ReportFraming }): Promise<ResearchJob> {
-    return requireJob(await this.call("app_save_report_framing", input));
+    const response = (await this.call("app_save_report_framing", { research_id: input.research_id })) as TransferResponse;
+    if (!response.transfer?.url) throw new Error("Report framing save response did not include a transfer URL.");
+    return requireJob(await fetchTransfer<JobResponse>(response.transfer, input));
   }
 
   async saveAssembledResearchResult(input: { research_id: string; report_markdown: string; source_urls?: string[] }): Promise<ResearchJob> {

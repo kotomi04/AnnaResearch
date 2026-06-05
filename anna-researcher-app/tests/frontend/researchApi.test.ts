@@ -47,7 +47,16 @@ describe("AnnaResearchApi", () => {
             };
           }
           if (request.method === "app_get_research_job") {
-            return { success: true, data: { job: null } };
+            return {
+              success: true,
+              data: {
+                job: {
+                  research_id: "r1",
+                  status: "running",
+                  job_transfer: { method: "GET", url: "http://127.0.0.1:43123/jobs/r1", content_type: "application/json" },
+                },
+              },
+            };
           }
           if (request.method === "app_call_research_source") {
             return {
@@ -71,15 +80,7 @@ describe("AnnaResearchApi", () => {
             return {
               success: true,
               data: {
-                test: {
-                  source_id: "tavily",
-                  source_name: "Tavily",
-                  query: "anna",
-                  duration_ms: 1,
-                  pages: [],
-                  extracted: [],
-                  error: null,
-                },
+                test_transfer: { method: "GET", url: "http://127.0.0.1:43123/source-tests/t1", content_type: "application/json" },
               },
             };
           }
@@ -93,6 +94,12 @@ describe("AnnaResearchApi", () => {
             return {
               success: true,
               data: { transfer: { method: "POST", url: "http://127.0.0.1:43123/research-results/r1", content_type: "application/json" } },
+            };
+          }
+          if (request.method === "app_save_report_framing") {
+            return {
+              success: true,
+              data: { transfer: { method: "POST", url: "http://127.0.0.1:43123/report-framings/r1", content_type: "application/json" } },
             };
           }
           return { success: true, data: { job: { research_id: "r1", status: "running" } } };
@@ -116,6 +123,34 @@ describe("AnnaResearchApi", () => {
           headers: { "Content-Type": "application/json" },
         });
       }
+      if (String(url).includes("/jobs/")) {
+        return new Response(JSON.stringify({ job: { research_id: "r1", status: "running", iterations: [], source_urls: [] } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (String(url).includes("/report-framings/")) {
+        return new Response(JSON.stringify({ job: { research_id: "r1", status: "running", stage: "assemble_report", progress: 96 } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (String(url).includes("/source-tests/")) {
+        return new Response(
+          JSON.stringify({
+            test: {
+              source_id: "tavily",
+              source_name: "Tavily",
+              query: "anna",
+              duration_ms: 1,
+              pages: [],
+              extracted: [],
+              error: null,
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
       return new Response(
         JSON.stringify({ result: { report_markdown: "# Report", source_urls: ["https://example.com"] } }),
         { status: 200, headers: { "Content-Type": "application/json" } },
@@ -132,6 +167,10 @@ describe("AnnaResearchApi", () => {
       await api.testResearchSource({ id: "tavily", definition: { id: "tavily" }, query: "anna" });
       await api.callResearchSource({ research_id: "r1", iteration: 1, source_id: "tavily", queries: ["anna"] });
       await api.selectContext({ research_id: "r1" });
+      await api.saveReportFraming({
+        research_id: "r1",
+        framing: { title: "Report", introduction: "large intro", conclusion: "large conclusion" },
+      });
       const transfer = await api.saveResearchResult({ research_id: "r1" });
       await api.uploadResearchResult(transfer, { report_markdown: "# Report", source_urls: ["https://example.com"] });
 
@@ -150,11 +189,26 @@ describe("AnnaResearchApi", () => {
           args: { research_id: "r1", iteration: 1, source_id: "tavily", queries: ["anna"] },
         },
         { tool_id: TOOL_ID, method: "app_select_context", args: { research_id: "r1" } },
+        { tool_id: TOOL_ID, method: "app_save_report_framing", args: { research_id: "r1" } },
         { tool_id: TOOL_ID, method: "app_save_research_result", args: { research_id: "r1" } },
       ]);
-      expect(fetchCalls).toHaveLength(2);
-      expect(fetchCalls[0]).toEqual(["http://127.0.0.1:43123/contexts/r1", { method: "GET" }]);
-      expect(JSON.stringify(fetchCalls[1])).toContain("# Report");
+      expect(JSON.stringify(calls)).not.toContain("large intro");
+      expect(fetchCalls).toHaveLength(5);
+      expect(fetchCalls[0]).toEqual(["http://127.0.0.1:43123/jobs/r1", { method: "GET" }]);
+      expect(fetchCalls[1]).toEqual(["http://127.0.0.1:43123/source-tests/t1", { method: "GET" }]);
+      expect(fetchCalls[2]).toEqual(["http://127.0.0.1:43123/contexts/r1", { method: "GET" }]);
+      expect(fetchCalls[3]).toEqual([
+        "http://127.0.0.1:43123/report-framings/r1",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            research_id: "r1",
+            framing: { title: "Report", introduction: "large intro", conclusion: "large conclusion" },
+          }),
+        },
+      ]);
+      expect(JSON.stringify(fetchCalls[4])).toContain("# Report");
     } finally {
       globalThis.fetch = oldFetch;
     }

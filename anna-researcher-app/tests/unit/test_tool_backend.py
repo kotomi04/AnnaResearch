@@ -41,6 +41,12 @@ def post_json(url: str, payload: dict):
         return json.loads(response.read().decode("utf-8"))
 
 
+def get_json(url: str):
+    request = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 # ---------------------------------------------------------------------------
 # Settings & legacy migration
 # ---------------------------------------------------------------------------
@@ -101,7 +107,10 @@ def test_job_create_update_latest_and_not_found(tmp_path):
     dispatcher = make_dispatcher(tmp_path)
     job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
     assert job["research_id"].startswith("research_")
-    assert dispatcher.dispatch("app_get_research_job", {})["job"]["research_id"] == job["research_id"]
+    latest_status = dispatcher.dispatch("app_get_research_job", {})["job"]
+    assert latest_status["research_id"] == job["research_id"]
+    assert "schema_version" not in latest_status
+    assert get_json(latest_status["job_transfer"]["url"])["job"]["research_id"] == job["research_id"]
     updated = dispatcher.dispatch(
         "app_update_research_job",
         {
@@ -131,7 +140,10 @@ def test_job_create_update_latest_and_not_found(tmp_path):
 def test_compact_job_view_exposes_v2_fields(tmp_path):
     dispatcher = make_dispatcher(tmp_path)
     job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
-    loaded = dispatcher.dispatch("app_get_research_job", {"research_id": job["research_id"]})["job"]
+    immediate = dispatcher.dispatch("app_get_research_job", {"research_id": job["research_id"]})["job"]
+    assert "iterations" not in immediate
+    assert "source_urls" not in immediate
+    loaded = get_json(immediate["job_transfer"]["url"])["job"]
     assert loaded["schema_version"] == 2
     assert loaded["iterations"] == []
     assert loaded["research_log"] == []
@@ -592,7 +604,8 @@ def test_call_research_source_uses_fake_token_and_records_iteration(tmp_path, mo
     assert call["results_count"] == 4
     assert call["error"] is None
     assert all("items" not in entry for entry in call["calls"])
-    loaded = dispatcher.dispatch("app_get_research_job", {"research_id": job["research_id"]})["job"]
+    immediate = dispatcher.dispatch("app_get_research_job", {"research_id": job["research_id"]})["job"]
+    loaded = get_json(immediate["job_transfer"]["url"])["job"]
     assert loaded["iterations"][0]["queries"] == ["anna", "researcher"]
     assert all("raw_results" not in iteration for iteration in loaded["iterations"])
     assert loaded["search_queries"] == ["anna", "researcher"]
@@ -650,10 +663,15 @@ def test_app_test_research_source_uses_draft_definition_and_saved_credential(tmp
         "title": {"mode": "path", "value": "name"},
         "content": {"mode": "paths", "value": ["body"]},
     }
-    result = dispatcher.dispatch(
+    immediate = dispatcher.dispatch(
         "app_test_research_source",
         {"id": "tavily", "definition": draft, "query": "anna"},
-    )["test"]
+    )
+    assert "test" not in immediate
+    assert "Draft body" not in json.dumps(immediate)
+    transfer = immediate["test_transfer"]
+    assert transfer["method"] == "GET"
+    result = get_json(transfer["url"])["test"]
     assert result["pages"][0]["request"]["body"]["api_key"] == "tvly-secret-abcd"
     assert result["pages"][0]["response"]["json"]["items"][0]["name"] == "Draft title"
     assert result["extracted"][0]["url"] == "https://draft.example/a"
