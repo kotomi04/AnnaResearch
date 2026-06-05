@@ -176,12 +176,14 @@ export class AnnaResearchApi implements ResearchApi {
   async getResearchJob(researchId?: string): Promise<ResearchJob | null> {
     const response = (await this.call("app_get_research_job", researchId ? { research_id: researchId } : {})) as JobResponse;
     let job = response.job ?? null;
+    const resultTransfer = job?.result_transfer;
     if (job?.job_transfer?.url) {
       const data = await fetchTransfer<JobResponse>(job.job_transfer);
-      job = data.job ?? job;
+      job = data.job ? { ...job, ...data.job } : job;
     }
-    if (!job?.result_transfer) return job;
-    const data = await fetchTransfer<ResultResponse>(job.result_transfer);
+    const transfer = job?.result_transfer ?? resultTransfer;
+    if (!transfer) return job;
+    const data = await fetchTransfer<ResultResponse>(transfer);
     return { ...job, result: data.result ?? job.result };
   }
 

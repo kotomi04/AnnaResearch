@@ -214,6 +214,60 @@ describe("AnnaResearchApi", () => {
     }
   });
 
+  it("keeps the result transfer after loading a compact transferred job", async () => {
+    const anna: AnnaRuntimeApi = {
+      tools: {
+        async invoke(request) {
+          expect(request).toEqual({ tool_id: TOOL_ID, method: "app_get_research_job", args: {} });
+          return {
+            success: true,
+            data: {
+              job: {
+                research_id: "r1",
+                status: "completed",
+                job_transfer: { method: "GET", url: "http://127.0.0.1:43123/jobs/r1", content_type: "application/json" },
+                result_transfer: { method: "GET", url: "http://127.0.0.1:43123/research-results/r1", content_type: "application/json" },
+              },
+            },
+          };
+        },
+      },
+      llm: {
+        async complete() {
+          return { content: { type: "text", text: "{}" } };
+        },
+      },
+    };
+    const oldFetch = globalThis.fetch;
+    const fetchCalls: string[] = [];
+    globalThis.fetch = (async (url: RequestInfo | URL) => {
+      fetchCalls.push(String(url));
+      if (String(url).includes("/jobs/")) {
+        return new Response(JSON.stringify({ job: { research_id: "r1", status: "completed", iterations: [], source_urls: [] } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ result: { report_markdown: "# Restored", source_urls: ["https://example.com"] } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    try {
+      const api = new AnnaResearchApi(anna);
+      const job = await api.getResearchJob();
+
+      expect(fetchCalls).toEqual([
+        "http://127.0.0.1:43123/jobs/r1",
+        "http://127.0.0.1:43123/research-results/r1",
+      ]);
+      expect(job?.result?.report_markdown).toBe("# Restored");
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
   it("keeps section and assembled large payloads out of tool invoke arguments", async () => {
     const calls: unknown[] = [];
     const anna: AnnaRuntimeApi = {
