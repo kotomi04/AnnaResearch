@@ -12,6 +12,13 @@ import type {
   ResearchSourceView,
   ToolSettings,
 } from "../types";
+import {
+  makeLiveRunEvent,
+  sectionPreview,
+  sourceCallEvent,
+  type RunEvent,
+  type SectionPreview,
+} from "../workflow/runEvents";
 
 export const MAX_RESEARCH_ITERATIONS = 5;
 
@@ -48,6 +55,8 @@ export function useResearchJob(api: ResearchApi) {
   const [roleCandidates, setRoleCandidates] = useState<RoleCandidate[]>([]);
   const [focusCandidates, setFocusCandidates] = useState<FocusCandidate[]>([]);
   const [outlineDraft, setOutlineDraft] = useState<ReportSection[]>([]);
+  const [runEvents, setRunEvents] = useState<RunEvent[]>([]);
+  const [sectionPreviews, setSectionPreviews] = useState<SectionPreview[]>([]);
   const runIdRef = useRef(0);
 
   const refreshSources = useCallback(async () => {
@@ -137,6 +146,19 @@ export function useResearchJob(api: ResearchApi) {
     [api],
   );
 
+  const resetForNewResearch = useCallback(() => {
+    runIdRef.current += 1;
+    setJob(null);
+    setResult(null);
+    setError(null);
+    setRoleCandidates([]);
+    setFocusCandidates([]);
+    setOutlineDraft([]);
+    setRunEvents([]);
+    setSectionPreviews([]);
+    setPhase(hasConfiguredSource(sources) ? "idle" : "settings_required");
+  }, [sources]);
+
   const start = useCallback(
     async (query: string, regenerationInstruction = "") => {
       const runId = runIdRef.current + 1;
@@ -146,6 +168,8 @@ export function useResearchJob(api: ResearchApi) {
       setResult(null);
       setFocusCandidates([]);
       setOutlineDraft([]);
+      setRunEvents([]);
+      setSectionPreviews([]);
       try {
         const current = await refreshSettings();
         if (!hasConfiguredSource(current.sources)) {
@@ -256,12 +280,21 @@ export function useResearchJob(api: ResearchApi) {
       const runId = runIdRef.current + 1;
       runIdRef.current = runId;
       setPhase("running");
+      setRunEvents([]);
+      setSectionPreviews([]);
       try {
         let currentJob = await api.saveConfirmedResearchOutline(job.research_id, sections);
         setJob(currentJob);
         const sectionResults: Array<{ section: ReportSection; markdown: string; summary: string; sourceUrls: string[] }> = [];
         for (let index = 0; index < sections.length; index++) {
           const section = sections[index];
+          appendRunEvent(setRunEvents, {
+            kind: "section_started",
+            sectionId: section.id,
+            sectionTitle: section.title,
+            title: section.title,
+            detail: `${index + 1}/${sections.length}`,
+          });
           currentJob = await updateJob(api, currentJob, {
             status: "running",
             stage: "section_research",
@@ -270,17 +303,37 @@ export function useResearchJob(api: ResearchApi) {
           });
           setJob(currentJob);
           if (runId !== runIdRef.current) return;
-          const sectionResult = await runSection({ api, job: currentJob, section, role: job.confirmed_role, focuses: job.confirmed_focuses, sources: readyEnabledSources(sources) });
+          const sectionResult = await runSection({
+            api,
+            job: currentJob,
+            section,
+            role: job.confirmed_role,
+            focuses: job.confirmed_focuses,
+            sources: readyEnabledSources(sources),
+            onEvent: (event) => appendRunEvent(setRunEvents, event),
+          });
           sectionResults.push({ section, ...sectionResult });
+          setSectionPreviews((previews) => upsertPreview(previews, sectionPreview(section, sectionResult)));
           currentJob = (await api.getResearchJob(job.research_id)) || currentJob;
           setJob(currentJob);
         }
+        appendRunEvent(setRunEvents, {
+          kind: "report_framing",
+          title: "Report framing",
+          detail: `${sections.length} section summaries`,
+        });
         currentJob = await updateJob(api, currentJob, { stage: "report_framing", progress: 94 });
         setJob(currentJob);
         const framing = await generateReportFraming(api, job.query || "", job.confirmed_focuses, sections, sectionResults);
         currentJob = await api.saveReportFraming({ research_id: job.research_id, framing });
         const reportMarkdown = assembleReport(framing, sectionResults);
         const sourceUrls = sortedUnique(sectionResults.flatMap((section) => section.sourceUrls));
+        appendRunEvent(setRunEvents, {
+          kind: "final_assembly",
+          title: "Final assembly",
+          detail: `${sourceUrls.length} sources`,
+          count: sourceUrls.length,
+        });
         currentJob = await api.saveAssembledResearchResult({ research_id: job.research_id, report_markdown: reportMarkdown, source_urls: sourceUrls });
         setJob(currentJob);
         setResult(currentJob.result || { research_id: job.research_id, report_markdown: reportMarkdown, source_urls: sourceUrls, status: "completed" });
@@ -303,6 +356,8 @@ export function useResearchJob(api: ResearchApi) {
     roleCandidates,
     focusCandidates,
     outlineDraft,
+    runEvents,
+    sectionPreviews,
     setRoleCandidates,
     setFocusCandidates,
     setOutlineDraft,
@@ -322,6 +377,7 @@ export function useResearchJob(api: ResearchApi) {
     confirmFocuses,
     regenerateOutline,
     confirmOutlineAndRun,
+    resetForNewResearch,
   };
 }
 
@@ -433,7 +489,7 @@ async function assignAllowedSources(api: ResearchApi, sections: ReportSection[],
   const assignments = new Map<string, string[]>();
   const valid = new Set(sources.map((source) => source.id));
   for (const item of Array.isArray(parsed?.sections) ? parsed.sections : []) {
-    const ids = Array.isArray(item?.allowed_source_ids) ? item.allowed_source_ids.map(String).filter((id) => valid.has(id)) : [];
+    const ids = Array.isArray(item?.allowed_source_ids) ? item.allowed_source_ids.map(String).filter((id: string) => valid.has(id)) : [];
     if (item?.id && ids.length) assignments.set(String(item.id), sortedUnique(ids));
   }
   const fallback = sources[0].id;
@@ -447,13 +503,21 @@ async function runSection(input: {
   role: ConfirmedResearchRole;
   focuses: string[];
   sources: ResearchSourceView[];
+  onEvent?(event: Parameters<typeof makeLiveRunEvent>[0]): void;
 }): Promise<{ markdown: string; summary: string; sourceUrls: string[] }> {
-  const { api, job, section, role, focuses, sources } = input;
+  const { api, job, section, role, focuses, sources, onEvent } = input;
   const allowedSources = sources.filter((source) => section.allowed_source_ids.includes(source.id));
   if (!allowedSources.length) throw new Error(`Section has no configured allowed source: ${section.title}`);
   const history: IterationEntry[] = [];
   for (let iteration = 1; iteration <= section.max_iterations; iteration++) {
     await updateJob(api, job, { stage: "section_research", iteration, progress: progressForIteration(iteration, section.max_iterations) });
+    onEvent?.({
+      kind: "decision",
+      sectionId: section.id,
+      sectionTitle: section.title,
+      title: "Deciding next research action",
+      detail: `${iteration}/${section.max_iterations}`,
+    });
     const decision = await decideNextAction({
       api,
       query: job.query || "",
@@ -477,6 +541,7 @@ async function runSection(input: {
       queries,
     });
     if (call.source_call) {
+      onEvent?.(sourceCallEvent(section, call.source_call));
       history.push({
         iteration,
         source_id: call.source_call.source_id,
@@ -489,6 +554,14 @@ async function runSection(input: {
     if (call.source_call?.error && iteration >= section.max_iterations) break;
   }
   const selected = await api.selectSectionContext({ research_id: requiredResearchId(job), section_id: section.id });
+  onEvent?.({
+    kind: "context_selected",
+    sectionId: section.id,
+    sectionTitle: section.title,
+    title: "Context selected",
+    detail: `${(selected.source_urls || []).length} sources`,
+    count: (selected.source_urls || []).length,
+  });
   const writer = await writeSection(api, job.query || "", role, focuses, section, selected.selected_context || "");
   const sourceUrls = selected.source_urls || [];
   await api.saveSectionResult({
@@ -498,6 +571,13 @@ async function runSection(input: {
     section_summary: writer.summary,
     source_urls: sourceUrls,
     status: "completed",
+  });
+  onEvent?.({
+    kind: "section_written",
+    sectionId: section.id,
+    sectionTitle: section.title,
+    title: "Section written",
+    detail: writer.summary,
   });
   return { ...writer, sourceUrls };
 }
@@ -695,5 +775,16 @@ function sortedUnique(items: string[]): string[] {
 function deriveSummary(markdown: string): string {
   return markdown.replace(/[#*_>`\[\]()]/g, "").split(/\s+/).filter(Boolean).slice(0, 60).join(" ");
 }
+
+function appendRunEvent(setRunEvents: ReactSetState<RunEvent[]>, event: Parameters<typeof makeLiveRunEvent>[0]): void {
+  setRunEvents((events) => [...events, makeLiveRunEvent(event)]);
+}
+
+function upsertPreview(previews: SectionPreview[], next: SectionPreview): SectionPreview[] {
+  const rest = previews.filter((preview) => preview.id !== next.id);
+  return [...rest, next];
+}
+
+type ReactSetState<T> = (value: T | ((previous: T) => T)) => void;
 
 export type UseResearchJobReturn = ReturnType<typeof useResearchJob>;

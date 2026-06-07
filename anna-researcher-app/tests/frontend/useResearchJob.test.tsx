@@ -11,6 +11,7 @@ interface ApiOptions {
   llmReplies?: LlmReply[];
   callOverrides?: Array<Partial<SourceCallResult>>;
   sources?: ResearchSourceView[];
+  latestJob?: Awaited<ReturnType<ResearchApi["getResearchJob"]>>;
 }
 
 function makeApi(options: ApiOptions = {}) {
@@ -83,7 +84,7 @@ function makeApi(options: ApiOptions = {}) {
     },
     async getResearchJob() {
       calls.push(["getResearchJob"]);
-      return null;
+      return options.latestJob ?? null;
     },
     async createResearchJob(input) {
       calls.push(["createResearchJob", input]);
@@ -289,6 +290,32 @@ describe("useResearchJob (iterative loop)", () => {
     expect(result.current.roleCandidates[0]).toMatchObject({ server: "Researcher", agent_role_prompt: "Use sources." });
     expect(llmCalls).toHaveLength(1);
     expect(JSON.stringify(llmCalls[0])).toContain("roles");
+  });
+
+  it("resets a restored completed job when starting a new research draft", async () => {
+    const { api } = makeApi({
+      latestJob: {
+        research_id: "done-1",
+        status: "completed",
+        stage: "completed",
+        progress: 100,
+        query: "old query",
+        result: { report_markdown: "# Old report", source_urls: [] },
+      },
+    });
+    const { result } = renderHook(() => useResearchJob(api));
+
+    await waitFor(() => expect(result.current.phase).toBe("completed"));
+    expect(result.current.job?.research_id).toBe("done-1");
+    expect(result.current.result?.report_markdown).toBe("# Old report");
+
+    act(() => {
+      result.current.resetForNewResearch();
+    });
+
+    expect(result.current.phase).toBe("idle");
+    expect(result.current.job).toBeNull();
+    expect(result.current.result).toBeNull();
   });
 
   it("confirms role and focus candidates before outline generation", async () => {

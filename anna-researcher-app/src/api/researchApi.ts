@@ -184,6 +184,7 @@ export class AnnaResearchApi implements ResearchApi {
     const transfer = job?.result_transfer ?? resultTransfer;
     if (!transfer) return job;
     const data = await fetchTransfer<ResultResponse>(transfer);
+    if (!job) return data.result ? { result: data.result } : null;
     return { ...job, result: data.result ?? job.result };
   }
 

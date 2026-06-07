@@ -1,35 +1,42 @@
 import { useEffect, useMemo, useState } from "react";
-import type React from "react";
 import { connectAnnaRuntime } from "./api/annaRuntime";
 import { AnnaResearchApi, createStandaloneApi, type ResearchApi } from "./api/researchApi";
+import { FocusReviewPage } from "./components/FocusReviewPage";
 import { LanguageToggle } from "./components/LanguageToggle";
-import { ReportView } from "./components/ReportView";
+import { OutlineReviewPage } from "./components/OutlineReviewPage";
+import { ReportDisplayPage } from "./components/ReportDisplayPage";
+import { ReportGenerationPage } from "./components/ReportGenerationPage";
 import { ResearchForm } from "./components/ResearchForm";
 import {
   ResearchSourceDetailPage,
   ResearchSourceListPage,
   ResearchSourceNewPage,
 } from "./components/ResearchSourcePanel";
-import { ResearchTimeline } from "./components/ResearchTimeline";
-import { StatusPanel } from "./components/StatusPanel";
+import { RoleReviewPage } from "./components/RoleReviewPage";
+import { WorkflowStepper } from "./components/WorkflowStepper";
 import { MAX_RESEARCH_ITERATIONS, useResearchJob } from "./hooks/useResearchJob";
 import type { FocusCandidate, RoleCandidate } from "./hooks/useResearchJob";
-import { useLocale } from "./i18n/useLocale";
 import { localizedError, localizedJobMessage } from "./i18n/status";
+import { useLocale } from "./i18n/useLocale";
 import type { ReportSection } from "./types";
+import { summarizePlan } from "./workflow/planSummary";
+import { projectGuidedStep, type GuidedStepId } from "./workflow/stepState";
+
+type AppPage = "workflow" | "sources" | "source-detail" | "source-new";
 
 export function App() {
   const { locale, setLocale, t } = useLocale();
   const [api, setApi] = useState<ResearchApi>(() => createStandaloneApi());
   const [runtimeError, setRuntimeError] = useState<unknown>(null);
   const [validationMessage, setValidationMessage] = useState("");
-  const [appPage, setAppPage] = useState<"intro" | "result" | "sources" | "source-detail" | "source-new">("intro");
-  const [sourceReturnPage, setSourceReturnPage] = useState<"intro" | "result">("intro");
+  const [appPage, setAppPage] = useState<AppPage>("workflow");
   const [selectedSourceId, setSelectedSourceId] = useState("");
   const [briefNameDraft, setBriefNameDraft] = useState("");
   const [researchNeedDraft, setResearchNeedDraft] = useState("");
+  const [selectedRoleIndex, setSelectedRoleIndex] = useState(0);
   const [selectedFocusIds, setSelectedFocusIds] = useState<string[]>([]);
   const [regenInstruction, setRegenInstruction] = useState("");
+  const [requestedStep, setRequestedStep] = useState<GuidedStepId | undefined>("need");
 
   useEffect(() => {
     let cancelled = false;
@@ -55,25 +62,59 @@ export function App() {
   }, []);
 
   const research = useResearchJob(api);
+  const sourceResult = useMemo(() => research.result, [research.result]);
+  const hasCompletedResult = hasCompletedResearchResult(research.job, sourceResult);
+  const projection = projectGuidedStep({
+    requestedStep,
+    phase: research.phase,
+    canStart: research.canStart,
+    job: research.job,
+    result: sourceResult,
+  });
+  const step = projection.current;
   const jobMessage = localizedJobMessage(research.job, t);
   const asyncErrorMessage = research.error ? localizedError(research.error, t) : "";
   const runtimeErrorMessage = runtimeError ? t("runtimeMissing") : "";
   const message = validationMessage || runtimeErrorMessage || asyncErrorMessage || jobMessage.message;
   const isMessageError = Boolean(validationMessage || runtimeErrorMessage || asyncErrorMessage || jobMessage.isError);
-
-  const sourceResult = useMemo(() => research.result, [research.result]);
   const selectedSource = useMemo(
     () => research.sources.find((source) => source.id === selectedSourceId) ?? null,
     [research.sources, selectedSourceId],
   );
-  const ready = research.canStart;
-  const stepLabel = makeIntroStepLabel(research.job?.max_iterations);
-  const hasCompletedResult = hasCompletedResearchResult(research.job, sourceResult);
-  const showIntroPage = appPage === "intro" && !research.isBusy;
+  const planSummary = summarizePlan({
+    role: research.job?.confirmed_role,
+    focuses: research.job?.confirmed_focuses,
+    sections: research.outlineDraft.length ? research.outlineDraft : research.job?.confirmed_outline,
+  });
+
+  useEffect(() => {
+    if (research.phase === "settings_required") {
+      setRequestedStep("need");
+    } else if (research.phase === "role_review") {
+      setRequestedStep("role");
+    } else if (research.phase === "focus_review") {
+      setRequestedStep("focus");
+    } else if (research.phase === "outline_review") {
+      setRequestedStep("outline");
+    } else if (research.phase === "running") {
+      setRequestedStep("generate");
+    } else if (research.phase === "completed") {
+      setRequestedStep("report");
+    }
+  }, [research.phase]);
+
+  useEffect(() => {
+    if (research.roleCandidates.length && selectedRoleIndex >= research.roleCandidates.length) {
+      setSelectedRoleIndex(0);
+    }
+  }, [research.roleCandidates.length, selectedRoleIndex]);
 
   function start(input: { briefName: string; researchNeed: string }) {
     setValidationMessage("");
-    setAppPage("result");
+    setSelectedRoleIndex(0);
+    setSelectedFocusIds([]);
+    setRegenInstruction("");
+    setRequestedStep("role");
     void research.start(formatResearchQuery(input, locale));
   }
 
@@ -108,6 +149,15 @@ export function App() {
     research.setOutlineDraft(research.outlineDraft.filter((_, idx) => idx !== index).map((section, idx) => ({ ...section, id: `section-${idx + 1}` })));
   }
 
+  function moveOutlineSection(index: number, direction: -1 | 1) {
+    const nextIndex = index + direction;
+    if (nextIndex < 0 || nextIndex >= research.outlineDraft.length) return;
+    const next = [...research.outlineDraft];
+    const [item] = next.splice(index, 1);
+    next.splice(nextIndex, 0, item);
+    research.setOutlineDraft(next.map((section, idx) => ({ ...section, id: `section-${idx + 1}` })));
+  }
+
   function toggleSectionSource(index: number, sourceId: string) {
     const section = research.outlineDraft[index];
     if (!section) return;
@@ -117,45 +167,39 @@ export function App() {
     updateOutlineSection(index, { allowed_source_ids: Array.from(current).sort() });
   }
 
-  function showLastResult() {
-    if (hasCompletedResult) {
-      setValidationMessage("");
-      setAppPage("result");
-    }
+  function confirmRole() {
+    const role = research.roleCandidates[selectedRoleIndex];
+    if (!role) return;
+    setRegenInstruction("");
+    void research.confirmRole(role);
+  }
+
+  function confirmFocuses() {
+    const focuses = research.focusCandidates.filter((focus) => selectedFocusIds.includes(focus.id)).map((focus) => focus.text);
+    setRegenInstruction("");
+    void research.confirmFocuses(focuses);
+  }
+
+  function startGeneration() {
+    setRegenInstruction("");
+    setRequestedStep("generate");
+    void research.confirmOutlineAndRun(research.outlineDraft);
+  }
+
+  function showSources() {
+    if (!projection.canOpenSources) return;
+    setValidationMessage("");
+    setAppPage("sources");
   }
 
   function showNewResearch() {
     setValidationMessage("");
-    setAppPage("intro");
-  }
-
-  function showSources() {
-    setValidationMessage("");
-    setSourceReturnPage(appPage === "result" ? "result" : "intro");
-    setAppPage("sources");
-  }
-
-  function returnFromSources() {
-    setValidationMessage("");
-    setSelectedSourceId("");
-    setAppPage(sourceReturnPage);
-  }
-
-  function showSourceDetail(id: string) {
-    setValidationMessage("");
-    setSelectedSourceId(id);
-    setAppPage("source-detail");
-  }
-
-  function showNewSource() {
-    setValidationMessage("");
-    setSelectedSourceId("");
-    setAppPage("source-new");
-  }
-
-  function backToSourceList() {
-    setValidationMessage("");
-    setAppPage("sources");
+    setSelectedRoleIndex(0);
+    setSelectedFocusIds([]);
+    setRegenInstruction("");
+    setRequestedStep("need");
+    setAppPage("workflow");
+    research.resetForNewResearch();
   }
 
   async function saveCredential(input: { id: string; credential?: string; clear?: boolean }) {
@@ -198,9 +242,11 @@ export function App() {
           </div>
           <div className="topbar-actions">
             <LanguageToggle locale={locale} setLocale={setLocale} t={t} />
-            <button type="button" className="secondary source-button" onClick={showSources} data-testid="open-source-panel">
-              {t("sourcesButton")}
-            </button>
+            {projection.canOpenSources ? (
+              <button type="button" className="secondary source-button" onClick={showSources} data-testid="open-source-panel">
+                {t("sourcesButton")}
+              </button>
+            ) : null}
           </div>
         </header>
 
@@ -211,16 +257,22 @@ export function App() {
               isBusy={research.isBusy}
               errorMessage={runtimeErrorMessage || asyncErrorMessage}
               t={t}
-              onBack={returnFromSources}
-              onAdd={showNewSource}
-              onOpenSource={showSourceDetail}
+              onBack={() => setAppPage("workflow")}
+              onAdd={() => {
+                setSelectedSourceId("");
+                setAppPage("source-new");
+              }}
+              onOpenSource={(id) => {
+                setSelectedSourceId(id);
+                setAppPage("source-detail");
+              }}
             />
           ) : appPage === "source-detail" ? (
             <ResearchSourceDetailPage
               source={selectedSource}
               isBusy={research.isBusy}
               t={t}
-              onBack={backToSourceList}
+              onBack={() => setAppPage("sources")}
               onSaveCredential={saveCredential}
               onToggleEnabled={toggleSourceEnabled}
               onSaveDefinition={saveSourceDefinition}
@@ -231,215 +283,108 @@ export function App() {
             <ResearchSourceNewPage
               isBusy={research.isBusy}
               t={t}
-              onBack={backToSourceList}
+              onBack={() => setAppPage("sources")}
               onAddSource={addSource}
             />
-          ) : showIntroPage ? (
-            <ResearchForm
-              isBusy={research.isBusy}
-              canStart={ready}
-              briefName={briefNameDraft}
-              researchNeed={researchNeedDraft}
-              t={t}
-              stepLabel={stepLabel}
-              validationMessage={validationMessage}
-              canShowLastResult={hasCompletedResult}
-              onBriefNameChange={setBriefNameDraft}
-              onResearchNeedChange={setResearchNeedDraft}
-              onShowLastResult={showLastResult}
-              onStart={start}
-              onValidationError={setValidationMessage}
-            />
           ) : (
-            <section className="page active research-page">
-              <div className="result-toolbar">
-                <button type="button" className="secondary small-button" onClick={showNewResearch}>
-                  {t("newResearchButton")}
-                </button>
-              </div>
-              <StatusPanel job={research.job} message={message} isError={isMessageError} t={t} />
-              {research.phase === "role_review" ? (
-                <ReviewPanel
-                  title={locale === "zh-CN" ? "选择研究角色" : "Choose Research Role"}
-                  actionLabel={locale === "zh-CN" ? "重新生成角色" : "Regenerate roles"}
+            <>
+              <WorkflowStepper
+                current={step}
+                completed={projection.completedSteps}
+                available={projection.availableSteps}
+                locked={projection.locked}
+                t={t}
+                onNavigate={setRequestedStep}
+              />
+              {step === "need" ? (
+                <ResearchForm
+                  isBusy={research.isBusy}
+                  canStart={research.canStart}
+                  briefName={briefNameDraft}
+                  researchNeed={researchNeedDraft}
+                  t={t}
+                  stepLabel={makeIntroStepLabel(research.job?.max_iterations)}
+                  validationMessage={message}
+                  canShowLastResult={hasCompletedResult}
+                  onBriefNameChange={setBriefNameDraft}
+                  onResearchNeedChange={setResearchNeedDraft}
+                  onShowLastResult={() => setRequestedStep("report")}
+                  onStart={start}
+                  onValidationError={setValidationMessage}
+                />
+              ) : step === "role" ? (
+                <RoleReviewPage
+                  candidates={research.roleCandidates}
+                  selectedIndex={selectedRoleIndex}
                   instruction={regenInstruction}
+                  isBusy={research.isBusy}
+                  t={t}
+                  onSelectedIndexChange={setSelectedRoleIndex}
+                  onCandidateChange={updateRoleCandidate}
                   onInstructionChange={setRegenInstruction}
                   onRegenerate={() => research.regenerateRoles(regenInstruction)}
-                >
-                  <div className="card-grid">
-                    {research.roleCandidates.map((candidate, index) => (
-                      <article className="option-card" key={index}>
-                        <label>
-                          {locale === "zh-CN" ? "角色名称" : "Role"}
-                          <input value={candidate.server} onChange={(event) => updateRoleCandidate(index, { server: event.target.value })} />
-                        </label>
-                        <label>
-                          {locale === "zh-CN" ? "角色提示词" : "Role prompt"}
-                          <textarea value={candidate.agent_role_prompt} onChange={(event) => updateRoleCandidate(index, { agent_role_prompt: event.target.value })} />
-                        </label>
-                        {candidate.rationale ? <p className="muted">{candidate.rationale}</p> : null}
-                        <button type="button" onClick={() => research.confirmRole(candidate)}>
-                          {locale === "zh-CN" ? "选择这个角色" : "Use this role"}
-                        </button>
-                      </article>
-                    ))}
-                  </div>
-                </ReviewPanel>
-              ) : research.phase === "focus_review" ? (
-                <ReviewPanel
-                  title={locale === "zh-CN" ? "选择研究重点" : "Choose Research Focuses"}
-                  actionLabel={locale === "zh-CN" ? "重新生成重点" : "Regenerate focuses"}
+                  onBack={() => setRequestedStep("need")}
+                  onConfirm={confirmRole}
+                />
+              ) : step === "focus" ? (
+                <FocusReviewPage
+                  candidates={research.focusCandidates}
+                  selectedIds={selectedFocusIds}
                   instruction={regenInstruction}
+                  summary={planSummary}
+                  isBusy={research.isBusy}
+                  t={t}
+                  onSelectedIdsChange={setSelectedFocusIds}
+                  onCandidateChange={updateFocusCandidate}
                   onInstructionChange={setRegenInstruction}
                   onRegenerate={() => research.regenerateFocuses(regenInstruction)}
-                >
-                  <div className="card-grid">
-                    {research.focusCandidates.map((candidate, index) => {
-                      const checked = selectedFocusIds.includes(candidate.id);
-                      return (
-                        <article className="option-card" key={candidate.id}>
-                          <label className="checkbox-row">
-                            <input
-                              type="checkbox"
-                              checked={checked}
-                              onChange={() => {
-                                setSelectedFocusIds((ids) => checked ? ids.filter((id) => id !== candidate.id) : [...ids, candidate.id].slice(0, 5));
-                              }}
-                            />
-                            {locale === "zh-CN" ? "选择" : "Select"}
-                          </label>
-                          <textarea value={candidate.text} onChange={(event) => updateFocusCandidate(index, { text: event.target.value })} />
-                          {candidate.rationale ? <p className="muted">{candidate.rationale}</p> : null}
-                        </article>
-                      );
-                    })}
-                  </div>
-                  <button
-                    type="button"
-                    disabled={selectedFocusIds.length < 1 || selectedFocusIds.length > 5}
-                    onClick={() => research.confirmFocuses(research.focusCandidates.filter((focus) => selectedFocusIds.includes(focus.id)).map((focus) => focus.text))}
-                  >
-                    {locale === "zh-CN" ? "确认研究重点" : "Confirm focuses"}
-                  </button>
-                </ReviewPanel>
-              ) : research.phase === "outline_review" ? (
-                <ReviewPanel
-                  title={locale === "zh-CN" ? "确认研究大纲" : "Confirm Research Outline"}
-                  actionLabel={locale === "zh-CN" ? "重新生成大纲" : "Regenerate outline"}
+                  onBack={() => setRequestedStep("role")}
+                  onConfirm={confirmFocuses}
+                />
+              ) : step === "outline" ? (
+                <OutlineReviewPage
+                  sections={research.outlineDraft}
+                  sources={research.sources}
                   instruction={regenInstruction}
+                  summary={planSummary}
+                  isBusy={research.isBusy}
+                  t={t}
+                  onSectionChange={updateOutlineSection}
+                  onAddSection={addOutlineSection}
+                  onDeleteSection={deleteOutlineSection}
+                  onMoveSection={moveOutlineSection}
+                  onToggleSectionSource={toggleSectionSource}
                   onInstructionChange={setRegenInstruction}
                   onRegenerate={() => research.regenerateOutline(regenInstruction)}
-                >
-                  <div className="outline-list">
-                    {research.outlineDraft.map((section, index) => (
-                      <article className="option-card" key={section.id}>
-                        <div className="section-card-header">
-                          <strong>{section.id}</strong>
-                          <button type="button" className="secondary small-button" onClick={() => deleteOutlineSection(index)}>
-                            {locale === "zh-CN" ? "删除" : "Delete"}
-                          </button>
-                        </div>
-                        <label>
-                          {locale === "zh-CN" ? "标题" : "Title"}
-                          <input value={section.title} onChange={(event) => updateOutlineSection(index, { title: event.target.value })} />
-                        </label>
-                        <label>
-                          {locale === "zh-CN" ? "大纲内容" : "Outline"}
-                          <textarea value={section.outline} onChange={(event) => updateOutlineSection(index, { outline: event.target.value })} />
-                        </label>
-                        <label>
-                          {locale === "zh-CN" ? "最大迭代次数" : "Max iterations"}
-                          <input
-                            type="number"
-                            min={1}
-                            max={10}
-                            value={section.max_iterations}
-                            onChange={(event) => updateOutlineSection(index, { max_iterations: Number(event.target.value) })}
-                          />
-                        </label>
-                        <div className="source-chip-list">
-                          {research.sources.filter((source) => source.enabled && source.credential_status === "configured").map((source) => (
-                            <label className="checkbox-row" key={source.id}>
-                              <input
-                                type="checkbox"
-                                checked={section.allowed_source_ids.includes(source.id)}
-                                onChange={() => toggleSectionSource(index, source.id)}
-                              />
-                              {source.name}
-                            </label>
-                          ))}
-                        </div>
-                      </article>
-                    ))}
-                  </div>
-                  <div className="button-row">
-                    <button type="button" className="secondary" onClick={addOutlineSection} disabled={research.outlineDraft.length >= 8}>
-                      {locale === "zh-CN" ? "添加段落" : "Add section"}
-                    </button>
-                    <button
-                      type="button"
-                      disabled={!isOutlineConfirmable(research.outlineDraft)}
-                      onClick={() => research.confirmOutlineAndRun(research.outlineDraft)}
-                    >
-                      {locale === "zh-CN" ? "确认大纲并开始研究" : "Confirm outline and research"}
-                    </button>
-                  </div>
-                </ReviewPanel>
+                  onBack={() => setRequestedStep("focus")}
+                  onStartGeneration={startGeneration}
+                />
+              ) : step === "generate" ? (
+                <ReportGenerationPage
+                  job={research.job}
+                  events={research.runEvents}
+                  previews={research.sectionPreviews}
+                  sources={research.sources}
+                  summary={planSummary}
+                  message={message}
+                  isError={isMessageError}
+                  t={t}
+                />
               ) : (
-                <>
-                  <ResearchTimeline iterations={mergedIterations(research.job)} t={t} />
-                  <ReportView result={sourceResult} t={t} />
-                </>
+                <ReportDisplayPage
+                  result={sourceResult}
+                  events={research.runEvents}
+                  previews={research.sectionPreviews}
+                  t={t}
+                  onNewResearch={showNewResearch}
+                />
               )}
-            </section>
+            </>
           )}
         </div>
       </section>
     </main>
   );
-}
-
-function ReviewPanel(props: {
-  title: string;
-  actionLabel: string;
-  instruction: string;
-  children: React.ReactNode;
-  onInstructionChange(value: string): void;
-  onRegenerate(): void;
-}) {
-  return (
-    <section className="guided-panel">
-      <div className="guided-panel-header">
-        <h2>{props.title}</h2>
-        <div className="regen-controls">
-          <input
-            value={props.instruction}
-            placeholder="Optional regeneration instruction"
-            onChange={(event) => props.onInstructionChange(event.target.value)}
-          />
-          <button type="button" className="secondary" onClick={props.onRegenerate}>
-            {props.actionLabel}
-          </button>
-        </div>
-      </div>
-      {props.children}
-    </section>
-  );
-}
-
-function isOutlineConfirmable(sections: ReportSection[]): boolean {
-  return sections.length >= 1 && sections.length <= 8 && sections.every((section) =>
-    section.title.trim() &&
-    section.outline.trim() &&
-    section.allowed_source_ids.length >= 1 &&
-    section.max_iterations >= 1 &&
-    section.max_iterations <= 10
-  );
-}
-
-function mergedIterations(job: { iterations?: unknown[]; section_iterations?: Record<string, unknown[]> } | null | undefined) {
-  if (!job?.section_iterations) return job?.iterations as Parameters<typeof ResearchTimeline>[0]["iterations"];
-  return Object.values(job.section_iterations).flat() as Parameters<typeof ResearchTimeline>[0]["iterations"];
 }
 
 export function formatResearchQuery(input: { briefName: string; researchNeed: string }, locale: string): string {
