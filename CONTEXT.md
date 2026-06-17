@@ -234,8 +234,12 @@ A named retrieval capability that the Anna Research Orchestrator can call to gat
 _Avoid_: Retriever (backend-only term), data source (too generic), API connector (too implementation-flavored)
 
 **Built-in Research Source**:
-A Research Source whose configuration, request shape, and response mapping are owned by the Researcher Tool Backend and ship as part of the tool. Tavily Summary Retrieval is the first Built-in Research Source.
+A Research Source that ships as part of the Researcher Tool Backend rather than being added by the app user. It is the user-facing umbrella for "bundled, no-setup" retrieval. A Built-in Research Source is either envelope-backed — its request and response shape is a backend-owned Configurable Research Source Envelope, as with Tavily Summary Retrieval — or a Native Research Source, whose execution is backend Python code with no envelope. Tavily Summary Retrieval is the first Built-in Research Source.
 _Avoid_: Default retriever, hardcoded search backend
+
+**Native Research Source**:
+A Built-in Research Source whose retrieval is implemented as backend Python code (a native adapter) rather than a declarative Configurable Research Source Envelope. It exists for upstreams that cannot be expressed as a single JSON-over-HTTP request — for example the DuckDuckGo ddgs library, which performs multi-step scraping and HTML parsing. A Native Research Source still emits the same normalized result items as every other Research Source, so the Lexical Context Selector and job records do not branch on it; only its execution path differs. It carries no Configurable Research Source Envelope and is not user-editable.
+_Avoid_: Custom retriever code, scraper plugin, envelope source, User-Configured Research Source
 
 **User-Configured Research Source**:
 A Research Source defined by the app user — a remote API endpoint plus the request, authentication, response mapping, pagination, and natural-language description needed for the Anna Research Orchestrator to invoke it. The user adds, edits, and removes these without changes to the Researcher Tool Backend or Anna App Shell source.
