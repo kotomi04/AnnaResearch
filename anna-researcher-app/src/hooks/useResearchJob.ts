@@ -32,6 +32,11 @@ export interface FocusCandidate {
   rationale?: string;
 }
 
+interface CitationReference {
+  number: number;
+  url: string;
+}
+
 interface DecideCallSource {
   type: "call_source";
   source_id?: string;
@@ -294,6 +299,7 @@ export function useResearchJob(api: ResearchApi) {
         let currentJob = await api.saveConfirmedResearchOutline(job.research_id, sections);
         setJob(currentJob);
         const sectionResults: Array<{ section: ReportSection; markdown: string; summary: string; sourceUrls: string[] }> = [];
+        const citationRegistry: string[] = [];
         for (let index = 0; index < sections.length; index++) {
           const section = sections[index];
           appendRunEvent(setRunEvents, {
@@ -318,6 +324,7 @@ export function useResearchJob(api: ResearchApi) {
             role: job.confirmed_role,
             focuses: job.confirmed_focuses,
             sources: readyEnabledSources(sources),
+            citationRegistry,
             onEvent: (event) => appendRunEvent(setRunEvents, event),
           });
           sectionResults.push({ section, ...sectionResult });
@@ -335,7 +342,7 @@ export function useResearchJob(api: ResearchApi) {
         const framing = await generateReportFraming(api, job.query || "", job.confirmed_focuses, sections, sectionResults);
         currentJob = await api.saveReportFraming({ research_id: job.research_id, framing });
         const reportMarkdown = assembleReport(framing, sectionResults);
-        const sourceUrls = sortedUnique(sectionResults.flatMap((section) => section.sourceUrls));
+        const sourceUrls = citationRegistry.length ? [...citationRegistry] : sortedUnique(sectionResults.flatMap((section) => section.sourceUrls));
         appendRunEvent(setRunEvents, {
           kind: "final_assembly",
           title: "Final assembly",
@@ -526,9 +533,10 @@ async function runSection(input: {
   role: ConfirmedResearchRole;
   focuses: string[];
   sources: ResearchSourceView[];
+  citationRegistry: string[];
   onEvent?(event: Parameters<typeof makeLiveRunEvent>[0]): void;
 }): Promise<{ markdown: string; summary: string; sourceUrls: string[] }> {
-  const { api, job, section, role, focuses, sources, onEvent } = input;
+  const { api, job, section, role, focuses, sources, citationRegistry, onEvent } = input;
   const allowedSources = sources.filter((source) => section.allowed_source_ids.includes(source.id));
   if (!allowedSources.length) throw new Error(`Section has no configured allowed source: ${section.title}`);
   const history: IterationEntry[] = [];
@@ -585,12 +593,14 @@ async function runSection(input: {
     detail: `${(selected.source_urls || []).length} sources`,
     count: (selected.source_urls || []).length,
   });
-  const writer = await writeSection(api, job.query || "", role, focuses, section, selected.selected_context || "");
   const sourceUrls = selected.source_urls || [];
+  const citationReferences = registerCitationReferences(citationRegistry, sourceUrls);
+  const writer = await writeSection(api, job.query || "", role, focuses, section, selected.selected_context || "", citationReferences);
+  const markdown = remapLocalCitations(writer.markdown, citationReferences);
   await api.saveSectionResult({
     research_id: requiredResearchId(job),
     section_id: section.id,
-    section_markdown: writer.markdown,
+    section_markdown: markdown,
     section_summary: writer.summary,
     source_urls: sourceUrls,
     status: "completed",
@@ -602,7 +612,7 @@ async function runSection(input: {
     title: "Section written",
     detail: writer.summary,
   });
-  return { ...writer, sourceUrls };
+  return { ...writer, markdown, sourceUrls };
 }
 
 async function decideNextAction(input: {
@@ -656,7 +666,11 @@ async function writeSection(
   focuses: string[],
   section: ReportSection,
   selectedContext: string,
+  citationReferences: CitationReference[],
 ): Promise<{ markdown: string; summary: string }> {
+  const citationGuide = citationReferences.length
+    ? citationReferences.map((reference) => `[${reference.number}] ${reference.url}`).join("\n")
+    : "No selected source URLs for this section.";
   const text = await completeText(api, [
     { role: "system", content: { type: "text", text: role.agent_role_prompt } },
     {
@@ -665,7 +679,9 @@ async function writeSection(
         type: "text",
         text:
           'Write one report section. Return strict JSON only: {"section_markdown":"...","section_summary":"..."}.\n' +
-          "Use only the provided context. The markdown should include the section heading and cite URLs when useful.\n\n" +
+          "Use only the provided context. The markdown should include the section heading.\n" +
+          "When citing evidence, use ONLY the global citation numbers listed below, such as [3]. Do not invent new citation numbers and do not restart citations from [1] for this section.\n\n" +
+          `Global citation map for this section:\n${citationGuide}\n\n` +
           `Task:\n${query}\n\nFocuses:\n${focuses.map((focus) => `- ${focus}`).join("\n")}\n\nSection: ${section.title}\n${section.outline}\n\nContext:\n${selectedContext}`,
       },
     },
@@ -713,6 +729,30 @@ function assembleReport(framing: ReportFraming, results: Array<{ markdown: strin
     .map((part) => part.trim())
     .filter(Boolean)
     .join("\n\n");
+}
+
+function registerCitationReferences(registry: string[], urls: string[]): CitationReference[] {
+  const references: CitationReference[] = [];
+  for (const url of urls) {
+    const normalized = String(url || "").trim();
+    if (!normalized) continue;
+    let index = registry.indexOf(normalized);
+    if (index === -1) {
+      registry.push(normalized);
+      index = registry.length - 1;
+    }
+    references.push({ number: index + 1, url: normalized });
+  }
+  return references;
+}
+
+function remapLocalCitations(markdown: string, references: CitationReference[]): string {
+  if (!references.length) return markdown;
+  return markdown.replace(/\[(\d+)\]/g, (match, rawNumber: string) => {
+    const localIndex = Number(rawNumber) - 1;
+    const reference = references[localIndex];
+    return reference ? `[${reference.number}]` : match;
+  });
 }
 
 async function completeText(api: ResearchApi, messages: Parameters<ResearchApi["complete"]>[0]["messages"]): Promise<string> {

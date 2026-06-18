@@ -253,7 +253,7 @@ const FOCUS_REPLY = '{"focuses":[{"text":"focus one"},{"text":"focus two"},{"tex
 const OUTLINE_REPLY = '{"sections":[{"title":"Section One","outline":"Cover one.","max_iterations":2},{"title":"Section Two","outline":"Cover two.","max_iterations":1},{"title":"Section Three","outline":"Cover three.","max_iterations":1},{"title":"Section Four","outline":"Cover four.","max_iterations":1}]}';
 const ASSIGN_REPLY = '{"sections":[{"id":"section-1","allowed_source_ids":["tavily"]},{"id":"section-2","allowed_source_ids":["tavily"]},{"id":"section-3","allowed_source_ids":["tavily"]},{"id":"section-4","allowed_source_ids":["tavily"]}]}';
 const DECISION_REPLY = '{"type":"call_source","queries":["anna query"]}';
-const SECTION_REPLY = '{"section_markdown":"## Section One\\n\\nUses FULL CONTEXT","section_summary":"section summary"}';
+const SECTION_REPLY = '{"section_markdown":"## Section One\\n\\nUses FULL CONTEXT [1]","section_summary":"section summary"}';
 const FRAMING_REPLY = '{"title":"Done","introduction":"Intro","conclusion":"Conclusion"}';
 
 async function planToOutline(result: ReturnType<typeof renderHook<ReturnType<typeof useResearchJob>, unknown>>["result"]) {
@@ -449,7 +449,20 @@ describe("useResearchJob (iterative loop)", () => {
     expect(result.current.phase).toBe("completed");
     expect(result.current.result?.report_markdown).toContain("# Done");
     expect(result.current.result?.report_markdown).toContain("## Section One");
+    expect(result.current.result?.report_markdown).toContain("Uses FULL CONTEXT [1]");
+    expect(result.current.result?.report_markdown).toContain("## Section Two");
+    expect(result.current.result?.report_markdown).toContain("Uses FULL CONTEXT [2]");
+    expect(result.current.result?.report_markdown).toContain("## Section Three");
+    expect(result.current.result?.report_markdown).toContain("Uses FULL CONTEXT [3]");
+    expect(result.current.result?.report_markdown).toContain("## Section Four");
+    expect(result.current.result?.report_markdown).toContain("Uses FULL CONTEXT [4]");
     expect(result.current.result?.report_markdown).toContain("## Conclusion");
+    expect(result.current.result?.source_urls).toEqual([
+      "https://example.com/section-1",
+      "https://example.com/section-2",
+      "https://example.com/section-3",
+      "https://example.com/section-4",
+    ]);
     const callSourceCalls = calls.filter((call) => Array.isArray(call) && call[0] === "callSectionResearchSource");
     expect(callSourceCalls.length).toBeGreaterThanOrEqual(1);
     expect((callSourceCalls[0] as unknown[])[1]).toMatchObject({ section_id: "section-1", source_id: "tavily", queries: ["anna query"] });

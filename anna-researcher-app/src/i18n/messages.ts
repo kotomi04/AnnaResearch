@@ -281,6 +281,11 @@ export const messages = {
     eventFinalAssembly: "组装最终报告",
     reportPageTitle: "研究报告",
     reportPageSubtitle: "最终报告已生成，来源和过程摘要可供核对。",
+    exportButton: "导出",
+    exportMenuLabel: "选择导出格式",
+    exportFormatOption: "{format} 文档",
+    exportFileSaved: "{format} 已保存。",
+    exportFileFailed: "导出失败，请查看浏览器或 Anna 控制台。",
     processSummaryTitle: "研究过程摘要",
   },
   en: {
@@ -565,6 +570,11 @@ export const messages = {
     eventFinalAssembly: "Final assembly",
     reportPageTitle: "Research Report",
     reportPageSubtitle: "The final report is ready. Sources and process summary are available for review.",
+    exportButton: "Export",
+    exportMenuLabel: "Choose export format",
+    exportFormatOption: "{format} document",
+    exportFileSaved: "{format} saved.",
+    exportFileFailed: "Export failed. Check the browser or Anna console.",
     processSummaryTitle: "Research process summary",
   },
 } as const;

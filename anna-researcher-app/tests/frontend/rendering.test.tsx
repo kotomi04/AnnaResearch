@@ -5,7 +5,9 @@ import { useState } from "react";
 import { DraftGenerationPage } from "../../src/components/DraftGenerationPage";
 import { FocusReviewPage } from "../../src/components/FocusReviewPage";
 import { RegenerationControl } from "../../src/components/RegenerationControl";
+import { ReportDisplayPage } from "../../src/components/ReportDisplayPage";
 import { ReportView } from "../../src/components/ReportView";
+import { appendSourcesToMarkdown } from "../../src/export/exportFiles";
 import { ResearchForm } from "../../src/components/ResearchForm";
 import {
   ResearchSourceDetailPage,
@@ -653,11 +655,52 @@ describe("ReportView", () => {
   it("renders markdown and sources without raw html injection", () => {
     const t = createTranslator("en");
     const markdown = "# Title\n\n- item\n\n<script>window.bad = true</script>";
-    render(<ReportView result={{ report_markdown: markdown, source_urls: ["https://example.com"] }} t={t} />);
+    render(<ReportView result={{ report_markdown: markdown, source_urls: ["https://example.com", "https://second.example"] }} t={t} />);
 
     expect(screen.getByRole("heading", { name: "Title", level: 1 })).toBeTruthy();
     expect(screen.getByText("item")).toBeTruthy();
     expect(document.querySelector("script")).toBeNull();
     expect(screen.getByRole("link", { name: "https://example.com" }).getAttribute("rel")).toBe("noreferrer noopener");
+    expect(screen.getByText("[1]")).toBeTruthy();
+    expect(screen.getByText("[2]")).toBeTruthy();
   });
+});
+
+describe("ReportDisplayPage", () => {
+  it("exports the final report through the host save picker", async () => {
+    const t = createTranslator("en");
+    const write = vi.fn(async () => {});
+    const close = vi.fn(async () => {});
+    const createWritable = vi.fn(async () => ({ write, close }));
+    const showSaveFilePicker = vi.fn(async () => ({ createWritable }));
+    Object.defineProperty(window, "showSaveFilePicker", {
+      configurable: true,
+      value: showSaveFilePicker,
+    });
+
+    render(
+      <ReportDisplayPage
+        result={{ research_id: "Research 123", report_markdown: "# Done", source_urls: ["https://example.com/a", "https://example.com/b"] }}
+        events={[]}
+        previews={[]}
+        t={t}
+        onNewResearch={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Export" }));
+    expect(screen.getByRole("menu", { name: "Choose export format" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("menuitem", { name: "MD document" }));
+
+    await waitFor(() => expect(showSaveFilePicker).toHaveBeenCalledWith(expect.objectContaining({ suggestedName: "research-123.md" })));
+    expect(write).toHaveBeenCalledWith(expect.any(Blob));
+    expect(appendSourcesToMarkdown("# Done", ["https://example.com/a", "https://example.com/b"], "Sources")).toBe(
+      "# Done\n\n## Sources\n\n[1] https://example.com/a\n[2] https://example.com/b\n",
+    );
+    expect(close).toHaveBeenCalled();
+    expect(screen.getByText("MD saved.")).toBeTruthy();
+
+    delete (window as Window & { showSaveFilePicker?: unknown }).showSaveFilePicker;
+  });
+
 });

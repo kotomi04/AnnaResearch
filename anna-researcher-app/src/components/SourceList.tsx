@@ -12,15 +12,16 @@ export function SourceList({ urls, t }: Props) {
       {urls.length === 0 ? (
         <p className="source-empty">{t("emptySources")}</p>
       ) : (
-        <ul id="sources-list">
-          {urls.map((url) => (
+        <ol id="sources-list" className="reference-list">
+          {urls.map((url, index) => (
             <li key={url}>
+              <span className="reference-index" aria-label={`Reference ${index + 1}`}>[{index + 1}]</span>
               <a href={url} target="_blank" rel="noreferrer noopener">
                 {url}
               </a>
             </li>
           ))}
-        </ul>
+        </ol>
       )}
     </aside>
   );
