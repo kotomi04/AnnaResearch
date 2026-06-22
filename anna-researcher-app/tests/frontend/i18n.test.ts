@@ -43,7 +43,7 @@ describe("localized status mapping", () => {
 
   it("localizes job message and source count", () => {
     const t = createTranslator("zh-CN");
-    expect(localizedJobMessage({ status: "completed", stage: "completed" }, t).message).toBe("研究完成。");
+    expect(localizedJobMessage({ status: "completed", stage: "completed" }, t).message).toBe("");
     expect(localizedSourceCount(3, t)).toBe("3 个来源");
   });
 });

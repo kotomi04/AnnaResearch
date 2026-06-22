@@ -38,6 +38,7 @@ class SettingsStore:
     def view(self) -> dict[str, Any]:
         key = self.get_tavily_key()
         return {
+            "research_root": str(self.root),
             "tavily": {
                 "configured": bool(key),
                 "masked": mask_secret(key) if key else "",
@@ -75,4 +76,3 @@ def mask_secret(value: str) -> str:
     if len(text) <= 4:
         return "*" * len(text)
     return "***" + text[-4:]
-

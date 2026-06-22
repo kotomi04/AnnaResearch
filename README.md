@@ -181,7 +181,7 @@ anna-researcher-app/executas/researcher-python/executa.json
 它会从独立的 `researcher-tool/` 项目启动后端：
 
 ```bash
-uv run --project ../../../researcher-tool tool-test-researcher-12345678
+env UV_CACHE_DIR=/tmp/anna-researcher-uv-cache uv run --project ../../../researcher-tool tool-test-researcher-12345678
 ```
 
 真实 Anna App 联调时，在 `anna-researcher-app/` 下启动 Anna dev server，并在 UI 中配置至少一个 Research Source credential。真实 Tavily 检索需要 Tavily key；离线开发可以使用 fake mode。

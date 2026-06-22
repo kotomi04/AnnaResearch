@@ -62,7 +62,7 @@ export function localizedStageMessage(job: ResearchJob, t: Translator): string {
 export function localizedJobMessage(job: ResearchJob | null, t: Translator): { message: string; isError: boolean } {
   if (!job) return { message: t("emptyMessage"), isError: false };
   if (job.error) return { message: localizedError(job.error, t), isError: true };
-  if (job.status === "completed") return { message: t("completedMessage"), isError: false };
+  if (job.status === "completed") return { message: "", isError: false };
   if (job.status === "failed") return { message: t("failedMessage"), isError: true };
   if (job.status === "cancelled") return { message: t("cancelledMessage"), isError: false };
   return { message: localizedStageMessage(job, t), isError: false };

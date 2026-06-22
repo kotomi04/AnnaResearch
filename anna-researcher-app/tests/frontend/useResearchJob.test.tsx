@@ -12,6 +12,7 @@ interface ApiOptions {
   callOverrides?: Array<Partial<SourceCallResult>>;
   sources?: ResearchSourceView[];
   latestJob?: Awaited<ReturnType<ResearchApi["getResearchJob"]>>;
+  historyJobs?: Awaited<ReturnType<ResearchApi["listResearchJobs"]>>;
 }
 
 function makeApi(options: ApiOptions = {}) {
@@ -82,9 +83,16 @@ function makeApi(options: ApiOptions = {}) {
         error: null,
       };
     },
-    async getResearchJob() {
-      calls.push(["getResearchJob"]);
+    async getResearchJob(researchId) {
+      calls.push(["getResearchJob", researchId]);
+      if (researchId) {
+        return (options.historyJobs || []).find((job) => job.research_id === researchId) ?? options.latestJob ?? null;
+      }
       return options.latestJob ?? null;
+    },
+    async listResearchJobs(input) {
+      calls.push(["listResearchJobs", input]);
+      return options.historyJobs ?? (options.latestJob ? [options.latestJob] : []);
     },
     async createResearchJob(input) {
       calls.push(["createResearchJob", input]);
@@ -382,6 +390,33 @@ describe("useResearchJob (iterative loop)", () => {
     expect(result.current.result).toBeNull();
     expect(result.current.lastCompletedJob?.research_id).toBe("done-1");
     expect(result.current.lastCompletedResult?.report_markdown).toBe("# Old report");
+  });
+
+  it("loads history jobs and opens a selected completed research task", async () => {
+    const { api, calls } = makeApi({
+      historyJobs: [
+        {
+          research_id: "done-2",
+          status: "completed",
+          stage: "completed",
+          progress: 100,
+          query: "Research topic: history",
+          source_count: 2,
+          result: { report_markdown: "# History", source_urls: ["https://example.com"] },
+        },
+      ],
+    });
+    const { result } = renderHook(() => useResearchJob(api));
+
+    await waitFor(() => expect(result.current.historyJobs).toHaveLength(1));
+    await act(async () => {
+      await result.current.openResearchJob("done-2");
+    });
+
+    expect(result.current.phase).toBe("completed");
+    expect(result.current.job?.research_id).toBe("done-2");
+    expect(result.current.result?.report_markdown).toBe("# History");
+    expect(calls).toContainEqual(["getResearchJob", "done-2"]);
   });
 
   it("confirms role and focus candidates before outline generation", async () => {

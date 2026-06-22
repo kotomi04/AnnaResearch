@@ -368,6 +368,21 @@ class JobStore:
             return None
         return self.load(research_id)
 
+    def list_jobs(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        if not self.jobs_dir.exists():
+            return []
+        jobs: list[dict[str, Any]] = []
+        for path in self.jobs_dir.glob("*.json"):
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except json.JSONDecodeError as exc:
+                raise StoreError(f"malformed job record: {path.stem}") from exc
+            if isinstance(data, dict) and data.get("research_id"):
+                jobs.append(data)
+        jobs.sort(key=lambda job: str(job.get("updated_at") or job.get("created_at") or ""), reverse=True)
+        return jobs[: max(1, min(int(limit or 50), 200))]
+
     def save(self, job: dict[str, Any]) -> dict[str, Any]:
         research_id = str(job.get("research_id") or "").strip()
         if not research_id:

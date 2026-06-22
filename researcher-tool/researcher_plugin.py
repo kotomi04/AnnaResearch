@@ -21,6 +21,7 @@ APP_METHODS = [
     "app_save_confirmed_research_focuses",
     "app_save_confirmed_research_outline",
     "app_get_research_job",
+    "app_list_research_jobs",
     "app_list_research_sources",
     "app_update_research_source_credential",
     "app_set_research_source_enabled",

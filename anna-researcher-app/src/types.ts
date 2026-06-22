@@ -156,6 +156,8 @@ export interface ResearchJob {
   stage?: ResearchStage;
   progress?: number;
   query?: string;
+  created_at?: string;
+  updated_at?: string;
   agent_name?: string;
   agent_role_prompt?: string;
   search_queries?: string[];
@@ -219,6 +221,7 @@ export interface StartResearchInput {
 }
 
 export interface ToolSettings {
+  research_root?: string;
   tavily: {
     configured: boolean;
     masked: string;

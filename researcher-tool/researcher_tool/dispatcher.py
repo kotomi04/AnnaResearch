@@ -132,6 +132,9 @@ class AppDispatcher:
             if job.get("report_markdown"):
                 view["result_transfer"] = self.transfer_server.result_descriptor(str(job.get("research_id")), method="GET")
             return {"job": view}
+        if method == "app_list_research_jobs":
+            limit = int(args.get("limit") or 50)
+            return {"jobs": [status_view(job) for job in self.jobs.list_jobs(limit=limit)]}
         if method == "app_list_research_sources":
             return {"sources": self.registry.list_views()}
         if method == "app_update_research_source_credential":

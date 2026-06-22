@@ -59,6 +59,7 @@ def test_describe_v2_app_methods_only(tmp_path):
         assert "research" not in tools
         assert "app_search_web" not in tools
         assert "app_call_research_source" in tools
+        assert "app_list_research_jobs" in tools
         assert "app_list_research_sources" in tools
         assert "app_test_research_source" in tools
         assert "app_update_research_source_credential" in tools

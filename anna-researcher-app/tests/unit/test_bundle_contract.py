@@ -29,6 +29,7 @@ def test_bundle_does_not_contain_legacy_research_action_contract():
     assert "app_create_research_job" in bundle_js
     assert "app_save_research_result" in bundle_js
     assert "app_call_research_source" in bundle_js
+    assert "app_list_research_jobs" in bundle_js
     assert "app_list_research_sources" in bundle_js
     assert "app_update_research_source_credential" in bundle_js
     assert "uploadResearchResult" in bundle_js

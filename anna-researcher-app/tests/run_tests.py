@@ -35,6 +35,7 @@ def test_settings(tmp_path: Path):
     dispatcher = make_dispatcher(tmp_path)
     settings = dispatcher.dispatch("app_get_settings", {})["settings"]
     assert_true(settings["tavily"]["configured"] is False, "settings should start unconfigured")
+    assert_true(settings["research_root"] == str(tmp_path / ".research"), "settings should expose actual research root")
     updated = dispatcher.dispatch("app_update_settings", {"tavily_api_key": "tvly-test-secret"})["settings"]
     assert_true(updated["tavily"]["configured"] is True, "settings should become configured")
     assert_true("secret" not in updated["tavily"]["masked"], "settings should mask key")
@@ -69,6 +70,12 @@ def test_job_shell(tmp_path: Path):
     assert_true(updated["job"]["progress"] == 25, "progress should update")
     assert_true(updated["job"]["iteration"] == 1, "iteration should update")
     assert_true(updated["job"]["max_iterations"] == 5, "max_iterations should update")
+    second = dispatcher.dispatch("app_create_research_job", {"query": "Second research"})["job"]
+    listed = dispatcher.dispatch("app_list_research_jobs", {"limit": 10})["jobs"]
+    assert_true(len(listed) == 2, "job list should include created jobs")
+    listed_ids = {job["research_id"] for job in listed}
+    assert_true(second["research_id"] in listed_ids and job["research_id"] in listed_ids, "job list should include both ids")
+    assert_true(any(item["query"] == "Second research" for item in listed), "job list should include compact query")
     try:
         dispatcher.dispatch("app_update_research_job", {"research_id": job["research_id"], "updates": {"tavily_api_key": "leak"}})
         raise AssertionError("secret-like field should be rejected")

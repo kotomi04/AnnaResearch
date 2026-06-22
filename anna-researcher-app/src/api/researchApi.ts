@@ -24,6 +24,10 @@ interface JobResponse {
   job?: ResearchJob | null;
 }
 
+interface JobListResponse {
+  jobs?: ResearchJob[];
+}
+
 interface SourceListResponse {
   sources?: ResearchSourceView[];
 }
@@ -68,6 +72,7 @@ export interface ResearchApi {
   createResearchJob(input: StartResearchInput): Promise<ResearchJob>;
   updateResearchJob(researchId: string, updates: Record<string, unknown>): Promise<ResearchJob>;
   getResearchJob(researchId?: string): Promise<ResearchJob | null>;
+  listResearchJobs(input?: { limit?: number }): Promise<ResearchJob[]>;
   callResearchSource(input: {
     research_id: string;
     iteration: number;
@@ -186,6 +191,11 @@ export class AnnaResearchApi implements ResearchApi {
     const data = await fetchTransfer<ResultResponse>(transfer);
     if (!job) return data.result ? { result: data.result } : null;
     return { ...job, result: data.result ?? job.result };
+  }
+
+  async listResearchJobs(input: { limit?: number } = {}): Promise<ResearchJob[]> {
+    const response = (await this.call("app_list_research_jobs", { limit: input.limit ?? 50 })) as JobListResponse;
+    return response.jobs ?? [];
   }
 
   async callResearchSource(input: {
@@ -328,6 +338,7 @@ export function createStandaloneApi(): ResearchApi {
     createResearchJob: fail,
     updateResearchJob: fail,
     getResearchJob: fail,
+    listResearchJobs: fail,
     callResearchSource: fail,
     saveConfirmedResearchRole: fail,
     saveConfirmedResearchFocuses: fail,

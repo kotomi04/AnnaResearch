@@ -8,12 +8,14 @@ import { OutlineReviewPage } from "./components/OutlineReviewPage";
 import { ReportDisplayPage } from "./components/ReportDisplayPage";
 import { ReportGenerationPage } from "./components/ReportGenerationPage";
 import { ResearchForm } from "./components/ResearchForm";
+import { ResearchLibraryPage } from "./components/ResearchLibraryPage";
 import {
   ResearchSourceDetailPage,
   ResearchSourceListPage,
   ResearchSourceNewPage,
 } from "./components/ResearchSourcePanel";
 import { RoleReviewPage } from "./components/RoleReviewPage";
+import { TaskPickerPage } from "./components/TaskPickerPage";
 import { WorkflowStepper } from "./components/WorkflowStepper";
 import { MAX_RESEARCH_ITERATIONS, useResearchJob } from "./hooks/useResearchJob";
 import type { FocusCandidate, RoleCandidate } from "./hooks/useResearchJob";
@@ -23,14 +25,15 @@ import type { ReportSection } from "./types";
 import { summarizePlan } from "./workflow/planSummary";
 import { projectGuidedStep, type GuidedStepId } from "./workflow/stepState";
 
-type AppPage = "workflow" | "sources" | "source-detail" | "source-new";
+type AppPage = "task-picker" | "workflow" | "library" | "sources" | "source-detail" | "source-new";
 
 export function App() {
   const { locale, setLocale, t } = useLocale();
   const [api, setApi] = useState<ResearchApi>(() => createStandaloneApi());
   const [runtimeError, setRuntimeError] = useState<unknown>(null);
   const [validationMessage, setValidationMessage] = useState("");
-  const [appPage, setAppPage] = useState<AppPage>("workflow");
+  const [appPage, setAppPage] = useState<AppPage>("task-picker");
+  const [libraryReturnPage, setLibraryReturnPage] = useState<AppPage>("task-picker");
   const [selectedSourceId, setSelectedSourceId] = useState("");
   const [briefNameDraft, setBriefNameDraft] = useState("");
   const [researchNeedDraft, setResearchNeedDraft] = useState("");
@@ -80,7 +83,8 @@ export function App() {
   const jobMessage = localizedJobMessage(research.job, t);
   const asyncErrorMessage = research.error ? localizedError(research.error, t) : "";
   const runtimeErrorMessage = runtimeError ? t("runtimeMissing") : "";
-  const message = validationMessage || runtimeErrorMessage || asyncErrorMessage || jobMessage.message;
+  const alertMessage = validationMessage || runtimeErrorMessage || asyncErrorMessage;
+  const message = alertMessage || jobMessage.message;
   const isMessageError = Boolean(validationMessage || runtimeErrorMessage || asyncErrorMessage || jobMessage.isError);
   const selectedSource = useMemo(
     () => research.sources.find((source) => source.id === selectedSourceId) ?? null,
@@ -197,6 +201,13 @@ export function App() {
     setAppPage("sources");
   }
 
+  function showLibrary() {
+    setValidationMessage("");
+    void research.refreshHistoryJobs().catch((err) => setValidationMessage(localizedError(err, t)));
+    setLibraryReturnPage(appPage === "library" ? "task-picker" : appPage);
+    setAppPage("library");
+  }
+
   function showNewResearch() {
     setValidationMessage("");
     setSelectedRoleIndex(0);
@@ -205,6 +216,40 @@ export function App() {
     setRequestedStep("need");
     setAppPage("workflow");
     research.resetForNewResearch();
+  }
+
+  function showTaskPicker() {
+    setValidationMessage("");
+    void research.refreshHistoryJobs().catch((err) => setValidationMessage(localizedError(err, t)));
+    setAppPage("task-picker");
+  }
+
+  function goBackFromLibrary() {
+    setValidationMessage("");
+    setAppPage(libraryReturnPage === "library" ? "task-picker" : libraryReturnPage);
+  }
+
+  function continueLatestTask() {
+    setValidationMessage("");
+    if (hasCompletedResult) {
+      setRequestedStep("report");
+      setAppPage("workflow");
+      return;
+    }
+    if (research.job?.research_id) {
+      setAppPage("workflow");
+    }
+  }
+
+  async function openHistoryTask(researchId: string) {
+    setValidationMessage("");
+    const selected = await research.openResearchJob(researchId);
+    if (selected?.status === "completed" && selected.result) {
+      setRequestedStep("report");
+    } else {
+      setRequestedStep("need");
+    }
+    setAppPage("workflow");
   }
 
   async function saveCredential(input: { id: string; credential?: string; clear?: boolean }) {
@@ -241,12 +286,15 @@ export function App() {
     <main className="workbench" lang={locale}>
       <section className="app-window">
         <header className="topbar">
-          <div>
-            <p className="eyebrow">{t("appTitle")}</p>
-            <h1>{t("appSubtitle")}</h1>
+          <div className="brand-block">
+            <span className="brand-icon" aria-hidden="true">/</span>
+            <h1>{t("appTitle")}</h1>
           </div>
           <div className="topbar-actions">
             <LanguageToggle locale={locale} setLocale={setLocale} t={t} />
+            <button type="button" className="secondary source-button" onClick={showLibrary} disabled={research.isBusy}>
+              {t("libraryButton")}
+            </button>
             {projection.canOpenSources ? (
               <button type="button" className="secondary source-button" onClick={showSources} data-testid="open-source-panel">
                 {t("sourcesButton")}
@@ -256,7 +304,36 @@ export function App() {
         </header>
 
         <div className="app-window-body">
-          {appPage === "sources" ? (
+          {appPage === "task-picker" ? (
+            <TaskPickerPage
+              jobs={research.historyJobs}
+              latestJob={research.lastCompletedJob ?? research.job}
+              canContinue={hasCompletedResult || Boolean(research.job?.research_id)}
+              isBusy={research.isBusy}
+              message={alertMessage}
+              workspacePath={research.settings?.research_root}
+              t={t}
+              onCreate={showNewResearch}
+              onContinue={continueLatestTask}
+              onOpenLibrary={showLibrary}
+              onOpenTask={(researchId) => {
+                void openHistoryTask(researchId).catch((err) => setValidationMessage(localizedError(err, t)));
+              }}
+            />
+          ) : appPage === "library" ? (
+            <ResearchLibraryPage
+              jobs={research.historyJobs}
+              currentJob={research.job}
+              isBusy={research.isBusy}
+              errorMessage={alertMessage}
+              t={t}
+              onBack={goBackFromLibrary}
+              onCreate={showNewResearch}
+              onOpen={(researchId) => {
+                void openHistoryTask(researchId).catch((err) => setValidationMessage(localizedError(err, t)));
+              }}
+            />
+          ) : appPage === "sources" ? (
             <ResearchSourceListPage
               sources={research.sources}
               isBusy={research.isBusy}
@@ -330,8 +407,9 @@ export function App() {
                   researchNeed={researchNeedDraft}
                   t={t}
                   stepLabel={makeIntroStepLabel(research.job?.max_iterations)}
-                  validationMessage={message}
+                  validationMessage={alertMessage}
                   canShowLastResult={hasCompletedResult}
+                  onOpenLibrary={showLibrary}
                   onBriefNameChange={setBriefNameDraft}
                   onResearchNeedChange={setResearchNeedDraft}
                   onShowLastResult={() => setRequestedStep("report")}

@@ -9,6 +9,7 @@ interface Props {
   stepLabel: string;
   validationMessage: string;
   canShowLastResult: boolean;
+  onOpenLibrary(): void;
   onBriefNameChange(value: string): void;
   onResearchNeedChange(value: string): void;
   onShowLastResult(): void;
@@ -25,6 +26,7 @@ export function ResearchForm({
   stepLabel,
   validationMessage,
   canShowLastResult,
+  onOpenLibrary,
   onBriefNameChange,
   onResearchNeedChange,
   onShowLastResult,
@@ -48,6 +50,9 @@ export function ResearchForm({
           <h2>{t("researchQuestionHeading")}</h2>
         </div>
         <div className="intro-actions">
+          <button type="button" className="secondary" onClick={onOpenLibrary} disabled={isBusy}>
+            {t("libraryButton")}
+          </button>
           <button type="button" className="secondary" onClick={onShowLastResult} disabled={!canShowLastResult}>
             {t("viewLastResultButton")}
           </button>

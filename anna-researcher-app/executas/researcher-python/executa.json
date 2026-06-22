@@ -2,6 +2,6 @@
   "tool_id": "tool-test-researcher-12345678",
   "type": "python",
   "enabled": true,
-  "command": ["uv", "run", "--project", "../../../researcher-tool", "tool-test-researcher-12345678"],
+  "command": ["env", "UV_CACHE_DIR=/tmp/anna-researcher-uv-cache", "uv", "run", "--project", "../../../researcher-tool", "tool-test-researcher-12345678"],
   "_comment": "Minimal App Executa Reference. Source lives in ../../../researcher-tool."
 }

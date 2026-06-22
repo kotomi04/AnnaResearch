@@ -7,6 +7,7 @@ import { FocusReviewPage } from "../../src/components/FocusReviewPage";
 import { RegenerationControl } from "../../src/components/RegenerationControl";
 import { ReportDisplayPage } from "../../src/components/ReportDisplayPage";
 import { ReportView } from "../../src/components/ReportView";
+import { ResearchLibraryPage } from "../../src/components/ResearchLibraryPage";
 import { appendSourcesToMarkdown } from "../../src/export/exportFiles";
 import { ResearchForm } from "../../src/components/ResearchForm";
 import {
@@ -15,6 +16,7 @@ import {
   ResearchSourceNewPage,
 } from "../../src/components/ResearchSourcePanel";
 import { ResearchTimeline } from "../../src/components/ResearchTimeline";
+import { TaskPickerPage } from "../../src/components/TaskPickerPage";
 import { createTranslator, localeStorageKey } from "../../src/i18n/messages";
 import { useLocale } from "../../src/i18n/useLocale";
 import type { ResearchSourceView } from "../../src/types";
@@ -73,6 +75,7 @@ describe("ResearchForm", () => {
         stepLabel="Step 1/5"
         validationMessage=""
         canShowLastResult={false}
+        onOpenLibrary={vi.fn()}
         onShowLastResult={vi.fn()}
         onStart={onStart}
         onValidationError={onValidationError}
@@ -101,6 +104,7 @@ describe("ResearchForm", () => {
         stepLabel="Step 1/5"
         validationMessage=""
         canShowLastResult={true}
+        onOpenLibrary={vi.fn()}
         onShowLastResult={onShowLastResult}
         onStart={vi.fn()}
         onValidationError={vi.fn()}
@@ -121,6 +125,7 @@ describe("ResearchForm", () => {
         stepLabel="Step 1/5"
         validationMessage="Enter a research need."
         canShowLastResult={false}
+        onOpenLibrary={vi.fn()}
         onShowLastResult={vi.fn()}
         onStart={vi.fn()}
         onValidationError={vi.fn()}
@@ -703,4 +708,74 @@ describe("ReportDisplayPage", () => {
     delete (window as Window & { showSaveFilePicker?: unknown }).showSaveFilePicker;
   });
 
+});
+
+describe("ResearchLibraryPage", () => {
+  it("renders stored research tasks and opens the selected task", () => {
+    const t = createTranslator("en");
+    const onOpen = vi.fn();
+    render(
+      <ResearchLibraryPage
+        jobs={[
+          {
+            research_id: "research_abc",
+            query: "Research topic: Market scan",
+            status: "completed",
+            source_count: 3,
+            updated_at: "2026-06-18T08:00:00Z",
+          },
+        ]}
+        currentJob={null}
+        isBusy={false}
+        t={t}
+        onBack={vi.fn()}
+        onCreate={vi.fn()}
+        onOpen={onOpen}
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: "Research Library" })).toBeTruthy();
+    expect(screen.getByText("Market scan")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    expect(onOpen).toHaveBeenCalledWith("research_abc");
+  });
+});
+
+describe("TaskPickerPage", () => {
+  it("renders first-page task choices and opens a recent task", () => {
+    const t = createTranslator("en");
+    const onOpenTask = vi.fn();
+    render(
+      <TaskPickerPage
+        jobs={[
+          {
+            research_id: "research_recent",
+            query: "Research topic: Recent market brief",
+            status: "completed",
+            source_count: 4,
+          },
+        ]}
+        latestJob={{
+          research_id: "research_recent",
+          query: "Research topic: Recent market brief",
+          status: "completed",
+          source_count: 4,
+        }}
+        canContinue={true}
+        isBusy={false}
+        message=""
+        t={t}
+        onCreate={vi.fn()}
+        onContinue={vi.fn()}
+        onOpenLibrary={vi.fn()}
+        onOpenTask={onOpenTask}
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: "Choose task" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Create new/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Open project/ })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /Recent market brief/ }));
+    expect(onOpenTask).toHaveBeenCalledWith("research_recent");
+  });
 });

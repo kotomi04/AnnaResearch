@@ -14,6 +14,8 @@ import type {
 } from "../types";
 import {
   makeLiveRunEvent,
+  projectSectionPreviews,
+  projectStoredRunEvents,
   sectionPreview,
   sourceCallEvent,
   type RunEvent,
@@ -55,6 +57,7 @@ export function useResearchJob(api: ResearchApi) {
   const [result, setResult] = useState<ResearchResult | null>(null);
   const [lastCompletedJob, setLastCompletedJob] = useState<ResearchJob | null>(null);
   const [lastCompletedResult, setLastCompletedResult] = useState<ResearchResult | null>(null);
+  const [historyJobs, setHistoryJobs] = useState<ResearchJob[]>([]);
   const [settings, setSettings] = useState<ToolSettings | null>(null);
   const [sources, setSources] = useState<ResearchSourceView[]>([]);
   const [phase, setPhase] = useState<ResearchPhase>("idle");
@@ -89,10 +92,14 @@ export function useResearchJob(api: ResearchApi) {
         setSettings(nextSettings);
         setSources(nextSources);
         const latest = await api.getResearchJob();
+        const history = await api.listResearchJobs({ limit: 50 }).catch(() => []);
         if (cancelled) return;
         setError(null);
         setJob(latest);
         setResult(latest?.result || null);
+        setHistoryJobs(history);
+        setRunEvents(projectStoredRunEvents(latest));
+        setSectionPreviews(projectSectionPreviews(latest));
         if (latest?.status === "completed" && latest.result) {
           setLastCompletedJob(latest);
           setLastCompletedResult(latest.result);
@@ -113,6 +120,38 @@ export function useResearchJob(api: ResearchApi) {
       cancelled = true;
     };
   }, [api]);
+
+  const refreshHistoryJobs = useCallback(async () => {
+    const jobs = await api.listResearchJobs({ limit: 50 });
+    setHistoryJobs(jobs);
+    return jobs;
+  }, [api]);
+
+  const openResearchJob = useCallback(
+    async (researchId: string) => {
+      const selected = await api.getResearchJob(researchId);
+      setError(null);
+      setJob(selected);
+      setResult(selected?.result || null);
+      setRoleCandidates([]);
+      setFocusCandidates([]);
+      setOutlineDraft(selected?.confirmed_outline || []);
+      setRunEvents(projectStoredRunEvents(selected));
+      setSectionPreviews(projectSectionPreviews(selected));
+      if (selected?.status === "completed" && selected.result) {
+        setLastCompletedJob(selected);
+        setLastCompletedResult(selected.result);
+        setPhase("completed");
+      } else if (selected?.status === "failed") {
+        setPhase("failed");
+      } else {
+        setPhase(hasConfiguredSource(sources) ? "idle" : "settings_required");
+      }
+      void refreshHistoryJobs().catch(() => undefined);
+      return selected;
+    },
+    [api, refreshHistoryJobs, sources],
+  );
 
   const applySourceUpdate = useCallback(
     (next: ResearchSourceView) => {
@@ -183,6 +222,7 @@ export function useResearchJob(api: ResearchApi) {
       setSectionPreviews([]);
       try {
         const current = await refreshSettings();
+        void refreshHistoryJobs().catch(() => undefined);
         if (!hasConfiguredSource(current.sources)) {
           setPhase("settings_required");
           return;
@@ -355,6 +395,7 @@ export function useResearchJob(api: ResearchApi) {
         setResult(completedResult);
         setLastCompletedJob(currentJob);
         setLastCompletedResult(completedResult);
+        void refreshHistoryJobs().catch(() => undefined);
         setPhase("completed");
       } catch (err) {
         setError(err);
@@ -369,6 +410,7 @@ export function useResearchJob(api: ResearchApi) {
     result,
     lastCompletedJob,
     lastCompletedResult,
+    historyJobs,
     settings,
     sources,
     phase,
@@ -385,6 +427,8 @@ export function useResearchJob(api: ResearchApi) {
     canStart: hasConfiguredSource(sources),
     refreshSettings,
     refreshSources,
+    refreshHistoryJobs,
+    openResearchJob,
     updateSourceCredential,
     setSourceEnabled,
     upsertSource,

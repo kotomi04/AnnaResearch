@@ -46,6 +46,23 @@ describe("App Anna runtime integration", () => {
 
     expect((await screen.findByRole("alert")).textContent).toBe("Anna runtime is not connected.");
   });
+
+  it("returns from the library to the page that opened it", async () => {
+    const calls: unknown[] = [];
+    runtimeMock.connect.mockResolvedValue(makeAnnaRuntime(calls));
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Create new" }));
+    expect(await screen.findByRole("heading", { name: "What are you researching?" })).toBeTruthy();
+
+    fireEvent.click(screen.getAllByRole("button", { name: "Library" })[0]);
+    expect(await screen.findByRole("heading", { name: "Research Library" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(await screen.findByRole("heading", { name: "What are you researching?" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Choose task" })).toBeNull();
+  });
 });
 
 function makeAnnaRuntime(calls: unknown[]): AnnaRuntimeApi {
@@ -76,6 +93,9 @@ function makeAnnaRuntime(calls: unknown[]): AnnaRuntimeApi {
         }
         if (request.method === "app_get_research_job") {
           return { success: true, data: { job: null } };
+        }
+        if (request.method === "app_list_research_jobs") {
+          return { success: true, data: { jobs: [] } };
         }
         return { success: true, data: {} };
       },
