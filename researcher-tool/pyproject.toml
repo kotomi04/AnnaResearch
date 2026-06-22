@@ -4,7 +4,13 @@ version = "0.2.0"
 description = "Anna Researcher standalone Executa tool backend"
 requires-python = ">=3.10"
 authors = [{ name = "Anna Research" }]
-dependencies = []
+dependencies = [
+    "arxiv>=2.0.0",
+    "beautifulsoup4>=4.12.2",
+    "ddgs>=9.0.0",
+    "lxml>=4.9.2",
+    "pymupdf>=1.23.6",
+]
 
 [project.scripts]
 "tool-test-researcher-12345678" = "researcher_plugin:main"
@@ -16,4 +22,3 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 py-modules = ["researcher_plugin"]
 packages = ["researcher_tool"]
-
