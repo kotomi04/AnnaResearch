@@ -13,6 +13,7 @@ interface ListProps extends SharedProps {
   onBack(): void;
   onAdd(): void;
   onOpenSource(id: string): void;
+  onToggleEnabled(input: { id: string; enabled: boolean }): Promise<unknown>;
 }
 
 interface DetailProps extends SharedProps {
@@ -32,7 +33,36 @@ interface NewProps extends SharedProps {
 
 type Feedback = { kind: "ok" | "error"; text: string } | null;
 
-export function ResearchSourceListPage({ sources, isBusy, errorMessage, t, onBack, onAdd, onOpenSource }: ListProps) {
+function SourceSwitch({
+  source,
+  isBusy,
+  t,
+  onToggle,
+}: {
+  source: ResearchSourceView;
+  isBusy: boolean;
+  t(key: MessageKey): string;
+  onToggle(): void;
+}) {
+  const stateLabel = source.enabled ? t("sourceEnabledLabel") : t("sourceDisabledLabel");
+  return (
+    <label className="source-toggle compact-toggle" data-enabled={source.enabled ? "true" : "false"}>
+      <input
+        type="checkbox"
+        checked={source.enabled}
+        disabled={isBusy}
+        onChange={onToggle}
+        aria-label={`${source.name} ${stateLabel}`}
+      />
+      <span className="source-toggle-track" aria-hidden="true">
+        <span className="source-toggle-thumb" />
+      </span>
+      <span className="source-toggle-text">{stateLabel}</span>
+    </label>
+  );
+}
+
+export function ResearchSourceListPage({ sources, isBusy, errorMessage, t, onBack, onAdd, onOpenSource, onToggleEnabled }: ListProps) {
   return (
     <section className="page active source-page" aria-label={t("sourcePanelTitle")}>
       <div className="source-page-head">
@@ -57,6 +87,7 @@ export function ResearchSourceListPage({ sources, isBusy, errorMessage, t, onBac
         {sources.map((source) => {
           const configured = source.credential_status === "configured";
           const isBuiltin = source.kind === "builtin";
+          const requiresCredential = sourceRequiresCredential(source);
           return (
             <li key={source.id} className="source-row" data-source-id={source.id}>
               <button type="button" className="source-card-button" onClick={() => onOpenSource(source.id)}>
@@ -65,16 +96,25 @@ export function ResearchSourceListPage({ sources, isBusy, errorMessage, t, onBac
                     <span className="source-name">{source.name}</span>
                     <span className="source-kind">{isBuiltin ? t("sourceKindBuiltin") : t("sourceKindUser")}</span>
                   </div>
-                  <span className="status-pill" data-configured={configured ? "true" : "false"}>
-                    {configured ? maskCredential(source.credential || "") : t("sourceCredentialMissing")}
-                  </span>
                 </div>
                 {source.description ? <p className="source-description">{source.description}</p> : null}
                 <div className="source-meta-row">
-                  <span>{source.enabled ? t("sourceEnabledLabel") : t("sourceDisabledLabel")}</span>
+                  <span data-configured={configured ? "true" : "false"}>
+                    {requiresCredential ? (configured ? maskCredential(source.credential || "") : t("sourceCredentialMissing")) : source.enabled ? t("sourceEnabledLabel") : t("sourceDisabledLabel")}
+                  </span>
                   <span>{t("sourceOpenDetail")}</span>
                 </div>
               </button>
+              <div className="source-row-control">
+                <SourceSwitch
+                  source={source}
+                  isBusy={isBusy}
+                  t={t}
+                  onToggle={() => {
+                    void onToggleEnabled({ id: source.id, enabled: !source.enabled });
+                  }}
+                />
+              </div>
             </li>
           );
         })}
@@ -129,6 +169,7 @@ export function ResearchSourceDetailPage({
   const isBuiltin = source.kind === "builtin";
   const configured = source.credential_status === "configured";
   const definitionReadOnly = isBuiltin || isBusy;
+  const requiresCredential = sourceRequiresCredential(source);
 
   async function saveCredential() {
     const value = credentialDraft.trim();
@@ -234,91 +275,84 @@ export function ResearchSourceDetailPage({
       <div className="source-detail-layout">
         <div className="source-state-row">
           <span className="source-state-label">{t("sourceStateLabel")}</span>
-          <label className="source-toggle compact-toggle">
-            <input
-              type="checkbox"
-              checked={source.enabled}
-              disabled={isBusy}
-              onChange={toggleEnabled}
-              aria-label={`${source.name} ${source.enabled ? t("sourceEnabledLabel") : t("sourceDisabledLabel")}`}
-            />
-            <span>{source.enabled ? t("sourceEnabledLabel") : t("sourceDisabledLabel")}</span>
-          </label>
+          <SourceSwitch source={source} isBusy={isBusy} t={t} onToggle={toggleEnabled} />
         </div>
 
-        <section className="source-detail-section">
-          <h3>{t("sourceCredentialSection")}</h3>
+        {requiresCredential ? (
+          <section className="source-detail-section">
+            <h3>{t("sourceCredentialSection")}</h3>
 
-          {credentialEditing ? (
-            <div className="source-editor">
-              <label htmlFor={`source-token-${source.id}`}>{t("sourceCredentialLabel")}</label>
-              <input
-                id={`source-token-${source.id}`}
-                type="password"
-                autoComplete="off"
-                placeholder={t("sourceCredentialPlaceholder")}
-                value={credentialDraft}
-                onChange={(event) => setCredentialDraft(event.target.value)}
-              />
-              <div className="actions">
-                <button type="button" onClick={saveCredential} disabled={isBusy || !credentialDraft.trim()}>
-                  {t("saveSettingsButton")}
-                </button>
-                <button
-                  type="button"
-                  className="secondary"
-                  onClick={() => {
-                    setCredentialEditing(false);
-                    setCredentialDraft("");
-                  }}
-                >
-                  {t("cancelButton")}
-                </button>
+            {credentialEditing ? (
+              <div className="source-editor">
+                <label htmlFor={`source-token-${source.id}`}>{t("sourceCredentialLabel")}</label>
+                <input
+                  id={`source-token-${source.id}`}
+                  type="password"
+                  autoComplete="off"
+                  placeholder={t("sourceCredentialPlaceholder")}
+                  value={credentialDraft}
+                  onChange={(event) => setCredentialDraft(event.target.value)}
+                />
+                <div className="actions">
+                  <button type="button" onClick={saveCredential} disabled={isBusy || !credentialDraft.trim()}>
+                    {t("saveSettingsButton")}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => {
+                      setCredentialEditing(false);
+                      setCredentialDraft("");
+                    }}
+                  >
+                    {t("cancelButton")}
+                  </button>
+                </div>
               </div>
-            </div>
-          ) : (
-            <div className="credential-row">
-              <p className="source-description credential-mask">
-                {configured ? (credentialVisible ? source.credential || "" : maskCredential(source.credential || "")) : t("sourceCredentialMissing")}
-              </p>
-              <div className="actions credential-actions">
-                <button
-                  type="button"
-                  className="secondary"
-                  onClick={() => setCredentialVisible((value) => !value)}
-                  disabled={!configured}
-                  aria-label={credentialVisible ? t("sourceCredentialHide") : t("sourceCredentialShow")}
-                  title={credentialVisible ? t("sourceCredentialHide") : t("sourceCredentialShow")}
-                >
-                  {credentialVisible ? <EyeOffIcon /> : <EyeIcon />}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setCredentialEditing(true);
-                    setCredentialVisible(false);
-                    setCredentialDraft("");
-                    setFeedback(null);
-                  }}
-                  disabled={isBusy}
-                >
-                  {configured ? t("sourceCredentialReplace") : t("sourceCredentialAdd")}
-                </button>
-                <button
-                  type="button"
-                  className="danger"
-                  onClick={() => {
-                    setCredentialVisible(false);
-                    void clearCredential();
-                  }}
-                  disabled={isBusy || !configured}
-                >
-                  {t("clearSettingsButton")}
-                </button>
+            ) : (
+              <div className="credential-row">
+                <p className="source-description credential-mask">
+                  {configured ? (credentialVisible ? source.credential || "" : maskCredential(source.credential || "")) : t("sourceCredentialMissing")}
+                </p>
+                <div className="actions credential-actions">
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => setCredentialVisible((value) => !value)}
+                    disabled={!configured}
+                    aria-label={credentialVisible ? t("sourceCredentialHide") : t("sourceCredentialShow")}
+                    title={credentialVisible ? t("sourceCredentialHide") : t("sourceCredentialShow")}
+                  >
+                    {credentialVisible ? <EyeOffIcon /> : <EyeIcon />}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCredentialEditing(true);
+                      setCredentialVisible(false);
+                      setCredentialDraft("");
+                      setFeedback(null);
+                    }}
+                    disabled={isBusy}
+                  >
+                    {configured ? t("sourceCredentialReplace") : t("sourceCredentialAdd")}
+                  </button>
+                  <button
+                    type="button"
+                    className="danger"
+                    onClick={() => {
+                      setCredentialVisible(false);
+                      void clearCredential();
+                    }}
+                    disabled={isBusy || !configured}
+                  >
+                    {t("clearSettingsButton")}
+                  </button>
+                </div>
               </div>
-            </div>
-          )}
-        </section>
+            )}
+          </section>
+        ) : null}
 
         <section className="source-detail-section">
           <div className="source-section-head">
@@ -972,6 +1006,10 @@ function maskCredential(value: string): string {
   if (!text) return "***";
   if (text.length <= 4) return "*".repeat(text.length);
   return `***${text.slice(-4)}`;
+}
+
+function sourceRequiresCredential(source: ResearchSourceView): boolean {
+  return source.definition?.credential_required !== false;
 }
 
 function formatSourceTestError(error: NonNullable<ResearchSourceTestResult["error"]>): string {

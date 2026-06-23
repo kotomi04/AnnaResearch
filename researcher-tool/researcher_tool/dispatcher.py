@@ -18,6 +18,7 @@ from .sources import (
     validate_envelope,
     migrate_legacy_tavily_key,
 )
+from .sources.native.executor import NativeResearchSourceExecutor
 from .views import compact_job_view, source_view, status_view
 
 
@@ -70,6 +71,7 @@ class AppDispatcher:
         registry: ResearchSourceRegistry | None = None,
         credentials: CredentialStore | None = None,
         executor: ResearchSourceExecutor | None = None,
+        native_executor: NativeResearchSourceExecutor | None = None,
     ):
         self.settings = settings or SettingsStore()
         self.jobs = jobs or JobStore()
@@ -84,6 +86,7 @@ class AppDispatcher:
             self.executor = ResearchSourceExecutor(token_provider=self._token_for, http_open=_fake_tavily_http)
         else:
             self.executor = ResearchSourceExecutor(token_provider=self._token_for)
+        self.native_executor = native_executor or NativeResearchSourceExecutor()
         migrate_legacy_tavily_key(self.settings, self.credentials)
 
     def dispatch(self, method: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -240,16 +243,15 @@ class AppDispatcher:
         test_definition = dict(definition)
         test_definition["id"] = source_id
         test_definition.setdefault("name", definition.get("name") or source_id)
-        try:
-            validate_envelope(test_definition, kind="builtin" if self.registry.is_builtin(source_id) else "user")
-        except EnvelopeError:
-            raise
+        if not self._is_native_source(test_definition):
+            try:
+                validate_envelope(test_definition, kind="builtin" if self.registry.is_builtin(source_id) else "user")
+            except EnvelopeError:
+                raise
 
-        token = self._token_for(source_id)
-        if not token:
-            raise ConfigurationError(f"credential missing for source: {source_id}")
+        self._ensure_source_credential(source_id, test_definition)
 
-        result = self.executor.test(test_definition, query)
+        result = self._executor_for(test_definition).test(test_definition, query)
         test = {
             "source_id": result.source_id,
             "source_name": result.source_name,
@@ -273,9 +275,7 @@ class AppDispatcher:
         except Exception as exc:
             raise ValidationError(f"unknown source: {source_id}") from exc
 
-        token = self._token_for(source_id)
-        if not token:
-            raise ConfigurationError(f"credential missing for source: {source_id}")
+        self._ensure_source_credential(source_id, definition)
 
         accepted_queries: list[str] = []
         for query in queries:
@@ -294,8 +294,9 @@ class AppDispatcher:
         call_summaries: list[dict[str, Any]] = []
         raw_results: list[dict[str, Any]] = []
         first_error: str | None = None
+        executor = self._executor_for(definition)
         for query in accepted_queries:
-            result = self.executor.call(definition, query)
+            result = executor.call(definition, query)
             error_code = result.error if result.error not in (None, "empty_result") else None
             if error_code and first_error is None:
                 first_error = error_code
@@ -359,9 +360,7 @@ class AppDispatcher:
         except Exception as exc:
             raise ValidationError(f"unknown source: {source_id}") from exc
 
-        token = self._token_for(source_id)
-        if not token:
-            raise ConfigurationError(f"credential missing for source: {source_id}")
+        self._ensure_source_credential(source_id, definition)
 
         accepted_queries: list[str] = []
         for query in queries:
@@ -380,8 +379,9 @@ class AppDispatcher:
         call_summaries: list[dict[str, Any]] = []
         raw_results: list[dict[str, Any]] = []
         first_error: str | None = None
+        executor = self._executor_for(definition)
         for query in accepted_queries:
-            result = self.executor.call(definition, query)
+            result = executor.call(definition, query)
             error_code = result.error if result.error not in (None, "empty_result") else None
             if error_code and first_error is None:
                 first_error = error_code
@@ -475,6 +475,22 @@ class AppDispatcher:
             return True
         except Exception:
             return False
+
+    def _ensure_source_credential(self, source_id: str, definition: dict[str, Any]) -> None:
+        if definition.get("credential_required") is False:
+            return
+        token = self._token_for(source_id)
+        if not token:
+            raise ConfigurationError(f"credential missing for source: {source_id}")
+
+    def _executor_for(self, definition: dict[str, Any]):
+        if self._is_native_source(definition):
+            return self.native_executor
+        return self.executor
+
+    @staticmethod
+    def _is_native_source(definition: dict[str, Any]) -> bool:
+        return isinstance(definition.get("native"), dict)
 
 
 def required_string(args: dict[str, Any], key: str) -> str:

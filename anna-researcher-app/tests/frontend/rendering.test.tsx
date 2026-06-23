@@ -285,11 +285,43 @@ describe("Research Source pages", () => {
         onBack={vi.fn()}
         onAdd={vi.fn()}
         onOpenSource={onOpenSource}
+        onToggleEnabled={vi.fn().mockResolvedValue(undefined)}
       />,
     );
     expect(screen.getByRole("heading", { name: "Research Sources" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /Tavily/i }));
     expect(onOpenSource).toHaveBeenCalledWith("tavily");
+  });
+
+  it("shows credential-free sources using their enabled state in the source list", () => {
+    const t = createTranslator("en");
+    const onToggleEnabled = vi.fn().mockResolvedValue(undefined);
+    const onOpenSource = vi.fn();
+    render(
+      <ResearchSourceListPage
+        sources={[
+          makeSource({
+            id: "duckduckgo",
+            name: "DuckDuckGo",
+            enabled: false,
+            credential: "",
+            definition: { id: "duckduckgo", credential_required: false, native: { adapter: "ddgs" } },
+          }),
+        ]}
+        isBusy={false}
+        t={t}
+        onBack={vi.fn()}
+        onAdd={vi.fn()}
+        onOpenSource={onOpenSource}
+        onToggleEnabled={onToggleEnabled}
+      />,
+    );
+
+    expect(screen.getAllByText("Disabled")).toHaveLength(2);
+    expect(screen.queryByText("***")).toBeNull();
+    fireEvent.click(screen.getByRole("checkbox", { name: /DuckDuckGo Disabled/i }));
+    expect(onToggleEnabled).toHaveBeenCalledWith({ id: "duckduckgo", enabled: true });
+    expect(onOpenSource).not.toHaveBeenCalled();
   });
 
   it("saves a credential from the detail page", async () => {

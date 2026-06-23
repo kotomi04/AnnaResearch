@@ -7,6 +7,7 @@ from ..executor import SourceCallResult, SourceTestResult
 from .duckduckgo import DuckDuckGoSearchError, search_duckduckgo
 
 NativeSearchFn = Callable[[str], list[dict[str, Any]]]
+NativeExtractorFn = Callable[..., list[dict[str, Any]]]
 
 
 class NativeResearchSourceExecutor:
@@ -17,9 +18,11 @@ class NativeResearchSourceExecutor:
         *,
         clock: Callable[[], float] | None = None,
         adapters: dict[str, NativeSearchFn] | None = None,
+        extractor: NativeExtractorFn | None = None,
     ):
         self._clock = clock or time.monotonic
         self._adapters = adapters or {}
+        self._extractor = extractor
 
     def call(self, definition: dict[str, Any], query: str) -> SourceCallResult:
         source_id = str(definition.get("id") or "")
@@ -78,17 +81,34 @@ class NativeResearchSourceExecutor:
             raise NativeSourceError("bad_definition", "native source adapter is required")
 
         if adapter in self._adapters:
-            return self._adapters[adapter](query)
+            return self._maybe_extract(definition, self._adapters[adapter](query))
         if adapter == "ddgs":
             try:
-                return search_duckduckgo(
+                items = search_duckduckgo(
                     query,
                     max_results=int(native.get("max_results") or 5),
                     region=str(native.get("region") or "wt-wt"),
                 )
+                return self._maybe_extract(definition, items)
             except DuckDuckGoSearchError as exc:
                 raise NativeSourceError("upstream_5xx", str(exc)) from exc
         raise NativeSourceError("bad_definition", f"unknown native source adapter: {adapter}")
+
+    def _maybe_extract(self, definition: dict[str, Any], items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        native = definition.get("native") or {}
+        if not isinstance(native, dict) or not items:
+            return items
+        try:
+            extractor = self._extractor or _default_extractor
+            return extractor(
+                items,
+                max_urls=_clamp_int(native.get("max_urls"), default=len(items), minimum=0, maximum=20),
+                timeout=float(native.get("extract_timeout") or 20.0),
+                max_chars_per_page=_clamp_int(native.get("max_chars_per_page"), default=8000, minimum=1000, maximum=50000),
+                max_pdf_pages=_optional_clamp_int(native.get("max_pdf_pages"), minimum=1, maximum=100),
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise NativeSourceError("upstream_5xx", f"native extraction failed: {exc}") from exc
 
 
 class NativeSourceError(Exception):
@@ -103,3 +123,23 @@ def _with_source_metadata(item: dict[str, Any], *, source_id: str, source_name: 
     data["source_id"] = source_id
     data["source_name"] = source_name
     return data
+
+
+def _clamp_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError):
+        numeric = default
+    return max(minimum, min(maximum, numeric))
+
+
+def _optional_clamp_int(value: Any, *, minimum: int, maximum: int) -> int | None:
+    if value in (None, ""):
+        return None
+    return _clamp_int(value, default=minimum, minimum=minimum, maximum=maximum)
+
+
+def _default_extractor(items: list[dict[str, Any]], **kwargs: Any) -> list[dict[str, Any]]:
+    from ..extraction.fetcher import enrich_items_with_extracted_content
+
+    return enrich_items_with_extracted_content(items, **kwargs)

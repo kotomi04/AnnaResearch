@@ -9,7 +9,7 @@ from ..errors import NotFoundError, StoreError, ValidationError
 from .credentials import CredentialStore
 from .envelope import EnvelopeError, validate_envelope
 
-BUILTIN_SOURCE_IDS = frozenset({"tavily"})
+BUILTIN_SOURCE_IDS = frozenset({"tavily", "duckduckgo"})
 
 
 def builtin_tavily_definition() -> dict[str, Any]:
@@ -44,6 +44,22 @@ def builtin_tavily_definition() -> dict[str, Any]:
         "response": {"content_type": "application/json"},
     }
 
+def builtin_duckduckgo_definition() -> dict[str, Any]:
+    return {
+        "id": "duckduckgo",
+        "name": "DuckDuckGo",
+        "kind": "builtin",
+        "description": "Anna 默认 Web Search 源，适合轻量 research 和公开网页发现。",
+        "max_parallel": 2,
+        "credential_required": False,
+        "native": {
+            "adapter": "ddgs",
+            "max_results": 5,
+            "region": "wt-wt",
+            "max_urls": 5,
+            "max_chars_per_page": 8000,
+        },
+    }
 
 class ResearchSourceRegistry:
     """Holds Built-in and User-Configured Research Source definitions."""
@@ -58,7 +74,10 @@ class ResearchSourceRegistry:
         self.root = root
         self.path = root / "sources.json"
         self.credentials = credentials
-        self._builtins = builtins if builtins is not None else {"tavily": builtin_tavily_definition()}
+        self._builtins = builtins if builtins is not None else {
+            "tavily": builtin_tavily_definition(),
+            "duckduckgo": builtin_duckduckgo_definition(),
+        }
         self._enabled_path = root / "source_enabled.json"
 
     def _read_user_sources(self) -> dict[str, dict[str, Any]]:
@@ -197,6 +216,8 @@ class ResearchSourceRegistry:
 
     def _view_for(self, source_id: str, definition: dict[str, Any]) -> dict[str, Any]:
         cred = self.credentials.status(source_id)
+        if definition.get("credential_required") is False:
+            cred = {"credential_status": "configured", "credential": ""}
         enabled = self.is_enabled(source_id)
         kind = "builtin" if source_id in self._builtins else "user"
         view = {

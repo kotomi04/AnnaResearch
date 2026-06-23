@@ -19,6 +19,7 @@ from researcher_tool.dispatcher import AppDispatcher  # noqa: E402
 from researcher_tool.errors import ConfigurationError, NotFoundError, ValidationError  # noqa: E402
 from researcher_tool.job_store import JobStore  # noqa: E402
 from researcher_tool.settings import SettingsStore  # noqa: E402
+from researcher_tool.sources.native import duckduckgo as duckduckgo_native  # noqa: E402
 
 
 def assert_true(value, message):
@@ -357,6 +358,29 @@ def test_bundle_contract():
     assert_true("query_domains" not in bundle_js, "bundle should not reference query_domains")
 
 
+def test_duckduckgo_native_search_adapter(tmp_path: Path):
+    class FakeDDGS:
+        def text(self, query, *, region, max_results):
+            return [
+                {"href": "https://example.com/a", "title": "Alpha", "body": f"{query} body {region} {max_results}"},
+                {"url": "https://example.com/b", "title": "Beta", "snippet": "snippet text"},
+                {"title": "No useful content"},
+            ]
+
+    original = duckduckgo_native._create_client
+    duckduckgo_native._create_client = lambda: FakeDDGS()
+    try:
+        results = duckduckgo_native.search_duckduckgo(" anna research ", max_results=50, region="us-en")
+    finally:
+        duckduckgo_native._create_client = original
+
+    assert_true(len(results) == 2, "duckduckgo adapter should drop empty items")
+    assert_true(results[0]["query"] == "anna research", "duckduckgo adapter should trim query")
+    assert_true(results[0]["url"] == "https://example.com/a", "duckduckgo adapter should use href")
+    assert_true("20" in results[0]["content"], "duckduckgo adapter should clamp max_results")
+    assert_true(results[1]["content"] == "snippet text", "duckduckgo adapter should use snippet fallback")
+
+
 def main():
     tests = [
         ("settings", test_settings),
@@ -367,6 +391,7 @@ def main():
         ("call_requires_credential", test_call_research_source_requires_credential),
         ("source_test_transfer", test_source_test_transfer),
         ("selector", lambda tmp: test_selector()),
+        ("duckduckgo_native", test_duckduckgo_native_search_adapter),
         ("plugin_contract", test_plugin_contract),
         ("bundle_contract", lambda tmp: test_bundle_contract()),
     ]

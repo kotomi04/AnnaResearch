@@ -348,6 +348,7 @@ export function App() {
                 setSelectedSourceId(id);
                 setAppPage("source-detail");
               }}
+              onToggleEnabled={toggleSourceEnabled}
             />
           ) : appPage === "source-detail" ? (
             <ResearchSourceDetailPage

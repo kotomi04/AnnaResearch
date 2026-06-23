@@ -11,6 +11,7 @@ from .executor import ResearchSourceExecutor, SourceCallError, SourceCallResult,
 from .registry import (
     BUILTIN_SOURCE_IDS,
     ResearchSourceRegistry,
+    builtin_duckduckgo_definition,
     builtin_tavily_definition,
 )
 
@@ -25,6 +26,7 @@ __all__ = [
     "SourceCallError",
     "SourceCallResult",
     "SourceTestResult",
+    "builtin_duckduckgo_definition",
     "builtin_tavily_definition",
     "mask_secret",
     "migrate_legacy_tavily_key",

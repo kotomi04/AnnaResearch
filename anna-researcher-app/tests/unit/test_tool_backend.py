@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import urllib.error
 import urllib.request
 
@@ -18,11 +19,19 @@ from researcher_tool.sources import (
     ResearchSourceExecutor,
     ResearchSourceRegistry,
     SourceCallError,
+    builtin_duckduckgo_definition,
     builtin_tavily_definition,
     migrate_legacy_tavily_key,
 )
 from researcher_tool.sources.envelope import EnvelopeError, validate_envelope
 from researcher_tool.sources.executor import resolve_path
+from researcher_tool.sources.extraction import arxiv as arxiv_extraction
+from researcher_tool.sources.extraction import fetcher as extraction_fetcher
+from researcher_tool.sources.extraction.html import extract_html
+from researcher_tool.sources.extraction.models import ExtractedPage
+from researcher_tool.sources.extraction.pdf import extract_pdf
+from researcher_tool.sources.native import duckduckgo as duckduckgo_native
+from researcher_tool.sources.native.executor import NativeResearchSourceExecutor
 
 
 def make_dispatcher(tmp_path):
@@ -177,6 +186,350 @@ def test_normalize_query_collapses_whitespace_and_case():
 
 
 # ---------------------------------------------------------------------------
+# Native DuckDuckGo adapter
+# ---------------------------------------------------------------------------
+
+
+def test_duckduckgo_native_search_normalizes_results(monkeypatch):
+    class FakeDDGS:
+        def text(self, query, *, region, max_results):
+            assert query == "anna research"
+            assert region == "us-en"
+            assert max_results == 20
+            return [
+                {"href": "https://example.com/a", "title": "Alpha", "body": "alpha body"},
+                {"url": "https://example.com/b", "title": "Beta", "snippet": "beta snippet"},
+                {"href": "https://example.com/c", "content": "content fallback"},
+                {"title": "No useful content"},
+            ]
+
+    monkeypatch.setattr(duckduckgo_native, "_create_client", lambda: FakeDDGS())
+
+    results = duckduckgo_native.search_duckduckgo(" anna research ", max_results=50, region="us-en")
+
+    assert results == [
+        {
+            "query": "anna research",
+            "url": "https://example.com/a",
+            "title": "Alpha",
+            "content": "alpha body",
+        },
+        {
+            "query": "anna research",
+            "url": "https://example.com/b",
+            "title": "Beta",
+            "content": "beta snippet",
+        },
+        {
+            "query": "anna research",
+            "url": "https://example.com/c",
+            "title": "https://example.com/c",
+            "content": "content fallback",
+        },
+    ]
+
+
+def test_duckduckgo_native_search_handles_empty_query(monkeypatch):
+    monkeypatch.setattr(duckduckgo_native, "_create_client", lambda: pytest.fail("client should not be created"))
+
+    assert duckduckgo_native.search_duckduckgo("   ") == []
+
+
+def test_duckduckgo_native_search_wraps_ddgs_errors(monkeypatch):
+    class FailingDDGS:
+        def text(self, query, *, region, max_results):
+            raise RuntimeError("blocked")
+
+    monkeypatch.setattr(duckduckgo_native, "_create_client", lambda: FailingDDGS())
+
+    with pytest.raises(duckduckgo_native.DuckDuckGoSearchError, match="duckduckgo search failed"):
+        duckduckgo_native.search_duckduckgo("anna")
+
+
+def test_native_research_source_executor_call_wraps_ddgs_results():
+    executor = NativeResearchSourceExecutor(
+        clock=_fixed_clock(),
+        adapters={
+            "ddgs": lambda query: [
+                {"query": query, "url": "https://example.com/a", "title": "Alpha", "content": "alpha body"},
+            ]
+        },
+        extractor=lambda items, **kwargs: items,
+    )
+
+    result = executor.call(_native_definition(), " anna ")
+
+    assert result.source_id == "duckduckresearch"
+    assert result.source_name == "DuckDuckResearch"
+    assert result.query == "anna"
+    assert result.duration_ms == 125
+    assert result.error is None
+    assert result.items == [
+        {
+            "query": "anna",
+            "url": "https://example.com/a",
+            "title": "Alpha",
+            "content": "alpha body",
+            "source_id": "duckduckresearch",
+            "source_name": "DuckDuckResearch",
+        }
+    ]
+
+
+def test_native_research_source_executor_extracts_by_default():
+    extractor_calls = []
+
+    def fake_extractor(items, **kwargs):
+        extractor_calls.append((items, kwargs))
+        enriched = []
+        for item in items:
+            enriched.append({**item, "raw_content": "Fetched body", "content": item["content"] + "\n\nFull content:\nFetched body"})
+        return enriched
+
+    executor = NativeResearchSourceExecutor(
+        clock=_fixed_clock(),
+        adapters={
+            "ddgs": lambda query: [
+                {"query": query, "url": "https://example.com/a", "title": "Alpha", "content": "alpha snippet"},
+            ]
+        },
+        extractor=fake_extractor,
+    )
+    definition = _native_definition()
+    definition["native"]["max_urls"] = 2
+    definition["native"]["max_chars_per_page"] = 9000
+    definition["native"]["max_pdf_pages"] = 4
+
+    result = executor.call(definition, "anna")
+
+    assert result.error is None
+    assert result.items[0]["raw_content"] == "Fetched body"
+    assert result.items[0]["content"] == "alpha snippet\n\nFull content:\nFetched body"
+    assert extractor_calls == [
+        (
+            [{"query": "anna", "url": "https://example.com/a", "title": "Alpha", "content": "alpha snippet"}],
+            {"max_urls": 2, "timeout": 20.0, "max_chars_per_page": 9000, "max_pdf_pages": 4},
+        )
+    ]
+
+
+def test_native_research_source_executor_reports_extraction_failure():
+    def failing_extractor(items, **kwargs):
+        raise RuntimeError("fetch blocked")
+
+    executor = NativeResearchSourceExecutor(
+        clock=_fixed_clock(),
+        adapters={"ddgs": lambda query: [{"query": query, "url": "https://example.com/a", "title": "Alpha", "content": "alpha"}]},
+        extractor=failing_extractor,
+    )
+    definition = _native_definition()
+
+    result = executor.call(definition, "anna")
+    test = executor.test(definition, "anna")
+
+    assert result.error == "upstream_5xx"
+    assert result.items == []
+    assert test.error and test.error["code"] == "upstream_5xx"
+    assert "native extraction failed" in test.error["message"]
+
+
+def test_native_research_source_executor_reports_empty_results():
+    executor = NativeResearchSourceExecutor(clock=_fixed_clock(), adapters={"ddgs": lambda query: []})
+
+    result = executor.call(_native_definition(), "anna")
+    test = executor.test(_native_definition(), "anna")
+
+    assert result.error == "empty_result"
+    assert result.items == []
+    assert test.error == {"code": "empty_result", "message": "native source returned no results"}
+    assert test.extracted == []
+
+
+def test_native_research_source_executor_reports_bad_definition():
+    executor = NativeResearchSourceExecutor(clock=_fixed_clock())
+
+    result = executor.call({"id": "native", "name": "Native", "native": {"adapter": "missing"}}, "anna")
+    test = executor.test({"id": "native", "name": "Native", "native": {"adapter": "missing"}}, "anna")
+
+    assert result.error == "bad_definition"
+    assert result.items == []
+    assert test.error and test.error["code"] == "bad_definition"
+
+
+def test_pdf_extraction_reads_local_pdf(tmp_path):
+    fitz = pytest.importorskip("fitz")
+    pdf_path = tmp_path / "sample.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "Anna PDF extraction smoke test")
+    doc.save(str(pdf_path))
+    doc.close()
+
+    result = extract_pdf(str(pdf_path), max_pages=1, max_chars_per_page=2000)
+
+    assert result.status == "success"
+    assert result.content_type == "pdf"
+    assert result.url == str(pdf_path)
+    assert "Anna PDF extraction smoke test" in result.raw_content
+
+
+def test_arxiv_extraction_reads_paper_metadata(monkeypatch):
+    def fake_load(query, *, max_results):
+        assert query == "2401.12345"
+        assert max_results == 2
+        return {
+            "title": "Anna Research Systems",
+            "authors": "Ada Lovelace, Alan Turing",
+            "published": "2026-06-22T00:00:00+00:00",
+            "summary": "A paper about research agents.",
+        }
+
+    monkeypatch.setattr(arxiv_extraction, "_load_arxiv_document", fake_load)
+
+    result = arxiv_extraction.extract_arxiv("https://arxiv.org/abs/2401.12345v2")
+
+    assert result.status == "success"
+    assert result.content_type == "arxiv"
+    assert result.title == "Anna Research Systems"
+    assert "Published: 2026-06-22T00:00:00+00:00" in result.raw_content
+    assert "Author: Ada Lovelace, Alan Turing" in result.raw_content
+    assert "Content: A paper about research agents." in result.raw_content
+
+
+def test_arxiv_extraction_reports_empty_source():
+    result = arxiv_extraction.extract_arxiv(" ")
+
+    assert result.status == "failed"
+    assert result.error == "empty_source"
+
+
+def test_html_extraction_reads_local_html_and_removes_noise(tmp_path):
+    html_path = tmp_path / "page.html"
+    html_path.write_text(
+        """
+        <html>
+          <head><title>Anna Page</title><script>bad()</script></head>
+          <body>
+            <nav>Navigation should disappear</nav>
+            <article>
+              <h1>Research Findings</h1>
+              <p>Anna extracts the useful article body.</p>
+            </article>
+            <footer>Footer should disappear</footer>
+          </body>
+        </html>
+        """,
+        encoding="utf-8",
+    )
+
+    result = extract_html(str(html_path), max_chars_per_page=2000)
+
+    assert result.status == "success"
+    assert result.content_type == "html"
+    assert result.title == "Anna Page"
+    assert "Research Findings" in result.raw_content
+    assert "Anna extracts the useful article body." in result.raw_content
+    assert "Navigation should disappear" not in result.raw_content
+    assert "Footer should disappear" not in result.raw_content
+
+
+def test_extraction_fetcher_routes_by_url_type(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        extraction_fetcher,
+        "extract_arxiv",
+        lambda url: calls.append(("arxiv", url)) or ExtractedPage(url=url, raw_content="arxiv", content_type="arxiv"),
+    )
+    monkeypatch.setattr(
+        extraction_fetcher,
+        "extract_pdf",
+        lambda url, **kwargs: calls.append(("pdf", url, kwargs)) or ExtractedPage(url=url, raw_content="pdf", content_type="pdf"),
+    )
+    monkeypatch.setattr(
+        extraction_fetcher,
+        "extract_html",
+        lambda url, **kwargs: calls.append(("html", url, kwargs)) or ExtractedPage(url=url, raw_content="html", content_type="html"),
+    )
+
+    pages = extraction_fetcher.fetch_many(
+        [
+            "https://arxiv.org/abs/2401.12345",
+            "https://arxiv.org/pdf/2401.12345",
+            "https://example.com/report.pdf",
+            "https://example.com/page",
+            "https://example.com/page#section",
+        ],
+        max_urls=10,
+        max_chars_per_page=111,
+        max_pdf_pages=2,
+    )
+
+    assert [page.content_type for page in pages] == ["arxiv", "arxiv", "pdf", "html"]
+    assert calls[0] == ("arxiv", "https://arxiv.org/abs/2401.12345")
+    assert calls[1] == ("arxiv", "https://arxiv.org/pdf/2401.12345")
+    assert calls[2][0:2] == ("pdf", "https://example.com/report.pdf")
+    assert calls[2][2]["max_chars_per_page"] == 111
+    assert calls[2][2]["max_pdf_pages"] == 2
+    assert calls[3][0:2] == ("html", "https://example.com/page")
+
+
+def test_extraction_fetcher_enriches_search_items(monkeypatch):
+    monkeypatch.setattr(
+        extraction_fetcher,
+        "fetch_many",
+        lambda items, **kwargs: [
+            ExtractedPage(
+                url="https://example.com/a",
+                title="Fetched title",
+                raw_content="Full page text",
+                content_type="html",
+            )
+        ],
+    )
+
+    enriched = extraction_fetcher.enrich_items_with_extracted_content(
+        [
+            {"url": "https://example.com/a#intro", "content": "Snippet"},
+            {"url": "https://example.com/b", "content": "Untouched"},
+        ]
+    )
+
+    assert enriched[0]["title"] == "Fetched title"
+    assert enriched[0]["raw_content"] == "Full page text"
+    assert enriched[0]["content"] == "Snippet\n\nFull content:\nFull page text"
+    assert enriched[0]["extraction_status"] == "success"
+    assert enriched[1] == {"url": "https://example.com/b", "content": "Untouched"}
+
+
+@pytest.mark.skipif(
+    os.getenv("ANNA_RESEARCHER_REAL_DDGS") != "1",
+    reason="set ANNA_RESEARCHER_REAL_DDGS=1 to run the real DuckDuckGo/ddgs network test",
+)
+def test_duckduckgo_native_search_real_network():
+    results = duckduckgo_native.search_duckduckgo("Anna app research", max_results=3)
+
+    assert 1 <= len(results) <= 3
+    for item in results:
+        assert item["query"] == "Anna app research"
+        assert item["url"].startswith(("http://", "https://"))
+        assert item["title"] or item["content"]
+
+
+def _native_definition():
+    return {
+        "id": "duckduckresearch",
+        "name": "DuckDuckResearch",
+        "native": {"adapter": "ddgs", "max_results": 5, "region": "wt-wt"},
+    }
+
+
+def _fixed_clock():
+    values = iter([10.0, 10.125, 20.0, 20.125])
+    return lambda: next(values)
+
+
+# ---------------------------------------------------------------------------
 # Envelope validation (ADR 0004)
 # ---------------------------------------------------------------------------
 
@@ -270,13 +623,18 @@ def test_registry_lists_builtin_tavily_with_credential(tmp_path):
     creds = CredentialStore(root)
     registry = ResearchSourceRegistry(root, credentials=creds)
     views = registry.list_views()
-    assert [v["id"] for v in views] == ["tavily"]
-    assert views[0]["kind"] == "builtin"
-    assert views[0]["credential_status"] == "missing"
-    assert views[0]["definition"]["id"] == "tavily"
-    assert views[0]["definition"]["request"]["body"]["api_key"] == "{token}"
-    assert "credential" not in views[0]["definition"]
-    assert "token" not in views[0]["definition"]
+    by_id = {view["id"]: view for view in views}
+    assert list(by_id) == ["tavily", "duckduckgo"]
+    assert by_id["tavily"]["kind"] == "builtin"
+    assert by_id["tavily"]["credential_status"] == "missing"
+    assert by_id["tavily"]["definition"]["id"] == "tavily"
+    assert by_id["tavily"]["definition"]["request"]["body"]["api_key"] == "{token}"
+    assert "credential" not in by_id["tavily"]["definition"]
+    assert "token" not in by_id["tavily"]["definition"]
+    assert by_id["duckduckgo"]["kind"] == "builtin"
+    assert by_id["duckduckgo"]["credential_status"] == "configured"
+    assert by_id["duckduckgo"]["credential"] == ""
+    assert by_id["duckduckgo"]["definition"]["native"]["adapter"] == "ddgs"
 
     creds.set_token("tavily", "tvly-secret-1234")
     refreshed = registry.get_view("tavily")
@@ -289,6 +647,7 @@ def test_registry_rejects_user_attempt_to_override_builtin(tmp_path):
     creds = CredentialStore(root)
     registry = ResearchSourceRegistry(root, credentials=creds)
     assert "tavily" in BUILTIN_SOURCE_IDS
+    assert "duckduckgo" in BUILTIN_SOURCE_IDS
     with pytest.raises(ValidationError) as exc:
         registry.upsert_user_source(_user_envelope(id="tavily", name="hijacked"))
     assert exc.value.data.get("reason") == "builtin_protected"
@@ -612,6 +971,38 @@ def test_call_research_source_uses_fake_token_and_records_iteration(tmp_path, mo
     assert loaded["source_urls"] == ["https://e.com/a", "https://e.com/b"]
 
 
+def test_call_research_source_uses_native_duckduckgo_without_credential(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANNA_RESEARCHER_FAKE_TAVILY", raising=False)
+    dispatcher = make_dispatcher(tmp_path)
+    dispatcher.native_executor = NativeResearchSourceExecutor(
+        adapters={
+            "ddgs": lambda query: [
+                {"query": query, "url": "https://duck.example/a", "title": "Duck result", "content": "duck snippet"},
+            ]
+        },
+        extractor=lambda items, **kwargs: [
+            {**item, "raw_content": "Duck full content", "content": item["content"] + "\n\nFull content:\nDuck full content"}
+            for item in items
+        ],
+    )
+
+    job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
+    response = dispatcher.dispatch(
+        "app_call_research_source",
+        {"research_id": job["research_id"], "iteration": 1, "source_id": "duckduckgo", "queries": ["anna"]},
+    )
+
+    call = response["source_call"]
+    assert call["source_id"] == "duckduckgo"
+    assert call["results_count"] == 1
+    assert call["error"] is None
+    loaded = dispatcher.jobs.load(job["research_id"])
+    item = loaded["iterations"][0]["raw_results"][0]
+    assert item["source_id"] == "duckduckgo"
+    assert item["raw_content"] == "Duck full content"
+    assert loaded["source_urls"] == ["https://duck.example/a"]
+
+
 def test_call_research_source_rejects_duplicate_query(tmp_path, monkeypatch):
     monkeypatch.setenv("ANNA_RESEARCHER_FAKE_TAVILY", "1")
     dispatcher = make_dispatcher(tmp_path)
@@ -635,6 +1026,54 @@ def test_call_research_source_rejects_duplicate_query(tmp_path, monkeypatch):
             {"research_id": job["research_id"], "iteration": 2, "source_id": "tavily", "queries": ["Anna"]},
         )
     assert exc.value.data.get("reason") == "duplicate"
+
+
+def test_call_section_research_source_uses_native_duckduckgo(tmp_path):
+    dispatcher = make_dispatcher(tmp_path)
+    dispatcher.native_executor = NativeResearchSourceExecutor(
+        adapters={
+            "ddgs": lambda query: [
+                {"query": query, "url": "https://duck.example/section", "title": "Section result", "content": "section snippet"},
+            ]
+        },
+        extractor=lambda items, **kwargs: items,
+    )
+    job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
+    dispatcher.dispatch(
+        "app_save_confirmed_research_outline",
+        {
+            "research_id": job["research_id"],
+            "sections": [
+                {
+                    "id": "section-1",
+                    "title": "Background",
+                    "outline": "Find background information.",
+                    "allowed_source_ids": ["duckduckgo"],
+                    "max_iterations": 1,
+                }
+            ],
+        },
+    )
+
+    response = dispatcher.dispatch(
+        "app_call_section_research_source",
+        {
+            "research_id": job["research_id"],
+            "section_id": "section-1",
+            "iteration": 1,
+            "source_id": "duckduckgo",
+            "queries": ["anna background"],
+        },
+    )
+
+    call = response["source_call"]
+    assert call["section_id"] == "section-1"
+    assert call["source_id"] == "duckduckgo"
+    assert call["results_count"] == 1
+    loaded = dispatcher.jobs.load(job["research_id"])
+    item = loaded["section_iterations"]["section-1"][0]["raw_results"][0]
+    assert item["source_name"] == "DuckDuckGo"
+    assert item["url"] == "https://duck.example/section"
 
 
 def test_app_search_web_is_removed(tmp_path):
@@ -678,6 +1117,29 @@ def test_app_test_research_source_uses_draft_definition_and_saved_credential(tmp
     assert result["extracted"][0]["title"] == "Draft title"
 
 
+def test_app_test_research_source_uses_native_definition_without_credential(tmp_path):
+    dispatcher = make_dispatcher(tmp_path)
+    dispatcher.native_executor = NativeResearchSourceExecutor(
+        adapters={
+            "ddgs": lambda query: [
+                {"query": query, "url": "https://duck.example/test", "title": "Duck test", "content": "duck test body"},
+            ]
+        },
+        extractor=lambda items, **kwargs: items,
+    )
+
+    immediate = dispatcher.dispatch(
+        "app_test_research_source",
+        {"id": "duckduckgo", "definition": builtin_duckduckgo_definition(), "query": "anna"},
+    )
+
+    result = get_json(immediate["test_transfer"]["url"])["test"]
+    assert result["source_id"] == "duckduckgo"
+    assert result["error"] is None
+    assert result["pages"] == []
+    assert result["extracted"][0]["url"] == "https://duck.example/test"
+
+
 # ---------------------------------------------------------------------------
 # Source list, credential updates, enabled flag
 # ---------------------------------------------------------------------------
@@ -686,9 +1148,12 @@ def test_app_test_research_source_uses_draft_definition_and_saved_credential(tmp
 def test_app_list_research_sources_returns_builtin(tmp_path):
     dispatcher = make_dispatcher(tmp_path)
     sources = dispatcher.dispatch("app_list_research_sources", {})["sources"]
-    assert [s["id"] for s in sources] == ["tavily"]
-    assert sources[0]["kind"] == "builtin"
-    assert sources[0]["credential_status"] == "missing"
+    by_id = {source["id"]: source for source in sources}
+    assert list(by_id) == ["tavily", "duckduckgo"]
+    assert by_id["tavily"]["kind"] == "builtin"
+    assert by_id["tavily"]["credential_status"] == "missing"
+    assert by_id["duckduckgo"]["kind"] == "builtin"
+    assert by_id["duckduckgo"]["credential_status"] == "configured"
 
 
 def test_update_research_source_credential_returns_plain_credential_and_clears(tmp_path):
