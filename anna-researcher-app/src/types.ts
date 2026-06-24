@@ -232,10 +232,11 @@ export interface AnnaToolInvokeRequest {
   tool_id: string;
   method: string;
   args: Record<string, unknown>;
+  timeoutMs?: number;
 }
 
 export interface AnnaToolsApi {
-  invoke(request: AnnaToolInvokeRequest): Promise<unknown>;
+  invoke(request: AnnaToolInvokeRequest, options?: { timeoutMs?: number }): Promise<unknown>;
 }
 
 export interface AnnaLlmMessage {

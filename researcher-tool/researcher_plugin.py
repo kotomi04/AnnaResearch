@@ -4,11 +4,14 @@ from __future__ import annotations
 import json
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
 from researcher_tool.dispatcher import AppDispatcher
+from researcher_tool.embedding import AnnaEmbeddingsClient, EmbeddingsError, embed_texts
 from researcher_tool.errors import ResearcherToolError, ValidationError
+from researcher_tool.sources.native.executor import NativeResearchSourceExecutor
 
 TOOL_ID = "tool-test-researcher-12345678"
 VERSION = "0.2.0"
@@ -37,6 +40,7 @@ APP_METHODS = [
     "app_save_report_framing",
     "app_save_assembled_research_result",
     "app_save_research_result",
+    "app_embed_texts",
 ]
 
 MANIFEST: dict[str, Any] = {
@@ -45,6 +49,7 @@ MANIFEST: dict[str, Any] = {
     "version": VERSION,
     "description": "Standalone backend tool for the Anna Researcher app.",
     "author": "Anna Research",
+    "host_capabilities": ["llm.embed"],
     "tools": [
         {
             "name": method,
@@ -57,7 +62,11 @@ MANIFEST: dict[str, Any] = {
 }
 
 _stdout_lock = threading.Lock()
-dispatcher = AppDispatcher()
+_embedding_cache_lock = threading.Lock()
+_embedding_cache: dict[str, list[float]] = {}
+_embedding_cache_order: list[str] = []
+_EMBEDDING_CACHE_LIMIT = 256
+embeddings: AnnaEmbeddingsClient
 
 
 def write_frame(msg: dict[str, Any]) -> None:
@@ -65,6 +74,48 @@ def write_frame(msg: dict[str, Any]) -> None:
     with _stdout_lock:
         sys.stdout.write(payload + "\n")
         sys.stdout.flush()
+
+
+embeddings = AnnaEmbeddingsClient(write_frame=write_frame)
+
+
+def _embed_vectors(texts: list[str]) -> list[list[float]]:
+    vectors: list[list[float]] = []
+    for text in texts:
+        clean = str(text or "").strip()
+        if not clean:
+            continue
+        vectors.append(_embed_one_vector(clean))
+    return vectors
+
+
+def _embed_one_vector(text: str) -> list[float]:
+    with _embedding_cache_lock:
+        cached = _embedding_cache.get(text)
+        if cached is not None:
+            return list(cached)
+
+    result = embeddings.create(texts=[text], model="anna-managed-v1", timeout=30.0)
+    data = result.get("data") or []
+    for item in data:
+        if isinstance(item, dict) and isinstance(item.get("embedding"), list):
+            vector = [float(value) for value in item.get("embedding")]
+            _remember_embedding(text, vector)
+            return vector
+    raise EmbeddingsError(-32506, "embeddings/create returned no embedding vector")
+
+
+def _remember_embedding(text: str, vector: list[float]) -> None:
+    with _embedding_cache_lock:
+        if text not in _embedding_cache:
+            _embedding_cache_order.append(text)
+        _embedding_cache[text] = list(vector)
+        while len(_embedding_cache_order) > _EMBEDDING_CACHE_LIMIT:
+            oldest = _embedding_cache_order.pop(0)
+            _embedding_cache.pop(oldest, None)
+
+
+dispatcher = AppDispatcher(native_executor=NativeResearchSourceExecutor(embedding_provider=_embed_vectors))
 
 
 def make_response(req_id: Any, *, result: Any = None, error: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -84,7 +135,7 @@ def handle_initialize(req_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         result={
             "protocolVersion": negotiated,
             "serverInfo": {"name": TOOL_ID, "version": VERSION},
-            "client_capabilities": {},
+            "client_capabilities": {"embeddings": {}},
             "capabilities": {},
         },
     )
@@ -98,8 +149,10 @@ def handle_invoke(req_id: Any, params: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(args, dict):
         return make_response(req_id, error={"code": -32602, "message": "`arguments` must be an object"})
     try:
-        data = dispatcher.dispatch(tool, args)
+        data = embed_texts(args, embeddings=embeddings) if tool == "app_embed_texts" else dispatcher.dispatch(tool, args)
         return make_response(req_id, result={"success": True, "tool": tool, "data": data})
+    except EmbeddingsError as exc:
+        return make_response(req_id, result={"success": False, "tool": tool, "error": exc.message, "data": {"code": "embedding_error", "embedding_code": exc.code, **exc.data}})
     except ResearcherToolError as exc:
         return make_response(req_id, result={"success": False, "tool": tool, "error": exc.message, "data": {"code": exc.code, **exc.data}})
     except Exception as exc:  # noqa: BLE001
@@ -111,6 +164,8 @@ def handle_message(line: str) -> None:
         msg = json.loads(line)
     except json.JSONDecodeError as exc:
         write_frame(make_response(None, error={"code": -32700, "message": f"parse error: {exc}"}))
+        return
+    if "method" not in msg and embeddings.dispatch_response(msg):
         return
 
     method = msg.get("method")
@@ -132,10 +187,19 @@ def handle_message(line: str) -> None:
 
 def main() -> None:
     print(f"[anna-researcher] {TOOL_ID} v{VERSION} ready", file=sys.stderr)
-    for line in sys.stdin:
-        line = line.strip()
-        if line:
-            handle_message(line)
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="invoke") as pool:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                pool.submit(handle_message, line)
+                continue
+            if "method" not in msg and embeddings.dispatch_response(msg):
+                continue
+            pool.submit(handle_message, line)
 
 
 if __name__ == "__main__":

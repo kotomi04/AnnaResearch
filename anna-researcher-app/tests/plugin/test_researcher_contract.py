@@ -50,11 +50,11 @@ def test_describe_v2_app_methods_only(tmp_path):
     try:
         init = plugin.call("initialize", {"protocolVersion": "2.0"})
         assert init["result"]["protocolVersion"] == "2.0"
-        assert init["result"]["client_capabilities"] == {}
+        assert init["result"]["client_capabilities"] == {"embeddings": {}}
         describe = plugin.call("describe")
         assert describe["result"]["name"] == "tool-test-researcher-12345678"
         assert describe["result"]["version"] == "0.2.0"
-        assert "host_capabilities" not in describe["result"]
+        assert describe["result"]["host_capabilities"] == ["llm.embed"]
         tools = [tool["name"] for tool in describe["result"]["tools"]]
         assert "research" not in tools
         assert "app_search_web" not in tools

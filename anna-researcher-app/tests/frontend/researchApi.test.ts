@@ -7,8 +7,8 @@ describe("AnnaResearchApi", () => {
     const calls: unknown[] = [];
     const anna: AnnaRuntimeApi = {
       tools: {
-        async invoke(request) {
-          calls.push(request);
+        async invoke(request, options) {
+          calls.push(options ? [request, options] : request);
           if (request.method === "app_get_settings" || request.method === "app_update_settings") {
             return { success: true, data: { settings: { tavily: { configured: true, masked: "***test" } } } };
           }
@@ -350,6 +350,107 @@ describe("AnnaResearchApi", () => {
       expect(JSON.stringify(calls)).not.toContain("# Final");
       expect(JSON.stringify(fetchCalls)).toContain("## Section");
       expect(JSON.stringify(fetchCalls)).toContain("# Final");
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("adds an extended invoke timeout only for DuckDuckGo embedding source calls", async () => {
+    const calls: unknown[] = [];
+    const anna: AnnaRuntimeApi = {
+      tools: {
+        async invoke(request, options) {
+          calls.push(options ? [request, options] : request);
+          if (request.method === "app_test_research_source") {
+            return {
+              success: true,
+              data: {
+                test_transfer: { method: "GET", url: "http://127.0.0.1:43123/source-tests/t1", content_type: "application/json" },
+              },
+            };
+          }
+          return {
+            success: true,
+            data: {
+              job: { research_id: "r1" },
+              source_call: {
+                source_id: "duckduckgo",
+                source_name: "DuckDuckGo",
+                queries: ["anna"],
+                results_count: 0,
+                top_titles: [],
+                duration_ms: 0,
+                error: null,
+                calls: [],
+              },
+            },
+          };
+        },
+      },
+      llm: {
+        async complete() {
+          return { content: { type: "text", text: "{}" } };
+        },
+      },
+    };
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          test: {
+            source_id: "duckduckgo",
+            source_name: "DuckDuckGo",
+            query: "anna",
+            duration_ms: 1,
+            pages: [],
+            extracted: [],
+            error: null,
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )) as typeof fetch;
+
+    try {
+      const api = new AnnaResearchApi(anna);
+      await api.callResearchSource({ research_id: "r1", iteration: 1, source_id: "duckduckgo", queries: ["anna"] });
+      await api.callSectionResearchSource({
+        research_id: "r1",
+        section_id: "section-1",
+        iteration: 1,
+        source_id: "duckduckgo",
+        queries: ["anna"],
+      });
+      await api.testResearchSource({ id: "duckduckgo", definition: { id: "duckduckgo" }, query: "anna" });
+
+      expect(calls).toEqual([
+        [
+          {
+            tool_id: TOOL_ID,
+            method: "app_call_research_source",
+            args: { research_id: "r1", iteration: 1, source_id: "duckduckgo", queries: ["anna"] },
+            timeoutMs: 300000,
+          },
+          { timeoutMs: 300000 },
+        ],
+        [
+          {
+            tool_id: TOOL_ID,
+            method: "app_call_section_research_source",
+            args: { research_id: "r1", section_id: "section-1", iteration: 1, source_id: "duckduckgo", queries: ["anna"] },
+            timeoutMs: 300000,
+          },
+          { timeoutMs: 300000 },
+        ],
+        [
+          {
+            tool_id: TOOL_ID,
+            method: "app_test_research_source",
+            args: { id: "duckduckgo", definition: { id: "duckduckgo" }, query: "anna" },
+            timeoutMs: 300000,
+          },
+          { timeoutMs: 300000 },
+        ],
+      ]);
     } finally {
       globalThis.fetch = oldFetch;
     }

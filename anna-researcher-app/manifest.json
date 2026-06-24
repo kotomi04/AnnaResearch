@@ -40,7 +40,7 @@
       "tools": ["required:tool-test-researcher-12345678"],
       "chat": [],
       "artifact": [],
-      "llm": ["complete"],
+      "llm": ["complete", "embed"],
       "fs": [],
       "storage": [],
       "prefs": [],

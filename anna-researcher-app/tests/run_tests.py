@@ -314,7 +314,7 @@ def test_plugin_contract(tmp_path: Path):
     try:
         init = plugin.call("initialize", {"protocolVersion": "2.0"})
         assert_true(init["result"]["protocolVersion"] == "2.0", "initialize should negotiate v2")
-        assert_true(init["result"].get("client_capabilities") == {}, "tool should not declare sampling")
+        assert_true(init["result"].get("client_capabilities") == {"embeddings": {}}, "tool should declare embeddings")
         describe = plugin.call("describe")
         tools = [tool["name"] for tool in describe["result"]["tools"]]
         assert_true(describe["result"]["name"] == "tool-test-researcher-12345678", "describe should advertise tool")
@@ -351,7 +351,7 @@ def test_bundle_contract():
     manifest = (APP_ROOT / "manifest.json").read_text(encoding="utf-8")
     assert_true("tool-test-researcher-12345678" in manifest, "manifest should reference tool")
     assert_true('"min_version":"0.2.0"' in manifest.replace(" ", ""), "manifest should require tool 0.2.0")
-    assert_true('"llm":["complete"]' in manifest.replace(" ", ""), "manifest should authorize llm.complete")
+    assert_true('"llm":["complete","embed"]' in manifest.replace(" ", ""), "manifest should authorize llm.complete and llm.embed")
     assert_true('method:"research"' not in bundle_js and 'method: "research"' not in bundle_js, "bundle should not call legacy research method")
     assert_true('"action":"advance"' not in bundle_js and 'action:"advance"' not in bundle_js, "bundle should not contain legacy advance action")
     assert_true("app_search_web" not in bundle_js, "bundle should not reference legacy app_search_web")

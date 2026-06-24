@@ -16,6 +16,8 @@ import {
   type ToolSettings,
 } from "../types";
 
+const LONG_TOOL_TIMEOUT_MS = 300_000;
+
 interface SettingsResponse {
   settings?: ToolSettings;
 }
@@ -295,7 +297,10 @@ export class AnnaResearchApi implements ResearchApi {
   }
 
   private async call(method: string, args: Record<string, unknown>): Promise<unknown> {
-    const response = await this.anna.tools.invoke({ tool_id: TOOL_ID, method, args });
+    const timeoutMs = toolTimeoutMs(method, args);
+    const request = timeoutMs === undefined ? { tool_id: TOOL_ID, method, args } : { tool_id: TOOL_ID, method, args, timeoutMs };
+    const response =
+      timeoutMs === undefined ? await this.anna.tools.invoke(request) : await this.anna.tools.invoke(request, { timeoutMs });
     const maybe = response as { success?: boolean; data?: unknown; error?: string };
     if (maybe && maybe.success === false) {
       const error = new Error(maybe.error || "Research tool invocation failed.") as Error & { details?: unknown };
@@ -304,6 +309,16 @@ export class AnnaResearchApi implements ResearchApi {
     }
     return maybe && "data" in maybe ? maybe.data : response;
   }
+}
+
+function toolTimeoutMs(method: string, args: Record<string, unknown>): number | undefined {
+  if (method === "app_call_research_source" || method === "app_call_section_research_source") {
+    return args.source_id === "duckduckgo" ? LONG_TOOL_TIMEOUT_MS : undefined;
+  }
+  if (method === "app_test_research_source") {
+    return args.id === "duckduckgo" ? LONG_TOOL_TIMEOUT_MS : undefined;
+  }
+  return undefined;
 }
 
 async function fetchTransfer<T>(transfer: ResultTransferDescriptor, input?: unknown): Promise<T> {

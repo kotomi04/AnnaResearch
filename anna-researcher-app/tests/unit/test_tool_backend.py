@@ -299,6 +299,9 @@ def test_native_research_source_executor_extracts_by_default():
     definition["native"]["max_urls"] = 2
     definition["native"]["max_chars_per_page"] = 9000
     definition["native"]["max_pdf_pages"] = 4
+    definition["native"]["embedding_top_k"] = 2
+    definition["native"]["embedding_chunk_chars"] = 900
+    definition["native"]["embedding_min_page_score"] = 0.4
 
     result = executor.call(definition, "anna")
 
@@ -308,7 +311,17 @@ def test_native_research_source_executor_extracts_by_default():
     assert extractor_calls == [
         (
             [{"query": "anna", "url": "https://example.com/a", "title": "Alpha", "content": "alpha snippet"}],
-            {"max_urls": 2, "timeout": 20.0, "max_chars_per_page": 9000, "max_pdf_pages": 4},
+            {
+                "query": "anna",
+                "max_urls": 2,
+                "timeout": 20.0,
+                "max_chars_per_page": 9000,
+                "max_pdf_pages": 4,
+                "embedding_provider": None,
+                "embedding_top_k": 2,
+                "embedding_chunk_chars": 900,
+                "embedding_min_page_score": 0.4,
+            },
         )
     ]
 
@@ -354,6 +367,74 @@ def test_native_research_source_executor_reports_bad_definition():
     assert result.error == "bad_definition"
     assert result.items == []
     assert test.error and test.error["code"] == "bad_definition"
+
+
+def test_extraction_enrichment_uses_embedding_top_chunks(monkeypatch):
+    monkeypatch.setattr(
+        extraction_fetcher,
+        "fetch_many",
+        lambda items, **kwargs: [
+            ExtractedPage(
+                url="https://example.com/a",
+                title="Example",
+                status="success",
+                content_type="html",
+                raw_content="Unrelated recipe paragraph.\n\nRelevant Starbucks pricing paragraph.",
+            )
+        ],
+    )
+
+    def embed(texts):
+        return [[1.0, 0.0] if ("Starbucks" in text or "pricing" in text) else [0.0, 1.0] for text in texts]
+
+    [item] = extraction_fetcher.enrich_items_with_extracted_content(
+        [{"query": "Starbucks pricing", "url": "https://example.com/a", "title": "A", "content": "snippet"}],
+        query="Starbucks pricing",
+        embedding_provider=embed,
+        embedding_top_k=1,
+        embedding_chunk_chars=500,
+        embedding_min_page_score=0.35,
+    )
+
+    assert item["embedding_filter_status"] == "success"
+    assert item["embedding_page_score"] == pytest.approx(1.0)
+    assert "Relevant excerpts:" in item["content"]
+    assert "Relevant Starbucks pricing paragraph." in item["content"]
+    assert "Unrelated recipe paragraph." not in item["content"]
+    assert item["raw_content"].startswith("Unrelated")
+
+
+def test_extraction_enrichment_marks_low_embedding_page_irrelevant(monkeypatch):
+    monkeypatch.setattr(
+        extraction_fetcher,
+        "fetch_many",
+        lambda items, **kwargs: [
+            ExtractedPage(
+                url="https://example.com/a",
+                title="Example",
+                status="success",
+                content_type="html",
+                raw_content="Unrelated recipe paragraph.",
+            )
+        ],
+    )
+
+    def embed(texts):
+        return [[1.0, 0.0] if index == 0 else [0.0, 1.0] for index, _ in enumerate(texts)]
+
+    [item] = extraction_fetcher.enrich_items_with_extracted_content(
+        [{"query": "Starbucks pricing", "url": "https://example.com/a", "title": "A", "content": "snippet"}],
+        query="Starbucks pricing",
+        embedding_provider=embed,
+        embedding_top_k=1,
+        embedding_chunk_chars=500,
+        embedding_min_page_score=0.35,
+    )
+
+    assert item["embedding_filter_status"] == "irrelevant"
+    assert item["embedding_page_score"] == pytest.approx(0.0)
+    assert item["content"] == "snippet"
+    assert item["raw_content"] == "Unrelated recipe paragraph."
 
 
 def test_pdf_extraction_reads_local_pdf(tmp_path):
@@ -497,7 +578,7 @@ def test_extraction_fetcher_enriches_search_items(monkeypatch):
 
     assert enriched[0]["title"] == "Fetched title"
     assert enriched[0]["raw_content"] == "Full page text"
-    assert enriched[0]["content"] == "Snippet\n\nFull content:\nFull page text"
+    assert enriched[0]["content"] == "Snippet\n\nRelevant excerpts:\nFull page text"
     assert enriched[0]["extraction_status"] == "success"
     assert enriched[1] == {"url": "https://example.com/b", "content": "Untouched"}
 

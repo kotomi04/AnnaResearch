@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from ...embedding import select_page_chunks_by_embedding
 from .arxiv import extract_arxiv
 from .html import extract_html
 from .models import ExtractedPage
@@ -53,10 +54,15 @@ def fetch_many(
 def enrich_items_with_extracted_content(
     items: Iterable[dict[str, Any]],
     *,
+    query: str = "",
     max_urls: int = 5,
     timeout: float = 20.0,
     max_chars_per_page: int = 12000,
     max_pdf_pages: int | None = None,
+    embedding_provider: Any = None,
+    embedding_top_k: int = 3,
+    embedding_chunk_chars: int = 1200,
+    embedding_min_page_score: float = 0.35,
 ) -> list[dict[str, Any]]:
     """Return search items with successful extraction content appended."""
     original = [dict(item) for item in items]
@@ -83,7 +89,36 @@ def enrich_items_with_extracted_content(
                 next_item["title"] = page.title
             if page.status == "success" and page.raw_content:
                 next_item["raw_content"] = page.raw_content
-                next_item["content"] = _join_snippet_and_content(str(next_item.get("content") or ""), page.raw_content)
+                content_to_join = page.raw_content
+                if page.content_type == "html" and embedding_provider is not None and query:
+                    try:
+                        selection = select_page_chunks_by_embedding(
+                            query=query,
+                            text=page.raw_content,
+                            embed=embedding_provider,
+                            top_k=embedding_top_k,
+                            chunk_chars=embedding_chunk_chars,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        next_item["embedding_filter_status"] = "failed"
+                        next_item["embedding_filter_error"] = f"{type(exc).__name__}: {exc}"
+                    else:
+                        next_item["embedding_page_score"] = selection.page_score
+                        next_item["embedding_selected_chunks"] = [
+                            {"index": chunk.index, "score": chunk.score, "text": chunk.text}
+                            for chunk in selection.chunks
+                        ]
+                        if selection.page_score < float(embedding_min_page_score):
+                            next_item["embedding_filter_status"] = "irrelevant"
+                            next_item["embedding_min_page_score"] = float(embedding_min_page_score)
+                            content_to_join = ""
+                        elif selection.chunks:
+                            next_item["embedding_filter_status"] = "success"
+                            content_to_join = "\n\n".join(chunk.text for chunk in selection.chunks)
+                        else:
+                            next_item["embedding_filter_status"] = "empty"
+                            content_to_join = ""
+                next_item["content"] = _join_snippet_and_content(str(next_item.get("content") or ""), content_to_join)
         enriched.append(next_item)
     return enriched
 
@@ -108,8 +143,10 @@ def _distinct_urls(items: Iterable[str | dict[str, Any]], *, max_urls: int) -> l
 def _join_snippet_and_content(snippet: str, raw_content: str) -> str:
     clean_snippet = snippet.strip()
     clean_content = raw_content.strip()
+    if not clean_content:
+        return clean_snippet
     if not clean_snippet:
         return clean_content
     if clean_snippet in clean_content:
         return clean_content
-    return f"{clean_snippet}\n\nFull content:\n{clean_content}"
+    return f"{clean_snippet}\n\nRelevant excerpts:\n{clean_content}"
