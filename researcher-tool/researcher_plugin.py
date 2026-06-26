@@ -13,7 +13,7 @@ from researcher_tool.embedding import AnnaEmbeddingsClient, EmbeddingsError, emb
 from researcher_tool.errors import ResearcherToolError, ValidationError
 from researcher_tool.sources.native.executor import NativeResearchSourceExecutor
 
-TOOL_ID = "tool-xhz-researcher-python-9ksd5wzq"
+TOOL_ID = "tool-xhz-researcher-python-e7k8xa3s"
 VERSION = "0.2.0"
 APP_METHODS = [
     "app_get_settings",

@@ -1,7 +1,7 @@
 {
   "slug": "researcher-python",
   "name": "Researcher Python Executa",
-  "tool_id": "tool-xhz-researcher-python-9ksd5wzq",
+  "tool_id": "tool-xhz-researcher-python-e7k8xa3s",
   "type": "python",
   "enabled": true,
   "host_capabilities": ["llm.embed"],
@@ -14,6 +14,6 @@
       }
     }
   },
-  "command": ["env", "UV_CACHE_DIR=/tmp/anna-researcher-uv-cache", "uv", "run", "--project", "../../../researcher-tool", "tool-xhz-researcher-python-9ksd5wzq"],
+  "command": ["env", "UV_CACHE_DIR=/tmp/anna-researcher-uv-cache", "uv", "run", "--project", "../../../researcher-tool", "tool-xhz-researcher-python-e7k8xa3s"],
   "_comment": "Minimal App Executa Reference. Source lives in ../../../researcher-tool."
 }

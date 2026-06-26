@@ -1,4 +1,4 @@
-export const TOOL_ID = "tool-test-researcher-12345678";
+export const TOOL_ID = "tool-xhz-researcher-python-e7k8xa3s";
 
 export type ResearchStatus = "created" | "running" | "completed" | "failed" | "cancelled" | string;
 
