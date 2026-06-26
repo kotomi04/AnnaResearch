@@ -355,7 +355,7 @@ describe("AnnaResearchApi", () => {
     }
   });
 
-  it("adds an extended invoke timeout only for DuckDuckGo embedding source calls", async () => {
+  it("adds an extended invoke timeout only for DuckDuckGo source calls", async () => {
     const calls: unknown[] = [];
     const anna: AnnaRuntimeApi = {
       tools: {

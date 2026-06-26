@@ -62,10 +62,6 @@ MANIFEST: dict[str, Any] = {
 }
 
 _stdout_lock = threading.Lock()
-_embedding_cache_lock = threading.Lock()
-_embedding_cache: dict[str, list[float]] = {}
-_embedding_cache_order: list[str] = []
-_EMBEDDING_CACHE_LIMIT = 256
 embeddings: AnnaEmbeddingsClient
 
 
@@ -79,43 +75,7 @@ def write_frame(msg: dict[str, Any]) -> None:
 embeddings = AnnaEmbeddingsClient(write_frame=write_frame)
 
 
-def _embed_vectors(texts: list[str]) -> list[list[float]]:
-    vectors: list[list[float]] = []
-    for text in texts:
-        clean = str(text or "").strip()
-        if not clean:
-            continue
-        vectors.append(_embed_one_vector(clean))
-    return vectors
-
-
-def _embed_one_vector(text: str) -> list[float]:
-    with _embedding_cache_lock:
-        cached = _embedding_cache.get(text)
-        if cached is not None:
-            return list(cached)
-
-    result = embeddings.create(texts=[text], model="anna-managed-v1", timeout=30.0)
-    data = result.get("data") or []
-    for item in data:
-        if isinstance(item, dict) and isinstance(item.get("embedding"), list):
-            vector = [float(value) for value in item.get("embedding")]
-            _remember_embedding(text, vector)
-            return vector
-    raise EmbeddingsError(-32506, "embeddings/create returned no embedding vector")
-
-
-def _remember_embedding(text: str, vector: list[float]) -> None:
-    with _embedding_cache_lock:
-        if text not in _embedding_cache:
-            _embedding_cache_order.append(text)
-        _embedding_cache[text] = list(vector)
-        while len(_embedding_cache_order) > _EMBEDDING_CACHE_LIMIT:
-            oldest = _embedding_cache_order.pop(0)
-            _embedding_cache.pop(oldest, None)
-
-
-dispatcher = AppDispatcher(native_executor=NativeResearchSourceExecutor(embedding_provider=_embed_vectors))
+dispatcher = AppDispatcher(native_executor=NativeResearchSourceExecutor())
 
 
 def make_response(req_id: Any, *, result: Any = None, error: dict[str, Any] | None = None) -> dict[str, Any]:

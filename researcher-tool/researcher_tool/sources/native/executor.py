@@ -8,7 +8,6 @@ from .duckduckgo import DuckDuckGoSearchError, search_duckduckgo
 
 NativeSearchFn = Callable[[str], list[dict[str, Any]]]
 NativeExtractorFn = Callable[..., list[dict[str, Any]]]
-EmbeddingProviderFn = Callable[[list[str]], list[list[float]]]
 
 
 class NativeResearchSourceExecutor:
@@ -20,12 +19,10 @@ class NativeResearchSourceExecutor:
         clock: Callable[[], float] | None = None,
         adapters: dict[str, NativeSearchFn] | None = None,
         extractor: NativeExtractorFn | None = None,
-        embedding_provider: EmbeddingProviderFn | None = None,
     ):
         self._clock = clock or time.monotonic
         self._adapters = adapters or {}
         self._extractor = extractor
-        self.embedding_provider = embedding_provider
 
     def call(self, definition: dict[str, Any], query: str) -> SourceCallResult:
         source_id = str(definition.get("id") or "")
@@ -110,10 +107,9 @@ class NativeResearchSourceExecutor:
                 timeout=float(native.get("extract_timeout") or 20.0),
                 max_chars_per_page=_clamp_int(native.get("max_chars_per_page"), default=8000, minimum=1000, maximum=50000),
                 max_pdf_pages=_optional_clamp_int(native.get("max_pdf_pages"), minimum=1, maximum=100),
-                embedding_provider=self.embedding_provider,
-                embedding_top_k=_clamp_int(native.get("embedding_top_k"), default=3, minimum=1, maximum=10),
-                embedding_chunk_chars=_clamp_int(native.get("embedding_chunk_chars"), default=1200, minimum=300, maximum=4000),
-                embedding_min_page_score=_clamp_float(native.get("embedding_min_page_score"), default=0.35, minimum=0.0, maximum=1.0),
+                browser_fallback=bool(native.get("browser_fallback", False)),
+                browser_fallback_min_chars=_clamp_int(native.get("browser_fallback_min_chars"), default=300, minimum=1, maximum=5000),
+                browser_timeout=float(native.get("browser_timeout") or 30.0),
             )
         except Exception as exc:  # noqa: BLE001
             raise NativeSourceError("upstream_5xx", f"native extraction failed: {exc}") from exc
@@ -145,14 +141,6 @@ def _optional_clamp_int(value: Any, *, minimum: int, maximum: int) -> int | None
     if value in (None, ""):
         return None
     return _clamp_int(value, default=minimum, minimum=minimum, maximum=maximum)
-
-
-def _clamp_float(value: Any, *, default: float, minimum: float, maximum: float) -> float:
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        numeric = default
-    return max(minimum, min(maximum, numeric))
 
 
 def _default_extractor(items: list[dict[str, Any]], **kwargs: Any) -> list[dict[str, Any]]:

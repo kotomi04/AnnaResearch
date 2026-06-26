@@ -3,8 +3,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
-from ...embedding import select_page_chunks_by_embedding
 from .arxiv import extract_arxiv
+from .browser_fallback import extract_with_browser_fallback
 from .html import extract_html
 from .models import ExtractedPage
 from .pdf import extract_pdf
@@ -17,6 +17,10 @@ def fetch_url(
     timeout: float = 20.0,
     max_chars_per_page: int = 12000,
     max_pdf_pages: int | None = None,
+    query: str = "",
+    browser_fallback: bool = False,
+    browser_fallback_min_chars: int = 300,
+    browser_timeout: float = 30.0,
 ) -> ExtractedPage:
     """Route a URL to the appropriate extraction backend."""
     clean_url = str(url or "").strip()
@@ -27,7 +31,14 @@ def fetch_url(
         return extract_pdf(clean_url, timeout=timeout, max_pages=max_pdf_pages, max_chars_per_page=max_chars_per_page)
     if "arxiv.org" in lower:
         return extract_arxiv(clean_url)
-    return extract_html(clean_url, timeout=timeout, max_chars_per_page=max_chars_per_page)
+    page = extract_html(clean_url, timeout=timeout, max_chars_per_page=max_chars_per_page, query=query)
+    if browser_fallback and _should_use_browser_fallback(page, min_chars=browser_fallback_min_chars):
+        browser_page = extract_with_browser_fallback(clean_url, query=query, timeout=browser_timeout, max_chars_per_page=max_chars_per_page)
+        if browser_page.status == "success":
+            return browser_page
+        if page.status != "success":
+            return browser_page
+    return page
 
 
 def fetch_many(
@@ -37,6 +48,10 @@ def fetch_many(
     timeout: float = 20.0,
     max_chars_per_page: int = 12000,
     max_pdf_pages: int | None = None,
+    query: str = "",
+    browser_fallback: bool = False,
+    browser_fallback_min_chars: int = 300,
+    browser_timeout: float = 30.0,
 ) -> list[ExtractedPage]:
     """Extract content from distinct URLs in order."""
     urls = _distinct_urls(items, max_urls=max_urls)
@@ -46,6 +61,10 @@ def fetch_many(
             timeout=timeout,
             max_chars_per_page=max_chars_per_page,
             max_pdf_pages=max_pdf_pages,
+            query=query,
+            browser_fallback=browser_fallback,
+            browser_fallback_min_chars=browser_fallback_min_chars,
+            browser_timeout=browser_timeout,
         )
         for url in urls
     ]
@@ -59,10 +78,9 @@ def enrich_items_with_extracted_content(
     timeout: float = 20.0,
     max_chars_per_page: int = 12000,
     max_pdf_pages: int | None = None,
-    embedding_provider: Any = None,
-    embedding_top_k: int = 3,
-    embedding_chunk_chars: int = 1200,
-    embedding_min_page_score: float = 0.35,
+    browser_fallback: bool = False,
+    browser_fallback_min_chars: int = 300,
+    browser_timeout: float = 30.0,
 ) -> list[dict[str, Any]]:
     """Return search items with successful extraction content appended."""
     original = [dict(item) for item in items]
@@ -74,6 +92,10 @@ def enrich_items_with_extracted_content(
             timeout=timeout,
             max_chars_per_page=max_chars_per_page,
             max_pdf_pages=max_pdf_pages,
+            query=query,
+            browser_fallback=browser_fallback,
+            browser_fallback_min_chars=browser_fallback_min_chars,
+            browser_timeout=browser_timeout,
         )
     }
     enriched: list[dict[str, Any]] = []
@@ -89,36 +111,7 @@ def enrich_items_with_extracted_content(
                 next_item["title"] = page.title
             if page.status == "success" and page.raw_content:
                 next_item["raw_content"] = page.raw_content
-                content_to_join = page.raw_content
-                if page.content_type == "html" and embedding_provider is not None and query:
-                    try:
-                        selection = select_page_chunks_by_embedding(
-                            query=query,
-                            text=page.raw_content,
-                            embed=embedding_provider,
-                            top_k=embedding_top_k,
-                            chunk_chars=embedding_chunk_chars,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        next_item["embedding_filter_status"] = "failed"
-                        next_item["embedding_filter_error"] = f"{type(exc).__name__}: {exc}"
-                    else:
-                        next_item["embedding_page_score"] = selection.page_score
-                        next_item["embedding_selected_chunks"] = [
-                            {"index": chunk.index, "score": chunk.score, "text": chunk.text}
-                            for chunk in selection.chunks
-                        ]
-                        if selection.page_score < float(embedding_min_page_score):
-                            next_item["embedding_filter_status"] = "irrelevant"
-                            next_item["embedding_min_page_score"] = float(embedding_min_page_score)
-                            content_to_join = ""
-                        elif selection.chunks:
-                            next_item["embedding_filter_status"] = "success"
-                            content_to_join = "\n\n".join(chunk.text for chunk in selection.chunks)
-                        else:
-                            next_item["embedding_filter_status"] = "empty"
-                            content_to_join = ""
-                next_item["content"] = _join_snippet_and_content(str(next_item.get("content") or ""), content_to_join)
+                next_item["content"] = _join_snippet_and_content(str(next_item.get("content") or ""), page.raw_content)
         enriched.append(next_item)
     return enriched
 
@@ -150,3 +143,14 @@ def _join_snippet_and_content(snippet: str, raw_content: str) -> str:
     if clean_snippet in clean_content:
         return clean_content
     return f"{clean_snippet}\n\nRelevant excerpts:\n{clean_content}"
+
+
+def _should_use_browser_fallback(page: ExtractedPage, *, min_chars: int) -> bool:
+    content = (page.raw_content or "").strip()
+    if page.status != "success":
+        return True
+    if len(content) < max(1, int(min_chars or 1)):
+        return True
+    if page.title and content == page.title.strip():
+        return True
+    return False

@@ -299,9 +299,9 @@ def test_native_research_source_executor_extracts_by_default():
     definition["native"]["max_urls"] = 2
     definition["native"]["max_chars_per_page"] = 9000
     definition["native"]["max_pdf_pages"] = 4
-    definition["native"]["embedding_top_k"] = 2
-    definition["native"]["embedding_chunk_chars"] = 900
-    definition["native"]["embedding_min_page_score"] = 0.4
+    definition["native"]["browser_fallback"] = True
+    definition["native"]["browser_fallback_min_chars"] = 250
+    definition["native"]["browser_timeout"] = 12
 
     result = executor.call(definition, "anna")
 
@@ -317,10 +317,9 @@ def test_native_research_source_executor_extracts_by_default():
                 "timeout": 20.0,
                 "max_chars_per_page": 9000,
                 "max_pdf_pages": 4,
-                "embedding_provider": None,
-                "embedding_top_k": 2,
-                "embedding_chunk_chars": 900,
-                "embedding_min_page_score": 0.4,
+                "browser_fallback": True,
+                "browser_fallback_min_chars": 250,
+                "browser_timeout": 12.0,
             },
         )
     ]
@@ -367,74 +366,6 @@ def test_native_research_source_executor_reports_bad_definition():
     assert result.error == "bad_definition"
     assert result.items == []
     assert test.error and test.error["code"] == "bad_definition"
-
-
-def test_extraction_enrichment_uses_embedding_top_chunks(monkeypatch):
-    monkeypatch.setattr(
-        extraction_fetcher,
-        "fetch_many",
-        lambda items, **kwargs: [
-            ExtractedPage(
-                url="https://example.com/a",
-                title="Example",
-                status="success",
-                content_type="html",
-                raw_content="Unrelated recipe paragraph.\n\nRelevant Starbucks pricing paragraph.",
-            )
-        ],
-    )
-
-    def embed(texts):
-        return [[1.0, 0.0] if ("Starbucks" in text or "pricing" in text) else [0.0, 1.0] for text in texts]
-
-    [item] = extraction_fetcher.enrich_items_with_extracted_content(
-        [{"query": "Starbucks pricing", "url": "https://example.com/a", "title": "A", "content": "snippet"}],
-        query="Starbucks pricing",
-        embedding_provider=embed,
-        embedding_top_k=1,
-        embedding_chunk_chars=500,
-        embedding_min_page_score=0.35,
-    )
-
-    assert item["embedding_filter_status"] == "success"
-    assert item["embedding_page_score"] == pytest.approx(1.0)
-    assert "Relevant excerpts:" in item["content"]
-    assert "Relevant Starbucks pricing paragraph." in item["content"]
-    assert "Unrelated recipe paragraph." not in item["content"]
-    assert item["raw_content"].startswith("Unrelated")
-
-
-def test_extraction_enrichment_marks_low_embedding_page_irrelevant(monkeypatch):
-    monkeypatch.setattr(
-        extraction_fetcher,
-        "fetch_many",
-        lambda items, **kwargs: [
-            ExtractedPage(
-                url="https://example.com/a",
-                title="Example",
-                status="success",
-                content_type="html",
-                raw_content="Unrelated recipe paragraph.",
-            )
-        ],
-    )
-
-    def embed(texts):
-        return [[1.0, 0.0] if index == 0 else [0.0, 1.0] for index, _ in enumerate(texts)]
-
-    [item] = extraction_fetcher.enrich_items_with_extracted_content(
-        [{"query": "Starbucks pricing", "url": "https://example.com/a", "title": "A", "content": "snippet"}],
-        query="Starbucks pricing",
-        embedding_provider=embed,
-        embedding_top_k=1,
-        embedding_chunk_chars=500,
-        embedding_min_page_score=0.35,
-    )
-
-    assert item["embedding_filter_status"] == "irrelevant"
-    assert item["embedding_page_score"] == pytest.approx(0.0)
-    assert item["content"] == "snippet"
-    assert item["raw_content"] == "Unrelated recipe paragraph."
 
 
 def test_pdf_extraction_reads_local_pdf(tmp_path):
@@ -495,6 +426,8 @@ def test_html_extraction_reads_local_html_and_removes_noise(tmp_path):
             <article>
               <h1>Research Findings</h1>
               <p>Anna extracts the useful article body.</p>
+              <p>Read the <a href="https://example.com/source">source page</a> for details.</p>
+              <ul><li>First finding</li><li>Second finding</li></ul>
             </article>
             <footer>Footer should disappear</footer>
           </body>
@@ -508,10 +441,84 @@ def test_html_extraction_reads_local_html_and_removes_noise(tmp_path):
     assert result.status == "success"
     assert result.content_type == "html"
     assert result.title == "Anna Page"
-    assert "Research Findings" in result.raw_content
+    assert "# Research Findings" in result.raw_content
     assert "Anna extracts the useful article body." in result.raw_content
+    assert "source page⟨1⟩" in result.raw_content
+    assert "## References" in result.raw_content
+    assert "⟨1⟩ https://example.com/source: source page" in result.raw_content
+    assert "- First finding" in result.raw_content
     assert "Navigation should disappear" not in result.raw_content
     assert "Footer should disappear" not in result.raw_content
+
+
+def test_html_extraction_prunes_and_filters_markdown_by_query(tmp_path):
+    html_path = tmp_path / "filtered.html"
+    html_path.write_text(
+        """
+        <html>
+          <head><title>Market Page</title></head>
+          <body>
+            <main>
+              <section>
+                <h2>Anthropic financing</h2>
+                <p>Anthropic raised new funding from strategic cloud partners and expanded its enterprise market position.</p>
+                <p>Claude adoption in enterprise accounts supports the company's market positioning.</p>
+              </section>
+              <section>
+                <h2>Recipe notes</h2>
+                <p>Banana bread tastes better with cinnamon and walnuts.</p>
+              </section>
+              <p><a href="/a">Home</a> <a href="/b">Login</a> <a href="/c">Register</a> <a href="/d">Share</a></p>
+            </main>
+          </body>
+        </html>
+        """,
+        encoding="utf-8",
+    )
+
+    result = extract_html(
+        str(html_path),
+        max_chars_per_page=4000,
+        query="Anthropic financing enterprise market positioning",
+    )
+
+    assert result.status == "success"
+    assert "# Anthropic financing" in result.raw_content
+    assert "strategic cloud partners" in result.raw_content
+    assert "enterprise accounts" in result.raw_content
+    assert "Banana bread" not in result.raw_content
+    assert "Home" not in result.raw_content
+
+
+def test_fetch_url_uses_browser_fallback_for_short_static_content(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        extraction_fetcher,
+        "extract_html",
+        lambda url, **kwargs: calls.append(("static", url, kwargs)) or ExtractedPage(url=url, title="Short", raw_content="Short", content_type="html"),
+    )
+    monkeypatch.setattr(
+        extraction_fetcher,
+        "extract_with_browser_fallback",
+        lambda url, **kwargs: calls.append(("browser", url, kwargs))
+        or ExtractedPage(url=url, title="Browser", raw_content="# Browser markdown", content_type="html"),
+    )
+
+    page = extraction_fetcher.fetch_url(
+        "https://example.com/dynamic",
+        query="dynamic page",
+        browser_fallback=True,
+        browser_fallback_min_chars=20,
+        browser_timeout=9,
+    )
+
+    assert page.title == "Browser"
+    assert page.raw_content == "# Browser markdown"
+    assert calls == [
+        ("static", "https://example.com/dynamic", {"timeout": 20.0, "max_chars_per_page": 12000, "query": "dynamic page"}),
+        ("browser", "https://example.com/dynamic", {"query": "dynamic page", "timeout": 9, "max_chars_per_page": 12000}),
+    ]
 
 
 def test_extraction_fetcher_routes_by_url_type(monkeypatch):
