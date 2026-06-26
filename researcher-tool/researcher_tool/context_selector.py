@@ -33,10 +33,11 @@ class LexicalContextSelector:
     Each emitted context item is prefixed with ``[来源: <name>]`` so the report
     writer can optionally attribute fragments to a specific source."""
 
-    def __init__(self, *, max_sources: int = 10, max_per_domain: int = 3, context_budget: int = 24000):
+    def __init__(self, *, max_sources: int = 10, max_per_domain: int = 3, context_budget: int = 24000, min_content_length: int = 300):
         self.max_sources = max_sources
         self.max_per_domain = max_per_domain
         self.context_budget = context_budget
+        self.min_content_length = min_content_length
 
     def select(
         self,
@@ -63,7 +64,11 @@ class LexicalContextSelector:
             if key in seen_keys:
                 continue
             seen_keys.add(key)
+            if str(result.get("extraction_status") or "").strip().lower() == "failed":
+                continue
             content = str(result.get("content") or result.get("body") or result.get("raw_content") or "")
+            if len(content.strip()) < self.min_content_length:
+                continue
             title_terms = tokenize(title)
             content_terms = tokenize(content)
             title_hits = len(query_terms & title_terms)
@@ -81,6 +86,9 @@ class LexicalContextSelector:
                     "source_id": source_id,
                     "source_name": source_name,
                     "score": round(score, 4),
+                    "extraction_status": result.get("extraction_status"),
+                    "extraction_error": result.get("extraction_error"),
+                    "content_type": result.get("content_type"),
                 },
             ))
 

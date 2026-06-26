@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 
 from .models import ExtractedPage
 from .utils import truncate_text
@@ -40,7 +41,75 @@ def extract_with_browser_fallback(
     return ExtractedPage(url=clean_url, title=title, raw_content=content, content_type="html")
 
 
+def extract_many_with_browser_fallback(
+    urls: Iterable[str],
+    *,
+    query: str = "",
+    timeout: float = 30.0,
+    max_chars_per_page: int = 12000,
+) -> list[ExtractedPage]:
+    """Extract multiple dynamic pages while reusing one crawl4ai browser session."""
+    clean_urls = [str(url or "").strip() for url in urls]
+    if not clean_urls:
+        return []
+    try:
+        results = asyncio.run(
+            _extract_many_with_crawl4ai(
+                clean_urls,
+                query=query,
+                timeout=timeout,
+            )
+        )
+    except BrowserFallbackError as exc:
+        return [
+            ExtractedPage(url=url, content_type="html", status="failed", error=str(exc)) if url else ExtractedPage(url="", content_type="html", status="failed", error="empty_url")
+            for url in clean_urls
+        ]
+    except Exception as exc:  # noqa: BLE001
+        return [
+            ExtractedPage(url=url, content_type="html", status="failed", error=f"browser_fallback_failed: {type(exc).__name__}: {exc}") if url else ExtractedPage(url="", content_type="html", status="failed", error="empty_url")
+            for url in clean_urls
+        ]
+
+    pages: list[ExtractedPage] = []
+    for url, result in zip(clean_urls, results):
+        if isinstance(result, ExtractedPage):
+            page = result
+        else:
+            title, markdown = result
+            content = truncate_text(markdown.strip(), max_chars_per_page)
+            if content:
+                page = ExtractedPage(url=url, title=title, raw_content=content, content_type="html")
+            else:
+                page = ExtractedPage(url=url, title=title, content_type="html", status="failed", error="empty_content")
+        pages.append(page)
+    return pages
+
+
 async def _extract_with_crawl4ai(url: str, *, query: str, timeout: float) -> tuple[str, str]:
+    crawler_cls, config = _crawl4ai_runtime(query=query, timeout=timeout)
+    async with crawler_cls() as crawler:
+        return await _crawl_one(crawler, url, config=config)
+
+
+async def _extract_many_with_crawl4ai(urls: list[str], *, query: str, timeout: float) -> list[tuple[str, str] | ExtractedPage]:
+    crawler_cls, config = _crawl4ai_runtime(query=query, timeout=timeout)
+    results: list[tuple[str, str] | ExtractedPage] = []
+    async with crawler_cls() as crawler:
+        for url in urls:
+            if not url:
+                results.append(ExtractedPage(url="", content_type="html", status="failed", error="empty_url"))
+                continue
+            try:
+                results.append(await _crawl_one(crawler, url, config=config))
+            except BrowserFallbackError as exc:
+                results.append(ExtractedPage(url=url, content_type="html", status="failed", error=str(exc)))
+            except Exception as exc:  # noqa: BLE001
+                results.append(ExtractedPage(url=url, content_type="html", status="failed", error=f"browser_fallback_failed: {type(exc).__name__}: {exc}"))
+    return results
+
+
+def _crawl4ai_runtime(*, query: str, timeout: float):
     try:
         from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
     except ImportError as exc:
@@ -65,10 +134,11 @@ async def _extract_with_crawl4ai(url: str, *, query: str, timeout: float) -> tup
             config.markdown_generator = DefaultMarkdownGenerator(content_filter=BM25ContentFilter(user_query=query))
         except Exception:
             pass
+    return AsyncWebCrawler, config
 
-    async with AsyncWebCrawler() as crawler:
-        result = await crawler.arun(url=url, config=config)
 
+async def _crawl_one(crawler: object, url: str, *, config: object) -> tuple[str, str]:
+    result = await crawler.arun(url=url, config=config)
     success = bool(getattr(result, "success", True))
     if not success:
         error = getattr(result, "error_message", "") or "crawl4ai returned failure"

@@ -24,7 +24,9 @@ env/
 # Python build outputs
 build/
 dist/
+dist-anna/
 *.egg-info/
+*.spec
 
 # Node / frontend dependencies and logs
 node_modules/

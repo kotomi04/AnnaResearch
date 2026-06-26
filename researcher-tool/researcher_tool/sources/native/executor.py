@@ -24,14 +24,14 @@ class NativeResearchSourceExecutor:
         self._adapters = adapters or {}
         self._extractor = extractor
 
-    def call(self, definition: dict[str, Any], query: str) -> SourceCallResult:
+    def call(self, definition: dict[str, Any], query: str, *, extraction_cache: dict[str, Any] | None = None) -> SourceCallResult:
         source_id = str(definition.get("id") or "")
         source_name = str(definition.get("name") or source_id)
         clean_query = str(query or "").strip()
         started = self._clock()
 
         try:
-            items = self._search(definition, clean_query)
+            items = self._search(definition, clean_query, extraction_cache=extraction_cache)
             error = None if items else "empty_result"
         except NativeSourceError as exc:
             items = []
@@ -70,7 +70,7 @@ class NativeResearchSourceExecutor:
             error=error,
         )
 
-    def _search(self, definition: dict[str, Any], query: str) -> list[dict[str, Any]]:
+    def _search(self, definition: dict[str, Any], query: str, *, extraction_cache: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         if not query:
             return []
         native = definition.get("native") or {}
@@ -81,7 +81,7 @@ class NativeResearchSourceExecutor:
             raise NativeSourceError("bad_definition", "native source adapter is required")
 
         if adapter in self._adapters:
-            return self._maybe_extract(definition, self._adapters[adapter](query))
+            return self._maybe_extract(definition, self._adapters[adapter](query), extraction_cache=extraction_cache)
         if adapter == "ddgs":
             try:
                 items = search_duckduckgo(
@@ -89,12 +89,12 @@ class NativeResearchSourceExecutor:
                     max_results=int(native.get("max_results") or 5),
                     region=str(native.get("region") or "wt-wt"),
                 )
-                return self._maybe_extract(definition, items)
+                return self._maybe_extract(definition, items, extraction_cache=extraction_cache)
             except DuckDuckGoSearchError as exc:
                 raise NativeSourceError("upstream_5xx", str(exc)) from exc
         raise NativeSourceError("bad_definition", f"unknown native source adapter: {adapter}")
 
-    def _maybe_extract(self, definition: dict[str, Any], items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _maybe_extract(self, definition: dict[str, Any], items: list[dict[str, Any]], *, extraction_cache: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         native = definition.get("native") or {}
         if not isinstance(native, dict) or not items:
             return items
@@ -110,6 +110,7 @@ class NativeResearchSourceExecutor:
                 browser_fallback=bool(native.get("browser_fallback", False)),
                 browser_fallback_min_chars=_clamp_int(native.get("browser_fallback_min_chars"), default=300, minimum=1, maximum=5000),
                 browser_timeout=float(native.get("browser_timeout") or 30.0),
+                page_cache=extraction_cache,
             )
         except Exception as exc:  # noqa: BLE001
             raise NativeSourceError("upstream_5xx", f"native extraction failed: {exc}") from exc

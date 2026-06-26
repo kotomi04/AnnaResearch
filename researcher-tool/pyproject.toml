@@ -1,5 +1,5 @@
 [project]
-name = "tool-test-researcher-12345678"
+name = "tool-xhz-researcher-python-9ksd5wzq"
 version = "0.2.0"
 description = "Anna Researcher standalone Executa tool backend"
 requires-python = ">=3.10"
@@ -10,10 +10,11 @@ dependencies = [
     "ddgs>=9.0.0",
     "lxml>=4.9.2",
     "pymupdf>=1.23.6",
+    "crawl4ai>=0.9.0",
 ]
 
 [project.scripts]
-"tool-test-researcher-12345678" = "researcher_plugin:main"
+"tool-xhz-researcher-python-9ksd5wzq" = "researcher_plugin:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

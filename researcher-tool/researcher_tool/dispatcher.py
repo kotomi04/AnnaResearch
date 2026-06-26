@@ -52,7 +52,14 @@ def _fake_tavily_http(request, timeout=None):
             {
                 "url": f"https://example.test/{i}",
                 "title": f"{query} result {i}",
-                "content": f"Synthetic result {i} for query {query}.",
+                "content": (
+                    f"Synthetic result {i} for query {query}. "
+                    "This offline fixture contains enough research context for selector tests, "
+                    "including evidence summary, source framing, and report-relevant details. "
+                    "It is intentionally verbose so production short-content filtering does not "
+                    "discard every fake Tavily item during integration tests. "
+                )
+                * 2,
             }
             for i in range(1, 4)
         ]
@@ -278,25 +285,42 @@ class AppDispatcher:
         self._ensure_source_credential(source_id, definition)
 
         accepted_queries: list[str] = []
+        skipped_queries: list[str] = []
         for query in queries:
             normalized = normalize_query_for_dedup(query)
             if not normalized:
                 continue
             if self.jobs.has_called(research_id, source_id, normalized):
-                raise ValidationError(
-                    "duplicate source call rejected",
-                    data={"source_id": source_id, "query": query, "reason": "duplicate"},
-                )
+                skipped_queries.append(query)
+                continue
             accepted_queries.append(query)
         if not accepted_queries:
-            raise ValidationError("queries must contain at least one new entry")
+            job = self.jobs.load(research_id)
+            return {
+                "job": status_view(job),
+                "source_call": {
+                    "source_id": source_id,
+                    "source_name": str(definition.get("name") or source_id),
+                    "queries": [],
+                    "skipped_queries": skipped_queries,
+                    "results_count": 0,
+                    "top_titles": [],
+                    "duration_ms": 0,
+                    "error": None,
+                    "calls": [],
+                },
+            }
 
         call_summaries: list[dict[str, Any]] = []
         raw_results: list[dict[str, Any]] = []
         first_error: str | None = None
         executor = self._executor_for(definition)
+        extraction_cache: dict[str, Any] = {}
         for query in accepted_queries:
-            result = executor.call(definition, query)
+            if self._is_native_source(definition):
+                result = executor.call(definition, query, extraction_cache=extraction_cache)
+            else:
+                result = executor.call(definition, query)
             error_code = result.error if result.error not in (None, "empty_result") else None
             if error_code and first_error is None:
                 first_error = error_code
@@ -328,6 +352,7 @@ class AppDispatcher:
                 "source_id": source_id,
                 "source_name": str(definition.get("name") or source_id),
                 "queries": accepted_queries,
+                "skipped_queries": skipped_queries,
                 "results_count": len(raw_results),
                 "top_titles": [str(item.get("title") or "") for item in raw_results[:3]],
                 "duration_ms": sum(int(c.get("duration_ms") or 0) for c in call_summaries),
@@ -363,25 +388,43 @@ class AppDispatcher:
         self._ensure_source_credential(source_id, definition)
 
         accepted_queries: list[str] = []
+        skipped_queries: list[str] = []
         for query in queries:
             normalized = normalize_query_for_dedup(query)
             if not normalized:
                 continue
             if self.jobs.has_section_called(research_id, section_id, source_id, normalized):
-                raise ValidationError(
-                    "duplicate section source call rejected",
-                    data={"section_id": section_id, "source_id": source_id, "query": query, "reason": "duplicate"},
-                )
+                skipped_queries.append(query)
+                continue
             accepted_queries.append(query)
         if not accepted_queries:
-            raise ValidationError("queries must contain at least one new entry")
+            job = self.jobs.load(research_id)
+            return {
+                "job": status_view(job),
+                "source_call": {
+                    "section_id": section_id,
+                    "source_id": source_id,
+                    "source_name": str(definition.get("name") or source_id),
+                    "queries": [],
+                    "skipped_queries": skipped_queries,
+                    "results_count": 0,
+                    "top_titles": [],
+                    "duration_ms": 0,
+                    "error": None,
+                    "calls": [],
+                },
+            }
 
         call_summaries: list[dict[str, Any]] = []
         raw_results: list[dict[str, Any]] = []
         first_error: str | None = None
         executor = self._executor_for(definition)
+        extraction_cache: dict[str, Any] = {}
         for query in accepted_queries:
-            result = executor.call(definition, query)
+            if self._is_native_source(definition):
+                result = executor.call(definition, query, extraction_cache=extraction_cache)
+            else:
+                result = executor.call(definition, query)
             error_code = result.error if result.error not in (None, "empty_result") else None
             if error_code and first_error is None:
                 first_error = error_code
@@ -415,6 +458,7 @@ class AppDispatcher:
                 "source_id": source_id,
                 "source_name": str(definition.get("name") or source_id),
                 "queries": accepted_queries,
+                "skipped_queries": skipped_queries,
                 "results_count": len(raw_results),
                 "top_titles": [str(item.get("title") or "") for item in raw_results[:3]],
                 "duration_ms": sum(int(c.get("duration_ms") or 0) for c in call_summaries),

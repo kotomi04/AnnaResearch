@@ -58,9 +58,9 @@ def builtin_duckduckgo_definition() -> dict[str, Any]:
             "region": "wt-wt",
             "max_urls": 5,
             "max_chars_per_page": 8000,
-            "browser_fallback": False,
+            "browser_fallback": True,
             "browser_fallback_min_chars": 300,
-            "browser_timeout": 30,
+            "browser_timeout": 15,
         },
     }
 
