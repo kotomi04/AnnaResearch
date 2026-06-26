@@ -6,7 +6,7 @@
   ],
   "required_executas": [
     {
-      "tool_id": "tool-test-researcher-12345678",
+      "tool_id": "bundled:researcher",
       "min_version": "0.2.0",
       "version": "latest"
     }
@@ -37,7 +37,7 @@
       }
     ],
     "host_api": {
-      "tools": ["required:tool-test-researcher-12345678"],
+      "tools": ["required:bundled:researcher"],
       "chat": [],
       "artifact": [],
       "llm": ["complete", "embed"],

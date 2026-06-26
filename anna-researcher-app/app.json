@@ -3,13 +3,15 @@
   "name": "Anna Researcher",
   "tagline": "A focused Anna App Adapter for GPT Researcher-style reports.",
   "description": "Anna Researcher runs a research_report from a single-page Anna App using an Executa wrapper, Tavily web retrieval, and Anna Sampling LLM.",
-  "category": "research",
+  "category": "data",
   "logo_url": "https://example.com/anna-researcher/logo.png",
   "cover_url": "https://example.com/anna-researcher/cover.png",
   "screenshots": [],
   "homepage_url": "https://example.com/anna-researcher",
   "support_url": "https://example.com/anna-researcher/support",
   "privacy_url": "https://example.com/anna-researcher/privacy",
-  "pricing_model": "free"
+  "pricing_model": "free",
+  "bundled_executas": {
+    "researcher": { "path": "./executas/researcher-python" }
+  }
 }
-

@@ -320,6 +320,7 @@ def test_native_research_source_executor_extracts_by_default():
                 "browser_fallback": True,
                 "browser_fallback_min_chars": 250,
                 "browser_timeout": 12.0,
+                "page_cache": None,
             },
         )
     ]
@@ -502,7 +503,7 @@ def test_fetch_url_uses_browser_fallback_for_short_static_content(monkeypatch):
         extraction_fetcher,
         "extract_with_browser_fallback",
         lambda url, **kwargs: calls.append(("browser", url, kwargs))
-        or ExtractedPage(url=url, title="Browser", raw_content="# Browser markdown", content_type="html"),
+        or ExtractedPage(url=url, title="Browser", raw_content="# Browser markdown\n\nThis dynamic page contains enough useful body text.", content_type="html"),
     )
 
     page = extraction_fetcher.fetch_url(
@@ -514,11 +515,99 @@ def test_fetch_url_uses_browser_fallback_for_short_static_content(monkeypatch):
     )
 
     assert page.title == "Browser"
-    assert page.raw_content == "# Browser markdown"
+    assert page.raw_content == "# Browser markdown\n\nThis dynamic page contains enough useful body text."
     assert calls == [
         ("static", "https://example.com/dynamic", {"timeout": 20.0, "max_chars_per_page": 12000, "query": "dynamic page"}),
         ("browser", "https://example.com/dynamic", {"query": "dynamic page", "timeout": 9, "max_chars_per_page": 12000}),
     ]
+
+
+def test_fetch_url_marks_low_value_fallback_result_as_failed(monkeypatch):
+    monkeypatch.setattr(
+        extraction_fetcher,
+        "extract_html",
+        lambda url, **kwargs: ExtractedPage(url=url, title="Shell", raw_content="html", content_type="html"),
+    )
+    monkeypatch.setattr(
+        extraction_fetcher,
+        "extract_with_browser_fallback",
+        lambda url, **kwargs: ExtractedPage(url=url, title="Shell", raw_content="Please wait while your request is being verified...", content_type="html"),
+    )
+
+    page = extraction_fetcher.fetch_url(
+        "https://example.com/shell",
+        browser_fallback=True,
+        browser_fallback_min_chars=20,
+    )
+
+    assert page.status == "failed"
+    assert page.error == "low_value_content"
+
+
+def test_fetch_many_batches_browser_fallback(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        extraction_fetcher,
+        "extract_html",
+        lambda url, **kwargs: calls.append(("static", url, kwargs)) or ExtractedPage(url=url, title="Short", raw_content="Short", content_type="html"),
+    )
+    monkeypatch.setattr(
+        extraction_fetcher,
+        "extract_many_with_browser_fallback",
+        lambda urls, **kwargs: calls.append(("browser_many", list(urls), kwargs))
+        or [
+            ExtractedPage(url=url, title="Browser", raw_content=f"# Browser markdown for {url}\n\nUseful dynamic body text.", content_type="html")
+            for url in urls
+        ],
+    )
+
+    pages = extraction_fetcher.fetch_many(
+        ["https://example.com/a", "https://example.com/b"],
+        query="dynamic page",
+        browser_fallback=True,
+        browser_fallback_min_chars=20,
+        browser_timeout=9,
+    )
+
+    assert [page.url for page in pages] == ["https://example.com/a", "https://example.com/b"]
+    assert all(page.status == "success" for page in pages)
+    assert calls == [
+        ("static", "https://example.com/a", {"timeout": 20.0, "max_chars_per_page": 12000, "query": "dynamic page"}),
+        ("static", "https://example.com/b", {"timeout": 20.0, "max_chars_per_page": 12000, "query": "dynamic page"}),
+        (
+            "browser_many",
+            ["https://example.com/a", "https://example.com/b"],
+            {"query": "dynamic page", "timeout": 9, "max_chars_per_page": 12000},
+        ),
+    ]
+
+
+def test_fetch_many_uses_page_cache(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        extraction_fetcher,
+        "extract_html",
+        lambda url, **kwargs: calls.append(("static", url)) or ExtractedPage(url=url, title="Cached", raw_content="Long enough cached body text.", content_type="html"),
+    )
+
+    cache = {}
+    first = extraction_fetcher.fetch_many(
+        ["https://example.com/a"],
+        browser_fallback=True,
+        browser_fallback_min_chars=20,
+        page_cache=cache,
+    )
+    second = extraction_fetcher.fetch_many(
+        ["https://example.com/a#again"],
+        browser_fallback=True,
+        browser_fallback_min_chars=20,
+        page_cache=cache,
+    )
+
+    assert first[0] is second[0]
+    assert calls == [("static", "https://example.com/a")]
 
 
 def test_extraction_fetcher_routes_by_url_type(monkeypatch):
@@ -1091,7 +1180,7 @@ def test_call_research_source_uses_native_duckduckgo_without_credential(tmp_path
     assert loaded["source_urls"] == ["https://duck.example/a"]
 
 
-def test_call_research_source_rejects_duplicate_query(tmp_path, monkeypatch):
+def test_call_research_source_skips_duplicate_query(tmp_path, monkeypatch):
     monkeypatch.setenv("ANNA_RESEARCHER_FAKE_TAVILY", "1")
     dispatcher = make_dispatcher(tmp_path)
 
@@ -1108,12 +1197,42 @@ def test_call_research_source_rejects_duplicate_query(tmp_path, monkeypatch):
         "app_call_research_source",
         {"research_id": job["research_id"], "iteration": 1, "source_id": "tavily", "queries": ["anna"]},
     )
-    with pytest.raises(ValidationError) as exc:
-        dispatcher.dispatch(
-            "app_call_research_source",
-            {"research_id": job["research_id"], "iteration": 2, "source_id": "tavily", "queries": ["Anna"]},
+    response = dispatcher.dispatch(
+        "app_call_research_source",
+        {"research_id": job["research_id"], "iteration": 2, "source_id": "tavily", "queries": ["Anna"]},
+    )
+    assert response["source_call"]["queries"] == []
+    assert response["source_call"]["skipped_queries"] == ["Anna"]
+    assert response["source_call"]["results_count"] == 0
+    assert response["source_call"]["error"] is None
+
+
+def test_call_research_source_runs_new_queries_when_some_are_duplicate(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANNA_RESEARCHER_FAKE_TAVILY", "1")
+    dispatcher = make_dispatcher(tmp_path)
+    seen = []
+
+    def fake_http(request, timeout=None):
+        seen.append(str(request.full_url))
+        return FakeResponse(
+            json.dumps({"results": [{"url": f"https://e.com/{len(seen)}", "title": "A", "content": "x"}]}).encode("utf-8")
         )
-    assert exc.value.data.get("reason") == "duplicate"
+
+    dispatcher.executor = ResearchSourceExecutor(
+        token_provider=dispatcher._token_for, http_open=fake_http, sleep=lambda _: None
+    )
+    job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
+    dispatcher.dispatch(
+        "app_call_research_source",
+        {"research_id": job["research_id"], "iteration": 1, "source_id": "tavily", "queries": ["anna"]},
+    )
+    response = dispatcher.dispatch(
+        "app_call_research_source",
+        {"research_id": job["research_id"], "iteration": 2, "source_id": "tavily", "queries": ["Anna", "researcher"]},
+    )
+    assert response["source_call"]["queries"] == ["researcher"]
+    assert response["source_call"]["skipped_queries"] == ["Anna"]
+    assert response["source_call"]["results_count"] == 1
 
 
 def test_call_section_research_source_uses_native_duckduckgo(tmp_path):
@@ -1162,6 +1281,60 @@ def test_call_section_research_source_uses_native_duckduckgo(tmp_path):
     item = loaded["section_iterations"]["section-1"][0]["raw_results"][0]
     assert item["source_name"] == "DuckDuckGo"
     assert item["url"] == "https://duck.example/section"
+
+
+def test_call_section_research_source_skips_duplicate_query(tmp_path):
+    dispatcher = make_dispatcher(tmp_path)
+    dispatcher.native_executor = NativeResearchSourceExecutor(
+        adapters={
+            "ddgs": lambda query: [
+                {"query": query, "url": "https://duck.example/section", "title": "Section result", "content": "section snippet"},
+            ]
+        },
+        extractor=lambda items, **kwargs: items,
+    )
+    job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
+    dispatcher.dispatch(
+        "app_save_confirmed_research_outline",
+        {
+            "research_id": job["research_id"],
+            "sections": [
+                {
+                    "id": "section-1",
+                    "title": "Background",
+                    "outline": "Find background information.",
+                    "allowed_source_ids": ["duckduckgo"],
+                    "max_iterations": 1,
+                }
+            ],
+        },
+    )
+    dispatcher.dispatch(
+        "app_call_section_research_source",
+        {
+            "research_id": job["research_id"],
+            "section_id": "section-1",
+            "iteration": 1,
+            "source_id": "duckduckgo",
+            "queries": ["anna background"],
+        },
+    )
+
+    response = dispatcher.dispatch(
+        "app_call_section_research_source",
+        {
+            "research_id": job["research_id"],
+            "section_id": "section-1",
+            "iteration": 2,
+            "source_id": "duckduckgo",
+            "queries": ["Anna  Background"],
+        },
+    )
+
+    assert response["source_call"]["queries"] == []
+    assert response["source_call"]["skipped_queries"] == ["Anna  Background"]
+    assert response["source_call"]["results_count"] == 0
+    assert response["source_call"]["error"] is None
 
 
 def test_app_search_web_is_removed(tmp_path):
@@ -1287,13 +1460,15 @@ def test_upsert_user_source_persists_and_credential_can_be_added(tmp_path):
 
 def test_selector_emits_source_prefix_and_dedupes_by_url():
     selector = LexicalContextSelector(max_sources=3, max_per_domain=2, context_budget=2000)
+    long_context = "Anna app research context " * 16
+    long_details = "anna app research details " * 16
     selected = selector.select(
         query="anna app research",
         search_queries=["anna app research"],
         search_results=[
-            {"query": "anna", "source_id": "tavily", "source_name": "Tavily", "url": "https://example.com/a", "title": "Anna research", "content": "Anna app research context"},
+            {"query": "anna", "source_id": "tavily", "source_name": "Tavily", "url": "https://example.com/a", "title": "Anna research", "content": long_context},
             {"query": "anna", "source_id": "tavily", "source_name": "Tavily", "url": "https://example.com/a", "title": "Duplicate", "content": "duplicate"},
-            {"query": "anna", "source_id": "acme", "source_name": "ACME", "url": "", "title": "Same title", "content": "anna app research details"},
+            {"query": "anna", "source_id": "acme", "source_name": "ACME", "url": "", "title": "Same title", "content": long_details},
             {"query": "anna", "source_id": "acme", "source_name": "ACME", "url": "", "title": "Same title", "content": "different body"},
         ],
     )
@@ -1303,3 +1478,42 @@ def test_selector_emits_source_prefix_and_dedupes_by_url():
     # url-empty entries dedupe on (source_id, title)
     assert selected["source_urls"] == ["https://example.com/a"]
     assert text.count("Same title") == 1
+
+
+def test_selector_skips_failed_and_short_extractions():
+    selector = LexicalContextSelector(max_sources=3, max_per_domain=3, context_budget=2000, min_content_length=120)
+    selected = selector.select(
+        query="starbucks china market",
+        search_queries=["starbucks china market"],
+        search_results=[
+            {
+                "query": "starbucks",
+                "source_id": "duckduckgo",
+                "source_name": "DuckDuckGo",
+                "url": "https://example.com/failed",
+                "title": "Starbucks China",
+                "content": "Starbucks China market " * 20,
+                "extraction_status": "failed",
+            },
+            {
+                "query": "starbucks",
+                "source_id": "duckduckgo",
+                "source_name": "DuckDuckGo",
+                "url": "https://example.com/short",
+                "title": "Starbucks China",
+                "content": "Starbucks China market",
+            },
+            {
+                "query": "starbucks",
+                "source_id": "duckduckgo",
+                "source_name": "DuckDuckGo",
+                "url": "https://example.com/good",
+                "title": "Starbucks China market report",
+                "content": "Starbucks China market expansion and competition analysis " * 12,
+            },
+        ],
+    )
+
+    assert selected["source_urls"] == ["https://example.com/good"]
+    assert "failed" not in selected["selected_context"]
+    assert "short" not in selected["selected_context"]

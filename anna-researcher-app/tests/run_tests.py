@@ -256,15 +256,18 @@ def test_source_test_transfer(tmp_path: Path):
 
 
 def test_selector():
-    selector = LexicalContextSelector(max_sources=2, max_per_domain=1, context_budget=700)
+    selector = LexicalContextSelector(max_sources=2, max_per_domain=1, context_budget=1600)
+    anna_context = "Anna app research context with source evidence and selector details. " * 8
+    same_domain_context = "anna app same domain evidence and repeated context details. " * 8
+    selector_context = "research context selector evidence for Anna app ranking and source selection. " * 8
     selected = selector.select(
         query="anna app research",
         search_queries=["anna app research"],
         search_results=[
-            {"query": "anna", "source_id": "tavily", "source_name": "Tavily", "url": "https://example.com/a", "title": "Anna research", "content": "Anna app research context"},
+            {"query": "anna", "source_id": "tavily", "source_name": "Tavily", "url": "https://example.com/a", "title": "Anna research", "content": anna_context},
             {"query": "anna", "source_id": "tavily", "source_name": "Tavily", "url": "https://example.com/a", "title": "Duplicate", "content": "duplicate"},
-            {"query": "anna", "source_id": "tavily", "source_name": "Tavily", "url": "https://example.com/b", "title": "Same domain", "content": "anna app same domain"},
-            {"query": "anna", "source_id": "tavily", "source_name": "Tavily", "url": "https://docs.example.org/c", "title": "Context selector", "content": "research context selector evidence"},
+            {"query": "anna", "source_id": "tavily", "source_name": "Tavily", "url": "https://example.com/b", "title": "Same domain", "content": same_domain_context},
+            {"query": "anna", "source_id": "tavily", "source_name": "Tavily", "url": "https://docs.example.org/c", "title": "Context selector", "content": selector_context},
         ],
     )
     assert_true(selected["source_urls"] == ["https://example.com/a", "https://docs.example.org/c"], "selector should dedupe and limit domains")
