@@ -2,6 +2,9 @@
 anna-executa-examples/
 gpt-researcher/
 docs/
+.github/
+.scratch/
+test-app/
 
 # OS / editor files
 **/.DS_Store
