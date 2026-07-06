@@ -154,18 +154,26 @@ class JobStore:
         section_id = _require_section(job, section_id)["id"]
         all_iterations = dict(job.get("section_iterations") or {})
         iterations = list(all_iterations.get(section_id) or [])
+        compact_source_calls = [_compact_source_call(call) for call in source_calls]
         entry = {
             "iteration": iteration,
             "source_id": source_id,
             "source_name": source_name,
             "queries": list(queries),
-            "source_calls": list(source_calls),
-            "results_count": sum(len(c.get("items", [])) for c in source_calls),
-            "raw_results": list(raw_results),
+            "source_calls": compact_source_calls,
+            "results_count": sum(_source_call_results_count(c) for c in compact_source_calls),
+            "raw_results": [_compact_search_result(item) for item in raw_results],
             "appended_at": utc_now(),
         }
-        iterations = [it for it in iterations if int(it.get("iteration") or -1) != iteration]
-        iterations.append(entry)
+        merged = False
+        for idx, existing in enumerate(iterations):
+            if int(existing.get("iteration") or -1) == iteration:
+                entry = _merge_iteration_entry(existing, entry)
+                iterations[idx] = entry
+                merged = True
+                break
+        if not merged:
+            iterations.append(entry)
         iterations.sort(key=lambda it: int(it.get("iteration") or 0))
         all_iterations[section_id] = iterations
         job["section_iterations"] = all_iterations
@@ -188,9 +196,13 @@ class JobStore:
         job = self.load(research_id)
         section_id = _require_section(job, section_id)["id"]
         contexts = dict(job.get("section_selected_context") or {})
+        selected_context = selected.get("selected_context") or ""
+        selected_sources = selected.get("selected_sources") or []
         contexts[section_id] = {
-            "selected_context": selected.get("selected_context") or "",
-            "selected_sources": selected.get("selected_sources") or [],
+            "selected_context_format": "v1",
+            "selected_context_chars": len(selected_context),
+            "selected_sources": [_persist_selected_source(source, index=idx) for idx, source in enumerate(selected_sources, 1)],
+            "selected_sources_count": len(selected_sources),
             "source_urls": selected.get("source_urls") or [],
             "selected_at": utc_now(),
         }
@@ -268,14 +280,15 @@ class JobStore:
         the job record only — callers never expose it to the frontend."""
         job = self.load(research_id)
         iterations = list(job.get("iterations") or [])
+        compact_source_calls = [_compact_source_call(call) for call in source_calls]
         entry = {
             "iteration": iteration,
             "source_id": source_id,
             "source_name": source_name,
             "queries": list(queries),
-            "source_calls": list(source_calls),
-            "results_count": sum(len(c.get("items", [])) for c in source_calls),
-            "raw_results": list(raw_results),
+            "source_calls": compact_source_calls,
+            "results_count": sum(_source_call_results_count(c) for c in compact_source_calls),
+            "raw_results": [_compact_search_result(item) for item in raw_results],
             "appended_at": utc_now(),
         }
         replaced = False
@@ -293,15 +306,15 @@ class JobStore:
         job["source_urls"] = sorted({str(item.get("url")) for item in accumulated if item.get("url")})
         job["source_count"] = len(job["source_urls"])
         log_entries = list(job.get("research_log") or [])
-        for call in source_calls:
+        for call in compact_source_calls:
             log_entries.append(
                 {
                     "iteration": iteration,
                     "source_id": source_id,
                     "source_name": source_name,
                     "query": call.get("query"),
-                    "results_count": len(call.get("items") or []),
-                    "top_titles": [str(item.get("title") or "") for item in (call.get("items") or [])[:3]],
+                    "results_count": _source_call_results_count(call),
+                    "top_titles": _source_call_top_titles(call),
                     "duration_ms": int(call.get("duration_ms") or 0),
                     "error": call.get("error"),
                 }
@@ -437,6 +450,26 @@ def _require_section(job: dict[str, Any], section_id: str) -> dict[str, Any]:
     raise ValidationError("unknown section_id", data={"section_id": clean})
 
 
+def _merge_iteration_entry(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    queries = list(existing.get("queries") or [])
+    for query in incoming.get("queries") or []:
+        if normalize_query_for_dedup(str(query)) not in {normalize_query_for_dedup(str(item)) for item in queries}:
+            queries.append(query)
+
+    source_calls = [_compact_source_call(call) for call in list(existing.get("source_calls") or []) + list(incoming.get("source_calls") or [])]
+    raw_results = list(existing.get("raw_results") or []) + list(incoming.get("raw_results") or [])
+    return {
+        **existing,
+        "source_id": incoming.get("source_id") or existing.get("source_id"),
+        "source_name": incoming.get("source_name") or existing.get("source_name"),
+        "queries": queries,
+        "source_calls": source_calls,
+        "results_count": sum(_source_call_results_count(call) for call in source_calls),
+        "raw_results": raw_results,
+        "appended_at": incoming.get("appended_at") or existing.get("appended_at"),
+    }
+
+
 def _flatten_section_research_log(job: dict[str, Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for section_id, iterations in (job.get("section_iterations") or {}).items():
@@ -449,13 +482,53 @@ def _flatten_section_research_log(job: dict[str, Any]) -> list[dict[str, Any]]:
                         "source_id": entry.get("source_id"),
                         "source_name": entry.get("source_name"),
                         "query": call.get("query"),
-                        "results_count": len(call.get("items") or []),
-                        "top_titles": [str(item.get("title") or "") for item in (call.get("items") or [])[:3]],
+                        "results_count": _source_call_results_count(call),
+                        "top_titles": _source_call_top_titles(call),
                         "duration_ms": int(call.get("duration_ms") or 0),
                         "error": call.get("error"),
                     }
                 )
     return out
+
+
+def _compact_source_call(call: dict[str, Any]) -> dict[str, Any]:
+    data = {k: v for k, v in (call or {}).items() if k != "items"}
+    if "results_count" not in data:
+        data["results_count"] = len((call or {}).get("items") or [])
+    if "top_titles" not in data:
+        data["top_titles"] = [str(item.get("title") or "") for item in ((call or {}).get("items") or [])[:3]]
+    return data
+
+
+def _compact_search_result(item: dict[str, Any]) -> dict[str, Any]:
+    data = dict(item or {})
+    content = str(data.pop("content", data.pop("summary", "")) or "").strip()
+    url_body = str(data.pop("url_body", data.pop("body", data.pop("raw_content", ""))) or "").strip()
+    if content:
+        data["content"] = content
+    if url_body:
+        data["url_body"] = url_body
+    return data
+
+
+def _persist_selected_source(source: dict[str, Any], *, index: int) -> dict[str, Any]:
+    data = dict(source or {})
+    content = str(data.get("content") or "")
+    data["index"] = int(data.get("index") or index)
+    data["source_label"] = data.get("source_label") or data.get("source_name") or data.get("source_id") or "未知来源"
+    data["content_chars"] = len(content)
+    return data
+
+
+def _source_call_results_count(call: dict[str, Any]) -> int:
+    try:
+        return int((call or {}).get("results_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _source_call_top_titles(call: dict[str, Any]) -> list[str]:
+    return [str(title or "") for title in ((call or {}).get("top_titles") or [])[:3]]
 
 
 def _all_section_source_urls(job: dict[str, Any]) -> list[str]:

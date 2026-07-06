@@ -11,6 +11,7 @@ from urllib.parse import unquote, urlparse
 
 from .errors import NotFoundError, ResearcherToolError, ValidationError
 from .job_store import JobStore
+from .context_selector import build_selected_context
 from .views import compact_job_view, result_view, section_result_view
 
 RESULT_PATH_RE = re.compile(r"^/research-results/([^/]+)$")
@@ -180,6 +181,8 @@ class LocalResultTransferServer:
                         result = get_http_context(jobs, route["research_id"])
                     elif route["kind"] == "section_context":
                         result = get_http_section_context(jobs, route["research_id"], route["section_id"])
+                    elif route["kind"] == "section_result":
+                        result = get_http_section_result(jobs, route["research_id"], route["section_id"])
                     elif route["kind"] == "source_test":
                         result = get_http_source_test(source_tests, route["test_id"])
                     else:
@@ -360,12 +363,21 @@ def get_http_section_context(jobs: JobStore, research_id: str, section_id: str) 
     context = (job.get("section_selected_context") or {}).get(section_id)
     if not isinstance(context, dict):
         raise NotFoundError(f"section context not found: {section_id}")
+    selected_sources = context.get("selected_sources") or []
     return {
-        "selected_context": context.get("selected_context") or "",
-        "selected_sources": context.get("selected_sources") or [],
+        "selected_context": build_selected_context(selected_sources),
+        "selected_sources": selected_sources,
         "source_urls": context.get("source_urls") or [],
         "selected_at": context.get("selected_at"),
     }
+
+
+def get_http_section_result(jobs: JobStore, research_id: str, section_id: str) -> dict[str, Any]:
+    job = jobs.load(research_id)
+    section = (job.get("section_results") or {}).get(section_id)
+    if not isinstance(section, dict):
+        raise NotFoundError(f"section result not found: {section_id}")
+    return {"section_result": section_result_view(section, include_markdown=True)}
 
 
 def get_http_source_test(source_tests: dict[str, dict[str, Any]], test_id: str) -> dict[str, Any]:

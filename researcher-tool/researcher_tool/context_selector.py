@@ -66,7 +66,7 @@ class LexicalContextSelector:
             seen_keys.add(key)
             if str(result.get("extraction_status") or "").strip().lower() == "failed":
                 continue
-            content = str(result.get("content") or result.get("body") or result.get("raw_content") or "")
+            content = evidence_text(result)
             if len(content.strip()) < self.min_content_length:
                 continue
             title_terms = tokenize(title)
@@ -118,18 +118,10 @@ class LexicalContextSelector:
             per_domain[domain] += 1
             remaining -= len(trimmed) + len(item.get("url") or "") + len(item["title"]) + 80
 
-        context_parts: list[str] = []
-        for index, item in enumerate(selected, 1):
-            source_label = item.get("source_name") or item.get("source_id") or "未知来源"
-            prefix = f"[来源: {source_label}]"
-            url_line = f"URL: {item['url']}" if item.get("url") else "URL: (无)"
-            context_parts.append(
-                f"{prefix} [{index}] {item['title']}\n{url_line}\nQuery: {item['query']}\nContent: {item['content']}"
-            )
         return {
             "selected_sources": selected,
             "source_urls": [item["url"] for item in selected if item.get("url")],
-            "selected_context": "\n\n".join(context_parts),
+            "selected_context": build_selected_context(selected),
         }
 
 
@@ -142,3 +134,30 @@ def trim_text(text: str, limit: int) -> str:
     if boundary > limit * 0.6:
         cut = cut[: boundary + 1]
     return cut.rstrip() + "..."
+
+
+def evidence_text(result: dict[str, Any]) -> str:
+    content = str(result.get("content") or result.get("summary") or "").strip()
+    url_body = str(result.get("url_body") or result.get("body") or result.get("raw_content") or "").strip()
+    if content and url_body:
+        if content in url_body:
+            return url_body
+        return f"{content}\n\nURL body:\n{url_body}"
+    return url_body or content
+
+
+def build_selected_context(selected_sources: list[dict[str, Any]]) -> str:
+    context_parts: list[str] = []
+    for fallback_index, item in enumerate(selected_sources, 1):
+        index = int(item.get("index") or fallback_index)
+        source_label = item.get("source_label") or item.get("source_name") or item.get("source_id") or "未知来源"
+        prefix = f"[来源: {source_label}]"
+        url = str(item.get("url") or "")
+        url_line = f"URL: {url}" if url else "URL: (无)"
+        title = item.get("title") or domain_of(url) or url or source_label or "(无标题)"
+        query = item.get("query") or ""
+        content = item.get("content") or ""
+        context_parts.append(
+            f"{prefix} [{index}] {title}\n{url_line}\nQuery: {query}\nContent: {content}"
+        )
+    return "\n\n".join(context_parts)

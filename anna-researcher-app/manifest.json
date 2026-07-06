@@ -47,6 +47,11 @@
       "window": []
     },
     "csp_overrides": {
+      "connect-src": [
+        "'self'",
+        "http://127.0.0.1:*",
+        "http://localhost:*"
+      ],
       "img-src": ["'self'", "data:", "blob:"],
       "font-src": ["'self'", "data:"],
       "style-src": ["'self'"],

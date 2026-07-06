@@ -373,7 +373,7 @@ def test_bundle_contract():
     bundle_js = "\n".join(path.read_text(encoding="utf-8") for path in (APP_ROOT / "bundle").glob("assets/*.js"))
     manifest = (APP_ROOT / "manifest.json").read_text(encoding="utf-8")
     assert_true("tool-test-researcher-12345678" in manifest, "manifest should reference tool")
-    assert_true('"min_version":"0.2.0"' in manifest.replace(" ", ""), "manifest should require tool 0.2.0")
+    assert_true('"min_version":"0.2.1"' in manifest.replace(" ", ""), "manifest should require tool 0.2.1")
     assert_true('"llm":["complete","embed"]' in manifest.replace(" ", ""), "manifest should authorize llm.complete and llm.embed")
     assert_true('method:"research"' not in bundle_js and 'method: "research"' not in bundle_js, "bundle should not call legacy research method")
     assert_true('"action":"advance"' not in bundle_js and 'action:"advance"' not in bundle_js, "bundle should not contain legacy advance action")

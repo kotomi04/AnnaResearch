@@ -19,7 +19,7 @@ from .sources import (
     migrate_legacy_tavily_key,
 )
 from .sources.native.executor import NativeResearchSourceExecutor
-from .views import compact_job_view, source_view, status_view
+from .views import compact_job_view, result_view, source_view, status_view
 
 
 class _FakeResponse:
@@ -137,9 +137,10 @@ class AppDispatcher:
             job = self.jobs.load(research_id) if research_id else self.jobs.load_latest()
             if not job:
                 return {"job": None}
-            view = status_view(job)
+            view = compact_job_view(job)
             view["job_transfer"] = self.transfer_server.job_descriptor(str(job.get("research_id")))
             if job.get("report_markdown"):
+                view["result"] = result_view(job, include_sources=False, include_markdown=True)
                 view["result_transfer"] = self.transfer_server.result_descriptor(str(job.get("research_id")), method="GET")
             return {"job": view}
         if method == "app_list_research_jobs":
@@ -491,9 +492,11 @@ class AppDispatcher:
             for item in (iteration.get("raw_results") or [])
         ]
         search_queries = sorted({query for iteration in iterations for query in (iteration.get("queries") or [])})
+        query_override = str(args.get("query") or "").strip()
+        search_query_override = normalize_queries(args.get("search_queries"))
         selected = self.selector.select(
-            query=f"{job.get('query')}\n\nSection: {section.get('title')}\n{section.get('outline')}",
-            search_queries=search_queries or [job.get("query")],
+            query=query_override or f"{job.get('query')}\n\nSection: {section.get('title')}\n{section.get('outline')}",
+            search_queries=search_query_override or search_queries or [job.get("query")],
             search_results=search_results,
         )
         job = self.jobs.save_section_selected_context(research_id, section_id, selected)

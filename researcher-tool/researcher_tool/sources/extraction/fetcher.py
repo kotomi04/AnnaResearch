@@ -144,7 +144,6 @@ def enrich_items_with_extracted_content(
                 next_item["title"] = page.title
             if page.status == "success" and page.raw_content:
                 next_item["raw_content"] = page.raw_content
-                next_item["content"] = _join_snippet_and_content(str(next_item.get("content") or ""), page.raw_content)
         enriched.append(next_item)
     return enriched
 
@@ -164,18 +163,6 @@ def _distinct_urls(items: Iterable[str | dict[str, Any]], *, max_urls: int) -> l
         if len(urls) >= limit:
             break
     return urls
-
-
-def _join_snippet_and_content(snippet: str, raw_content: str) -> str:
-    clean_snippet = snippet.strip()
-    clean_content = raw_content.strip()
-    if not clean_content:
-        return clean_snippet
-    if not clean_snippet:
-        return clean_content
-    if clean_snippet in clean_content:
-        return clean_content
-    return f"{clean_snippet}\n\nRelevant excerpts:\n{clean_content}"
 
 
 def _fetch_without_browser_fallback(

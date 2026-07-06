@@ -44,7 +44,7 @@ def result_view(job: dict[str, Any], *, include_sources: bool = True, include_ma
     return data
 
 
-def compact_job_view(job: dict[str, Any]) -> dict[str, Any]:
+def compact_job_view(job: dict[str, Any], *, include_section_markdown: bool = False) -> dict[str, Any]:
     data = status_view(job)
     data["query_domains"] = job.get("query_domains") or []
     data["agent_name"] = job.get("agent_name") or ""
@@ -71,14 +71,14 @@ def compact_job_view(job: dict[str, Any]) -> dict[str, Any]:
         section_id: {
             "source_urls": context.get("source_urls") or [],
             "selected_at": context.get("selected_at"),
-            "selected_context_chars": len(context.get("selected_context") or ""),
-            "selected_sources_count": len(context.get("selected_sources") or []),
+            "selected_context_chars": int(context.get("selected_context_chars") or 0),
+            "selected_sources_count": int(context.get("selected_sources_count") or 0),
         }
         for section_id, context in (job.get("section_selected_context") or {}).items()
         if isinstance(context, dict)
     }
     data["section_results"] = {
-        section_id: section_result_view(result)
+        section_id: section_result_view(result, include_markdown=include_section_markdown)
         for section_id, result in (job.get("section_results") or {}).items()
         if isinstance(result, dict)
     }

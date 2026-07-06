@@ -97,6 +97,7 @@ uv run --with pyinstaller python -m PyInstaller \
   --onefile \
   --clean \
   --noupx \
+  --collect-data crawl4ai \
   --name "$TOOL_ID" \
   "$ENTRY_FILE"
 
