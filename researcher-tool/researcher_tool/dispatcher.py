@@ -19,7 +19,7 @@ from .sources import (
     migrate_legacy_tavily_key,
 )
 from .sources.native.executor import NativeResearchSourceExecutor
-from .views import compact_job_view, result_view, source_view, status_view
+from .views import compact_job_view, source_view, status_view
 
 
 class _FakeResponse:
@@ -140,7 +140,6 @@ class AppDispatcher:
             view = compact_job_view(job)
             view["job_transfer"] = self.transfer_server.job_descriptor(str(job.get("research_id")))
             if job.get("report_markdown"):
-                view["result"] = result_view(job, include_sources=False, include_markdown=True)
                 view["result_transfer"] = self.transfer_server.result_descriptor(str(job.get("research_id")), method="GET")
             return {"job": view}
         if method == "app_list_research_jobs":

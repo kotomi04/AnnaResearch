@@ -93,11 +93,26 @@ mkdir -p "$OUT_DIR/staging-$PLATFORM/bin"
 
 echo "==> Building single-file executable with PyInstaller"
 
+CRAWL4AI_JS_DIR="$(uv run python - <<'PY'
+from pathlib import Path
+
+import crawl4ai
+
+print(Path(crawl4ai.__file__).resolve().parent / "js_snippet")
+PY
+)"
+
+if [ ! -f "$CRAWL4AI_JS_DIR/update_image_dimensions.js" ]; then
+  echo "ERROR: crawl4ai js_snippet data files were not found at $CRAWL4AI_JS_DIR" >&2
+  exit 1
+fi
+
 uv run --with pyinstaller python -m PyInstaller \
   --onefile \
   --clean \
   --noupx \
   --collect-data crawl4ai \
+  --add-data "$CRAWL4AI_JS_DIR:crawl4ai/js_snippet" \
   --name "$TOOL_ID" \
   "$ENTRY_FILE"
 

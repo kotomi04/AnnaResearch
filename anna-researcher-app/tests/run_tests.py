@@ -341,7 +341,7 @@ def test_plugin_contract(tmp_path: Path):
         describe = plugin.call("describe")
         tools = [tool["name"] for tool in describe["result"]["tools"]]
         assert_true(describe["result"]["name"] == "tool-test-researcher-12345678", "describe should advertise tool")
-        assert_true(describe["result"]["version"] == "0.2.1", "describe should advertise breaking version")
+        assert_true(describe["result"]["version"] == "0.2.2", "describe should advertise breaking version")
         assert_true("research" not in tools, "legacy research method should be absent")
         assert_true("app_search_web" not in tools, "legacy app_search_web must be removed")
         assert_true("app_call_research_source" in tools, "new app_call_research_source must be advertised")
@@ -373,7 +373,7 @@ def test_bundle_contract():
     bundle_js = "\n".join(path.read_text(encoding="utf-8") for path in (APP_ROOT / "bundle").glob("assets/*.js"))
     manifest = (APP_ROOT / "manifest.json").read_text(encoding="utf-8")
     assert_true("tool-test-researcher-12345678" in manifest, "manifest should reference tool")
-    assert_true('"min_version":"0.2.1"' in manifest.replace(" ", ""), "manifest should require tool 0.2.1")
+    assert_true('"min_version":"0.2.2"' in manifest.replace(" ", ""), "manifest should require tool 0.2.2")
     assert_true('"llm":["complete","embed"]' in manifest.replace(" ", ""), "manifest should authorize llm.complete and llm.embed")
     assert_true('method:"research"' not in bundle_js and 'method: "research"' not in bundle_js, "bundle should not call legacy research method")
     assert_true('"action":"advance"' not in bundle_js and 'action:"advance"' not in bundle_js, "bundle should not contain legacy advance action")

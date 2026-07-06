@@ -187,26 +187,14 @@ export class AnnaResearchApi implements ResearchApi {
     let job = response.job ?? null;
     const resultTransfer = job?.result_transfer;
     if (job?.job_transfer?.url) {
-      try {
-        const data = await fetchTransfer<JobResponse>(job.job_transfer);
-        job = data.job ? { ...job, ...data.job } : job;
-      } catch (err) {
-        console.warn("[anna-researcher] job transfer fetch failed; using inline job payload", err);
-      }
+      const data = await fetchTransfer<JobResponse>(job.job_transfer);
+      job = data.job ? { ...job, ...data.job } : job;
     }
     const transfer = job?.result_transfer ?? resultTransfer;
     if (!transfer) return job;
-    try {
-      const data = await fetchTransfer<ResultResponse>(transfer);
-      if (!job) return data.result ? { result: data.result } : null;
-      return { ...job, result: data.result ?? job.result };
-    } catch (err) {
-      if (job?.result?.report_markdown) {
-        console.warn("[anna-researcher] result transfer fetch failed; using inline result payload", err);
-        return job;
-      }
-      throw err;
-    }
+    const data = await fetchTransfer<ResultResponse>(transfer);
+    if (!job) return data.result ? { result: data.result } : null;
+    return { ...job, result: data.result ?? job.result };
   }
 
   async listResearchJobs(input: { limit?: number } = {}): Promise<ResearchJob[]> {
