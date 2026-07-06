@@ -52,6 +52,39 @@ interface DecideFinish {
 
 type Decision = DecideCallSource | DecideFinish;
 
+interface SectionRunResult {
+  section: ReportSection;
+  markdown: string;
+  summary: string;
+  sourceUrls: string[];
+}
+
+export interface CommentReference {
+  number: number;
+  url: string;
+  scope: "selected" | "nearby" | "section" | "fresh";
+}
+
+export interface SemanticRewriteInput {
+  selectedText: string;
+  instruction: string;
+  refreshResearch?: boolean;
+}
+
+export interface SemanticRewriteResult {
+  proposalId?: string;
+  rewrittenText: string;
+  originalText?: string;
+  targetKind: "section" | "title" | "introduction" | "conclusion";
+  sectionId?: string;
+  sectionTitle?: string;
+  references?: CommentReference[];
+}
+
+export interface ManualReportSaveInput {
+  reportMarkdown: string;
+}
+
 export function useResearchJob(api: ResearchApi) {
   const [job, setJob] = useState<ResearchJob | null>(null);
   const [result, setResult] = useState<ResearchResult | null>(null);
@@ -68,6 +101,7 @@ export function useResearchJob(api: ResearchApi) {
   const [runEvents, setRunEvents] = useState<RunEvent[]>([]);
   const [sectionPreviews, setSectionPreviews] = useState<SectionPreview[]>([]);
   const runIdRef = useRef(0);
+  const rewriteDraftsRef = useRef(new Map<string, SemanticRewriteDraft>());
 
   const refreshSources = useCallback(async () => {
     const next = await api.listResearchSources();
@@ -98,6 +132,8 @@ export function useResearchJob(api: ResearchApi) {
         setJob(latest);
         setResult(latest?.result || null);
         setHistoryJobs(history);
+        setRoleCandidates(roleCandidatesFromJob(latest));
+        setFocusCandidates(focusCandidatesFromJob(latest));
         setRunEvents(projectStoredRunEvents(latest));
         setSectionPreviews(projectSectionPreviews(latest));
         if (latest?.status === "completed" && latest.result) {
@@ -133,8 +169,8 @@ export function useResearchJob(api: ResearchApi) {
       setError(null);
       setJob(selected);
       setResult(selected?.result || null);
-      setRoleCandidates([]);
-      setFocusCandidates([]);
+      setRoleCandidates(roleCandidatesFromJob(selected));
+      setFocusCandidates(focusCandidatesFromJob(selected));
       setOutlineDraft(selected?.confirmed_outline || []);
       setRunEvents(projectStoredRunEvents(selected));
       setSectionPreviews(projectSectionPreviews(selected));
@@ -327,33 +363,45 @@ export function useResearchJob(api: ResearchApi) {
     [api, job?.confirmed_focuses, job?.confirmed_role, job?.query, sources],
   );
 
-  const confirmOutlineAndRun = useCallback(
-    async (sections: ReportSection[]) => {
-      if (!job?.research_id || !job.confirmed_role || !job.confirmed_focuses) throw new Error("Research job is not ready for outline confirmation.");
+  const runConfirmedSections = useCallback(
+    async (sections: ReportSection[], options: { resume?: boolean; baseJob?: ResearchJob | null } = {}) => {
+      const initialJob = options.baseJob || job;
+      if (!initialJob?.research_id) throw new Error("Research job is missing research_id.");
       const runId = runIdRef.current + 1;
       runIdRef.current = runId;
       setPhase("running");
-      setRunEvents([]);
-      setSectionPreviews([]);
       try {
-        let currentJob = await api.saveConfirmedResearchOutline(job.research_id, sections);
+        let currentJob = options.resume ? initialJob : await api.saveConfirmedResearchOutline(initialJob.research_id, sections);
+        const confirmedSections = currentJob.confirmed_outline?.length ? currentJob.confirmed_outline : sections;
+        const role = currentJob.confirmed_role || initialJob.confirmed_role;
+        const focuses = currentJob.confirmed_focuses || initialJob.confirmed_focuses || [];
+        if (!role || !focuses.length || !confirmedSections.length) throw new Error("Research job is not ready to run.");
+        setRunEvents(options.resume ? projectStoredRunEvents(currentJob) : []);
+        setSectionPreviews(options.resume ? projectSectionPreviews(currentJob) : []);
+        setOutlineDraft(confirmedSections);
         setJob(currentJob);
-        const sectionResults: Array<{ section: ReportSection; markdown: string; summary: string; sourceUrls: string[] }> = [];
+        const sectionResults: SectionRunResult[] = [];
         const citationRegistry: string[] = [];
-        for (let index = 0; index < sections.length; index++) {
-          const section = sections[index];
+        for (let index = 0; index < confirmedSections.length; index++) {
+          const section = confirmedSections[index];
+          const reusable = options.resume ? reusableSectionResult(section, currentJob.section_results?.[section.id]) : null;
+          if (reusable) {
+            registerCitationReferences(citationRegistry, reusable.sourceUrls);
+            sectionResults.push(reusable);
+            continue;
+          }
           appendRunEvent(setRunEvents, {
             kind: "section_started",
             sectionId: section.id,
             sectionTitle: section.title,
             title: section.title,
-            detail: `${index + 1}/${sections.length}`,
+            detail: `${index + 1}/${confirmedSections.length}`,
           });
           currentJob = await updateJob(api, currentJob, {
             status: "running",
             stage: "section_research",
             active_section_index: index,
-            progress: Math.min(90, 35 + Math.round((index / sections.length) * 50)),
+            progress: Math.min(90, 35 + Math.round((index / confirmedSections.length) * 50)),
           });
           setJob(currentJob);
           if (runId !== runIdRef.current) return;
@@ -361,26 +409,27 @@ export function useResearchJob(api: ResearchApi) {
             api,
             job: currentJob,
             section,
-            role: job.confirmed_role,
-            focuses: job.confirmed_focuses,
+            role,
+            focuses,
             sources: readyEnabledSources(sources),
             citationRegistry,
             onEvent: (event) => appendRunEvent(setRunEvents, event),
           });
           sectionResults.push({ section, ...sectionResult });
           setSectionPreviews((previews) => upsertPreview(previews, sectionPreview(section, sectionResult)));
-          currentJob = (await api.getResearchJob(job.research_id)) || currentJob;
+          const refreshedJob = await api.getResearchJob(initialJob.research_id);
+          currentJob = refreshedJob ? mergeSectionResults(refreshedJob, currentJob.section_results) : currentJob;
           setJob(currentJob);
         }
         appendRunEvent(setRunEvents, {
           kind: "report_framing",
           title: "Report framing",
-          detail: `${sections.length} section summaries`,
+          detail: `${confirmedSections.length} section summaries`,
         });
         currentJob = await updateJob(api, currentJob, { stage: "report_framing", progress: 94 });
         setJob(currentJob);
-        const framing = await generateReportFraming(api, job.query || "", job.confirmed_focuses, sections, sectionResults);
-        currentJob = await api.saveReportFraming({ research_id: job.research_id, framing });
+        const framing = await generateReportFraming(api, currentJob.query || initialJob.query || "", focuses, confirmedSections, sectionResults);
+        currentJob = await api.saveReportFraming({ research_id: initialJob.research_id, framing });
         const reportMarkdown = assembleReport(framing, sectionResults);
         const sourceUrls = citationRegistry.length ? [...citationRegistry] : sortedUnique(sectionResults.flatMap((section) => section.sourceUrls));
         appendRunEvent(setRunEvents, {
@@ -389,8 +438,8 @@ export function useResearchJob(api: ResearchApi) {
           detail: `${sourceUrls.length} sources`,
           count: sourceUrls.length,
         });
-        currentJob = await api.saveAssembledResearchResult({ research_id: job.research_id, report_markdown: reportMarkdown, source_urls: sourceUrls });
-        const completedResult = currentJob.result || { research_id: job.research_id, report_markdown: reportMarkdown, source_urls: sourceUrls, status: "completed" };
+        currentJob = await api.saveAssembledResearchResult({ research_id: initialJob.research_id, report_markdown: reportMarkdown, source_urls: sourceUrls });
+        const completedResult = currentJob.result || { research_id: initialJob.research_id, report_markdown: reportMarkdown, source_urls: sourceUrls, status: "completed" };
         setJob(currentJob);
         setResult(completedResult);
         setLastCompletedJob(currentJob);
@@ -403,6 +452,319 @@ export function useResearchJob(api: ResearchApi) {
       }
     },
     [api, job, sources],
+  );
+
+  const confirmOutlineAndRun = useCallback(
+    async (sections: ReportSection[]) => {
+      setRunEvents([]);
+      setSectionPreviews([]);
+      await runConfirmedSections(sections);
+    },
+    [runConfirmedSections],
+  );
+
+  const previewSemanticRewriteSelection = useCallback(
+    async (input: SemanticRewriteInput): Promise<SemanticRewriteResult> => {
+      const selectedText = input.selectedText.trim();
+      const instruction = input.instruction.trim();
+      if (!selectedText) throw new Error("Select report text to rewrite.");
+      if (!instruction) throw new Error("Enter a rewrite instruction.");
+      if (!job?.research_id) throw new Error("Research job is missing research_id.");
+      const hydratedJob = await hydrateCompletedSectionResults(api, job);
+      const target = findRewriteTarget(hydratedJob, selectedText);
+      if (!target) throw new Error("The selected text was not found in the completed report.");
+      const beforeCitations = extractCitations(target.selectedText);
+      const researchContext = input.refreshResearch
+        ? await refreshRewriteResearchContext(api, {
+            job: hydratedJob,
+            target,
+            instruction,
+            sources: readyEnabledSources(sources),
+          })
+        : null;
+      const references = researchContext?.references || target.references;
+      const rewrittenText = await rewriteTargetText(api, {
+        query: hydratedJob.query || "",
+        role: hydratedJob.confirmed_role,
+        targetTitle: target.title,
+        targetOutline: target.outline,
+        selectedText: target.selectedText,
+        beforeContext: target.beforeContext,
+        afterContext: target.afterContext,
+        references,
+        freshContext: researchContext?.selectedContext,
+        allowFreshResearch: Boolean(researchContext),
+        instruction,
+      });
+      const afterCitations = extractCitations(rewrittenText);
+      const addedCitations = afterCitations.filter((citation) => !beforeCitations.includes(citation));
+      if (addedCitations.length && !researchContext) {
+        throw new Error("Rewrite introduced new citations. Try a style-only instruction or reselect the passage.");
+      }
+      if (researchContext?.globalSourceUrls?.length) {
+        const allowed = new Set(researchContext.globalSourceUrls.map((_, index) => String(index + 1)));
+        const invalid = afterCitations.filter((citation) => !allowed.has(citation));
+        if (invalid.length) throw new Error("Rewrite cited sources outside the selected research context.");
+      }
+
+      const proposalId = `rewrite-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      rewriteDraftsRef.current.set(proposalId, {
+        proposalId,
+        hydratedJob,
+        target,
+        rewrittenText,
+        references,
+        sourceUrls: researchContext?.sourceUrls,
+        globalSourceUrls: researchContext?.globalSourceUrls,
+      });
+      return target.kind === "section"
+        ? {
+            proposalId,
+            rewrittenText,
+            originalText: target.selectedText,
+            targetKind: "section",
+            sectionId: target.section.id,
+            sectionTitle: target.section.title,
+            references,
+          }
+        : { proposalId, rewrittenText, originalText: target.selectedText, targetKind: target.kind, references };
+    },
+    [api, job, sources],
+  );
+
+  const applySemanticRewriteProposal = useCallback(
+    async (proposalId: string): Promise<SemanticRewriteResult> => {
+      const draft = rewriteDraftsRef.current.get(proposalId);
+      if (!draft) throw new Error("Rewrite proposal expired. Generate it again.");
+      const { hydratedJob, target, rewrittenText } = draft;
+      let nextJob: ResearchJob;
+      if (target.kind === "section") {
+        const updatedMarkdown = replaceSelectedText(target.markdown, target.selectedText, rewrittenText);
+        const previousResult = target.sectionResult;
+        const updatedSourceUrls = mergeSourceUrlsPreservingOrder(previousResult.source_urls || [], draft.sourceUrls || []);
+        const savedJob = await api.saveSectionResult({
+          research_id: hydratedJob.research_id,
+          section_id: target.section.id,
+          section_markdown: updatedMarkdown,
+          section_summary: previousResult.section_summary || deriveSummary(updatedMarkdown),
+          source_urls: updatedSourceUrls,
+          status: "completed",
+        });
+        const updatedSectionResult = {
+          ...previousResult,
+          section_markdown: updatedMarkdown,
+          section_summary: previousResult.section_summary || deriveSummary(updatedMarkdown),
+          source_urls: updatedSourceUrls,
+          status: "completed",
+        };
+        const savedJobWithContext = {
+          ...hydratedJob,
+          ...savedJob,
+          confirmed_role: savedJob.confirmed_role || hydratedJob.confirmed_role,
+          confirmed_focuses: savedJob.confirmed_focuses || hydratedJob.confirmed_focuses,
+          confirmed_outline: savedJob.confirmed_outline || hydratedJob.confirmed_outline,
+          report_framing: savedJob.report_framing || hydratedJob.report_framing,
+          result: savedJob.result || hydratedJob.result,
+        };
+        nextJob = mergeSectionResults(savedJobWithContext, {
+          ...(hydratedJob.section_results || {}),
+          [target.section.id]: updatedSectionResult,
+        });
+      } else {
+        const baseFraming = target.framing;
+        const updatedFraming = {
+          ...baseFraming,
+          [target.kind]: replaceSelectedText(target.markdown, target.selectedText, rewrittenText),
+        };
+        const savedJob = await api.saveReportFraming({ research_id: hydratedJob.research_id, framing: updatedFraming });
+        nextJob = mergeSectionResults(
+          {
+            ...hydratedJob,
+            ...savedJob,
+            confirmed_role: savedJob.confirmed_role || hydratedJob.confirmed_role,
+            confirmed_focuses: savedJob.confirmed_focuses || hydratedJob.confirmed_focuses,
+            confirmed_outline: savedJob.confirmed_outline || hydratedJob.confirmed_outline,
+            report_framing: savedJob.report_framing || updatedFraming,
+            result: savedJob.result || hydratedJob.result,
+          },
+          hydratedJob.section_results,
+        );
+      }
+      const sectionResults = sectionRunResultsFromJob(nextJob);
+      const framing = nextJob.report_framing || hydratedJob.report_framing || {
+        title: nextJob.result?.report_markdown ? headingFromMarkdown(nextJob.result.report_markdown) : "Research Report",
+        introduction: "",
+        conclusion: "",
+      };
+      const reportMarkdown = assembleReport(framing, sectionResults);
+      const sourceUrls = draft.globalSourceUrls?.length
+        ? mergeSourceUrlsPreservingOrder(draft.globalSourceUrls, sectionResults.flatMap((section) => section.sourceUrls))
+        : sortedUnique(sectionResults.flatMap((section) => section.sourceUrls));
+      const assembledJob = await api.saveAssembledResearchResult({
+        research_id: hydratedJob.research_id,
+        report_markdown: reportMarkdown,
+        source_urls: sourceUrls,
+      });
+      const completedResult = assembledJob.result || {
+        research_id: hydratedJob.research_id,
+        report_markdown: reportMarkdown,
+        source_urls: sourceUrls,
+        status: "completed",
+      };
+      const finalJob = mergeSectionResults({
+        ...nextJob,
+        ...assembledJob,
+        confirmed_role: assembledJob.confirmed_role || nextJob.confirmed_role,
+        confirmed_focuses: assembledJob.confirmed_focuses || nextJob.confirmed_focuses,
+        confirmed_outline: assembledJob.confirmed_outline || nextJob.confirmed_outline,
+        report_framing: assembledJob.report_framing || nextJob.report_framing,
+      }, nextJob.section_results);
+      setJob(finalJob);
+      setResult(completedResult);
+      setLastCompletedJob(finalJob);
+      setLastCompletedResult(completedResult);
+      setSectionPreviews(projectSectionPreviews(finalJob));
+      void refreshHistoryJobs().catch(() => undefined);
+      rewriteDraftsRef.current.delete(proposalId);
+      return target.kind === "section"
+        ? {
+            proposalId,
+            rewrittenText,
+            originalText: target.selectedText,
+            targetKind: "section",
+            sectionId: target.section.id,
+            sectionTitle: target.section.title,
+            references: draft.references,
+          }
+        : { proposalId, rewrittenText, originalText: target.selectedText, targetKind: target.kind, references: draft.references };
+    },
+    [api, refreshHistoryJobs],
+  );
+
+  const discardSemanticRewriteProposal = useCallback((proposalId: string) => {
+    rewriteDraftsRef.current.delete(proposalId);
+  }, []);
+
+  const saveManualReportMarkdown = useCallback(
+    async (input: ManualReportSaveInput): Promise<ResearchResult> => {
+      const reportMarkdown = input.reportMarkdown;
+      if (!reportMarkdown.trim()) throw new Error("Report markdown cannot be empty.");
+      const baseJob = job || lastCompletedJob;
+      const researchId = baseJob?.research_id || result?.research_id || lastCompletedResult?.research_id;
+      if (!researchId) throw new Error("Research job is missing research_id.");
+      const hydratedJob = baseJob?.research_id ? await hydrateCompletedSectionResults(api, baseJob) : baseJob;
+      let structuredJob = hydratedJob || baseJob || {};
+      const manualParts = parseManualReportMarkdown(reportMarkdown, structuredJob);
+      if (manualParts.framing) {
+        const savedFramingJob = await api.saveReportFraming({ research_id: researchId, framing: manualParts.framing });
+        structuredJob = mergeSectionResults(
+          {
+            ...structuredJob,
+            ...savedFramingJob,
+            confirmed_role: savedFramingJob.confirmed_role || structuredJob.confirmed_role,
+            confirmed_focuses: savedFramingJob.confirmed_focuses || structuredJob.confirmed_focuses,
+            confirmed_outline: savedFramingJob.confirmed_outline || structuredJob.confirmed_outline,
+            report_framing: savedFramingJob.report_framing || manualParts.framing,
+            result: savedFramingJob.result || structuredJob.result,
+          },
+          structuredJob.section_results,
+        );
+      }
+      let sectionResults = structuredJob.section_results;
+      for (const update of manualParts.sectionUpdates) {
+        const previous = sectionResults?.[update.section.id];
+        const savedSectionJob = await api.saveSectionResult({
+          research_id: researchId,
+          section_id: update.section.id,
+          section_markdown: update.markdown,
+          section_summary: previous?.section_summary || deriveSummary(update.markdown),
+          source_urls: previous?.source_urls || [],
+          status: "completed",
+        });
+        sectionResults = {
+          ...(sectionResults || {}),
+          [update.section.id]: {
+            ...previous,
+            section_id: update.section.id,
+            status: "completed",
+            section_markdown: update.markdown,
+            section_summary: previous?.section_summary || deriveSummary(update.markdown),
+            source_urls: previous?.source_urls || [],
+          },
+        };
+        structuredJob = mergeSectionResults(
+          {
+            ...structuredJob,
+            ...savedSectionJob,
+            confirmed_role: savedSectionJob.confirmed_role || structuredJob.confirmed_role,
+            confirmed_focuses: savedSectionJob.confirmed_focuses || structuredJob.confirmed_focuses,
+            confirmed_outline: savedSectionJob.confirmed_outline || structuredJob.confirmed_outline,
+            report_framing: savedSectionJob.report_framing || structuredJob.report_framing,
+            result: savedSectionJob.result || structuredJob.result,
+          },
+          sectionResults,
+        );
+      }
+      const sourceUrls =
+        result?.source_urls ||
+        lastCompletedResult?.source_urls ||
+        structuredJob.result?.source_urls ||
+        sortedUnique(sectionRunResultsFromJob(structuredJob).flatMap((section) => section.sourceUrls));
+      const savedJob = await api.saveAssembledResearchResult({
+        research_id: researchId,
+        report_markdown: reportMarkdown,
+        source_urls: sourceUrls,
+      });
+      const completedResult = savedJob.result || {
+        research_id: researchId,
+        report_markdown: reportMarkdown,
+        source_urls: sourceUrls,
+        status: "completed",
+      };
+      const finalJob = mergeSectionResults(
+        {
+          ...structuredJob,
+          ...savedJob,
+          result: completedResult,
+          status: savedJob.status || structuredJob.status || "completed",
+          stage: savedJob.stage || structuredJob.stage || "completed",
+          progress: savedJob.progress ?? structuredJob.progress ?? 100,
+          confirmed_role: savedJob.confirmed_role || structuredJob.confirmed_role,
+          confirmed_focuses: savedJob.confirmed_focuses || structuredJob.confirmed_focuses,
+          confirmed_outline: savedJob.confirmed_outline || structuredJob.confirmed_outline,
+          report_framing: savedJob.report_framing || structuredJob.report_framing,
+        },
+        structuredJob.section_results,
+      );
+      setJob(finalJob);
+      setResult(completedResult);
+      setLastCompletedJob(finalJob);
+      setLastCompletedResult(completedResult);
+      setSectionPreviews(projectSectionPreviews(finalJob));
+      void refreshHistoryJobs().catch(() => undefined);
+      return completedResult;
+    },
+    [api, job, lastCompletedJob, lastCompletedResult, refreshHistoryJobs, result],
+  );
+
+  const semanticRewriteSelection = useCallback(
+    async (input: SemanticRewriteInput): Promise<SemanticRewriteResult> => {
+      const proposal = await previewSemanticRewriteSelection(input);
+      if (!proposal.proposalId) return proposal;
+      return applySemanticRewriteProposal(proposal.proposalId);
+    },
+    [applySemanticRewriteProposal, previewSemanticRewriteSelection],
+  );
+
+  const resumeResearchJob = useCallback(
+    async (researchId?: string) => {
+      const baseJob = researchId ? await api.getResearchJob(researchId) : job;
+      if (!baseJob) throw new Error("Research job was not found.");
+      const hydratedJob = await hydrateCompletedSectionResults(api, baseJob);
+      const sections = hydratedJob.confirmed_outline?.length ? hydratedJob.confirmed_outline : outlineDraft;
+      await runConfirmedSections(sections, { resume: true, baseJob: hydratedJob });
+    },
+    [api, job, outlineDraft, runConfirmedSections],
   );
 
   return {
@@ -441,6 +803,12 @@ export function useResearchJob(api: ResearchApi) {
     confirmFocuses,
     regenerateOutline,
     confirmOutlineAndRun,
+    resumeResearchJob,
+    previewSemanticRewriteSelection,
+    applySemanticRewriteProposal,
+    discardSemanticRewriteProposal,
+    semanticRewriteSelection,
+    saveManualReportMarkdown,
     resetForNewResearch,
   };
 }
@@ -451,6 +819,524 @@ function hasConfiguredSource(sources: ResearchSourceView[]): boolean {
 
 function readyEnabledSources(sources: ResearchSourceView[]): ResearchSourceView[] {
   return sources.filter((source) => source.enabled && source.credential_status === "configured");
+}
+
+function roleCandidatesFromJob(job: ResearchJob | null | undefined): RoleCandidate[] {
+  const role = job?.confirmed_role;
+  return role?.server && role.agent_role_prompt ? [{ ...role }] : [];
+}
+
+function focusCandidatesFromJob(job: ResearchJob | null | undefined): FocusCandidate[] {
+  return (job?.confirmed_focuses || [])
+    .map((text, index) => ({ id: `confirmed-focus-${index + 1}`, text: String(text || "").trim() }))
+    .filter((candidate) => candidate.text);
+}
+
+function reusableSectionResult(section: ReportSection, result: NonNullable<ResearchJob["section_results"]>[string] | undefined): SectionRunResult | null {
+  if (!result || result.status !== "completed") return null;
+  const markdown = String(result.section_markdown || "").trim();
+  if (!markdown) return null;
+  const sourceUrls = Array.isArray(result.source_urls) ? result.source_urls.filter(Boolean) : [];
+  return {
+    section,
+    markdown,
+    summary: result.section_summary || deriveSummary(markdown),
+    sourceUrls,
+  };
+}
+
+async function hydrateCompletedSectionResults(api: ResearchApi, job: ResearchJob): Promise<ResearchJob> {
+  const researchId = job.research_id;
+  const sections = job.confirmed_outline || [];
+  const existing = job.section_results || {};
+  if (!researchId || !sections.length) return job;
+  let sectionResults = existing;
+  for (const section of sections) {
+    const result = sectionResults[section.id];
+    if (result?.status !== "completed" || result.section_markdown) continue;
+    const hydrated = await api.getSectionResult(researchId, section.id);
+    if (!hydrated?.section_markdown) continue;
+    if (sectionResults === existing) sectionResults = { ...existing };
+    sectionResults[section.id] = { ...result, ...hydrated };
+  }
+  return sectionResults === existing ? job : { ...job, section_results: sectionResults };
+}
+
+function mergeSectionResults(job: ResearchJob, sectionResults: ResearchJob["section_results"] | undefined): ResearchJob {
+  if (!sectionResults || !Object.keys(sectionResults).length) return job;
+  return {
+    ...job,
+    section_results: {
+      ...(job.section_results || {}),
+      ...sectionResults,
+    },
+  };
+}
+
+function sectionRunResultsFromJob(job: ResearchJob): SectionRunResult[] {
+  const sections = job.confirmed_outline || [];
+  return sections
+    .map((section) => {
+      const result = job.section_results?.[section.id];
+      const markdown = String(result?.section_markdown || "").trim();
+      if (!result || result.status !== "completed" || !markdown) return null;
+      return {
+        section,
+        markdown,
+        summary: result.section_summary || deriveSummary(markdown),
+        sourceUrls: Array.isArray(result.source_urls) ? result.source_urls.filter(Boolean) : [],
+      };
+    })
+    .filter((item): item is SectionRunResult => Boolean(item));
+}
+
+interface ManualReportParts {
+  framing: ReportFraming | null;
+  sectionUpdates: Array<{ section: ReportSection; markdown: string }>;
+}
+
+function parseManualReportMarkdown(markdown: string, job: ResearchJob): ManualReportParts {
+  const text = markdown.trim();
+  const titleMatch = text.match(/^#\s+(.+)$/m);
+  const title = titleMatch?.[1]?.trim() || job.report_framing?.title || headingFromMarkdown(text) || "Research Report";
+  const sectionBlocks = splitSecondLevelBlocks(text);
+  const conclusionIndex = sectionBlocks.findIndex((block) => isConclusionHeading(block.title));
+  const reportSections = conclusionIndex >= 0 ? sectionBlocks.slice(0, conclusionIndex) : sectionBlocks;
+  const conclusion = conclusionIndex >= 0 ? stripHeading(sectionBlocks[conclusionIndex].markdown).trim() : job.report_framing?.conclusion || "";
+  const firstSectionStart = reportSections[0]?.start ?? (conclusionIndex >= 0 ? sectionBlocks[conclusionIndex].start : text.length);
+  const introduction = stripLeadingTitle(text.slice(0, firstSectionStart)).trim();
+  const confirmedSections = job.confirmed_outline || [];
+  const sectionUpdates = confirmedSections
+    .map((section, index) => {
+      const block = reportSections[index];
+      if (!block?.markdown.trim()) return null;
+      return { section, markdown: block.markdown.trim() };
+    })
+    .filter((item): item is { section: ReportSection; markdown: string } => Boolean(item));
+  const hasFraming = Boolean(job.report_framing || titleMatch || introduction || conclusionIndex >= 0);
+  return {
+    framing: hasFraming
+      ? {
+          ...(job.report_framing || { title, introduction: "", conclusion: "" }),
+          title,
+          introduction,
+          conclusion,
+        }
+      : null,
+    sectionUpdates,
+  };
+}
+
+function splitSecondLevelBlocks(markdown: string): Array<{ title: string; markdown: string; start: number; end: number }> {
+  const matches = Array.from(markdown.matchAll(/^##\s+(.+)$/gm));
+  return matches.map((match, index) => {
+    const start = match.index ?? 0;
+    const end = matches[index + 1]?.index ?? markdown.length;
+    return {
+      title: String(match[1] || "").trim(),
+      markdown: markdown.slice(start, end).trim(),
+      start,
+      end,
+    };
+  });
+}
+
+function stripLeadingTitle(markdown: string): string {
+  return markdown.replace(/^#\s+.+\n?/, "").trim();
+}
+
+function stripHeading(markdown: string): string {
+  return markdown.replace(/^##\s+.+\n?/, "").trim();
+}
+
+function isConclusionHeading(title: string): boolean {
+  const normalized = title.trim().toLowerCase();
+  return normalized === "conclusion" || normalized === "结论" || normalized === "总结";
+}
+
+function conclusionHeadingFor(framing: ReportFraming, results: Array<{ markdown: string }>): string {
+  return isLikelyChinese(framing.title, framing.introduction, framing.conclusion, ...results.map((result) => result.markdown)) ? "结论" : "Conclusion";
+}
+
+function isLikelyChinese(...parts: string[]): boolean {
+  return /[\u3400-\u9fff]/.test(parts.join("\n"));
+}
+
+type RewriteTarget =
+  | {
+      kind: "section";
+      section: ReportSection;
+      sectionResult: NonNullable<ResearchJob["section_results"]>[string];
+      markdown: string;
+      title: string;
+      outline: string;
+      selectedText: string;
+      beforeContext: string;
+      afterContext: string;
+      references: CommentReference[];
+    }
+  | {
+      kind: "title" | "introduction" | "conclusion";
+      framing: ReportFraming;
+      markdown: string;
+      title: string;
+      outline: string;
+      selectedText: string;
+      beforeContext: string;
+      afterContext: string;
+      references: CommentReference[];
+    };
+
+interface SemanticRewriteDraft {
+  proposalId: string;
+  hydratedJob: ResearchJob;
+  target: RewriteTarget;
+  rewrittenText: string;
+  references: CommentReference[];
+  sourceUrls?: string[];
+  globalSourceUrls?: string[];
+}
+
+function findRewriteTarget(job: ResearchJob, selectedText: string): RewriteTarget | null {
+  const normalizedSelection = normalizeSelectedText(selectedText);
+  const framing = job.report_framing;
+  if (framing) {
+    const titleTarget = matchRewriteText(framing.title || "", selectedText, normalizedSelection);
+    if (titleTarget) {
+      return {
+        kind: "title",
+        framing,
+        markdown: framing.title || "",
+        title: "Report title",
+        outline: "The main report title.",
+        references: referencesForCommentTarget(job, titleTarget),
+        ...titleTarget,
+      };
+    }
+    const introductionTarget = matchRewriteText(framing.introduction || "", selectedText, normalizedSelection);
+    if (introductionTarget) {
+      return {
+        kind: "introduction",
+        framing,
+        markdown: framing.introduction || "",
+        title: "Introduction",
+        outline: "Opening framing before the report sections.",
+        references: referencesForCommentTarget(job, introductionTarget),
+        ...introductionTarget,
+      };
+    }
+  }
+  for (const section of job.confirmed_outline || []) {
+    const result = job.section_results?.[section.id];
+    const sectionMarkdown = String(result?.section_markdown || "");
+    if (!result || !sectionMarkdown.trim()) continue;
+    const matched = matchRewriteText(sectionMarkdown, selectedText, normalizedSelection);
+    if (!matched) continue;
+    return {
+      kind: "section",
+      section,
+      sectionResult: result,
+      markdown: sectionMarkdown,
+      title: section.title,
+      outline: section.outline,
+      references: referencesForCommentTarget(job, matched, result.source_urls || []),
+      ...matched,
+    };
+  }
+  if (framing) {
+    const conclusionTarget = matchRewriteText(framing.conclusion || "", selectedText, normalizedSelection);
+    if (conclusionTarget) {
+      return {
+        kind: "conclusion",
+        framing,
+        markdown: framing.conclusion || "",
+        title: isLikelyChinese(framing.title, framing.introduction, framing.conclusion) ? "结论" : "Conclusion",
+        outline: "Closing synthesis after the report sections.",
+        references: referencesForCommentTarget(job, conclusionTarget),
+        ...conclusionTarget,
+      };
+    }
+  }
+  return null;
+}
+
+function matchRewriteText(markdown: string, selectedText: string, normalizedSelection: string) {
+  const exactIndex = markdown.indexOf(selectedText);
+  const index = exactIndex >= 0 ? exactIndex : markdown.indexOf(normalizedSelection);
+  const targetText = exactIndex >= 0 ? selectedText : normalizedSelection;
+  if (index < 0) return null;
+  const duplicateIndex = markdown.indexOf(targetText, index + targetText.length);
+  if (duplicateIndex >= 0) throw new Error("The selected text appears more than once in this report area. Select a longer passage.");
+  return {
+    selectedText: targetText,
+    beforeContext: markdown.slice(Math.max(0, index - 900), index).trim(),
+    afterContext: markdown.slice(index + targetText.length, index + targetText.length + 900).trim(),
+  };
+}
+
+function referencesForCommentTarget(
+  job: ResearchJob,
+  target: { selectedText: string; beforeContext: string; afterContext: string },
+  sectionSourceUrls: string[] = [],
+): CommentReference[] {
+  const references: CommentReference[] = [];
+  const seen = new Set<string>();
+  const globalUrls = job.result?.source_urls || job.source_urls || [];
+  const add = (number: number, url: string, scope: CommentReference["scope"]) => {
+    const normalizedUrl = String(url || "").trim();
+    if (!normalizedUrl) return;
+    const key = `${number}:${normalizedUrl}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    references.push({ number, url: normalizedUrl, scope });
+  };
+  for (const raw of extractCitations(target.selectedText)) {
+    const number = Number(raw);
+    add(number, globalUrls[number - 1], "selected");
+  }
+  for (const raw of extractCitations(`${target.beforeContext}\n${target.afterContext}`)) {
+    const number = Number(raw);
+    add(number, globalUrls[number - 1], "nearby");
+  }
+  if (!references.length) {
+    sectionSourceUrls.forEach((url, index) => {
+      const globalIndex = globalUrls.indexOf(url);
+      add(globalIndex >= 0 ? globalIndex + 1 : index + 1, url, "section");
+    });
+  }
+  return references;
+}
+
+async function refreshRewriteResearchContext(
+  api: ResearchApi,
+  input: {
+    job: ResearchJob;
+    target: RewriteTarget;
+    instruction: string;
+    sources: ResearchSourceView[];
+  },
+): Promise<{ selectedContext: string; sourceUrls: string[]; globalSourceUrls: string[]; references: CommentReference[] }> {
+  const { job, target, instruction, sources } = input;
+  if (target.kind !== "section") {
+    throw new Error("Re-search rewrite is currently available for completed report sections. Select text inside a section.");
+  }
+  const role = job.confirmed_role;
+  if (!role) throw new Error("Research role is missing.");
+  const allowedSources = sources.filter((source) => target.section.allowed_source_ids.includes(source.id));
+  if (!allowedSources.length) throw new Error(`Section has no configured allowed source: ${target.section.title}`);
+  const plan = await generateRewriteResearchPlan(api, {
+    query: job.query || "",
+    role,
+    target,
+    instruction,
+  });
+  const focusedSection: ReportSection = {
+    ...target.section,
+    title: plan.title || target.section.title,
+    outline: plan.outline || `${target.section.outline}\n\nSelected passage:\n${target.selectedText}\n\nRewrite request:\n${instruction}`,
+    max_iterations: Math.min(Math.max(plan.maxIterations || 1, 1), 2),
+  };
+  const history: IterationEntry[] = [];
+  const seedQueries = plan.queries.length ? plan.queries : [target.selectedText];
+  for (let iteration = 1; iteration <= focusedSection.max_iterations; iteration++) {
+    const decision =
+      iteration === 1
+        ? { type: "call_source" as const, source_id: allowedSources[0].id, queries: seedQueries }
+        : await decideNextAction({
+            api,
+            query: job.query || "",
+            rolePrompt: role.agent_role_prompt,
+            section: focusedSection,
+            focuses: job.confirmed_focuses || [],
+            iteration,
+            maxIterations: focusedSection.max_iterations,
+            enabledSources: allowedSources,
+            history,
+          });
+    if (decision.type !== "call_source") break;
+    const sourceId = allowedSources.some((source) => source.id === decision.source_id) ? String(decision.source_id) : allowedSources[0].id;
+    const queries = uniqueQueries(decision.queries.length ? decision.queries : seedQueries);
+    if (!queries.length) break;
+    const call = await api.callSectionResearchSource({
+      research_id: requiredResearchId(job),
+      section_id: target.section.id,
+      iteration: nextRewriteResearchIteration(job, target.section.id, iteration),
+      source_id: sourceId,
+      queries,
+    });
+    if (call.source_call) {
+      history.push({
+        iteration,
+        source_id: call.source_call.source_id,
+        source_name: call.source_call.source_name,
+        queries: call.source_call.queries,
+        results_count: call.source_call.results_count,
+        source_calls: call.source_call.calls,
+      });
+    }
+  }
+  const contextQuery = [
+    job.query || "",
+    `Report area: ${target.title}`,
+    focusedSection.outline,
+    `Selected passage: ${target.selectedText}`,
+    `Rewrite request: ${instruction}`,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  const selected = await api.selectSectionContext({
+    research_id: requiredResearchId(job),
+    section_id: target.section.id,
+    query: contextQuery,
+    search_queries: sortedUnique(history.flatMap((entry) => entry.queries)),
+  });
+  const sourceUrls = selected.source_urls || [];
+  const existingGlobalUrls = job.result?.source_urls || job.source_urls || [];
+  const globalSourceUrls = mergeSourceUrlsPreservingOrder(existingGlobalUrls, sourceUrls);
+  const references = mergeCommentReferences(
+    target.references,
+    sourceUrls.map((url) => ({ number: globalSourceUrls.indexOf(url) + 1, url, scope: "fresh" as const })),
+  );
+  return {
+    selectedContext: selected.selected_context || "",
+    sourceUrls,
+    globalSourceUrls,
+    references,
+  };
+}
+
+async function generateRewriteResearchPlan(
+  api: ResearchApi,
+  input: {
+    query: string;
+    role: ConfirmedResearchRole;
+    target: Extract<RewriteTarget, { kind: "section" }>;
+    instruction: string;
+  },
+): Promise<{ title: string; outline: string; queries: string[]; maxIterations: number }> {
+  const text = await completeText(api, [
+    { role: "system", content: { type: "text", text: input.role.agent_role_prompt } },
+    {
+      role: "user",
+      content: {
+        type: "text",
+        text:
+          'Draft one temporary research section for revising only the selected report passage. Return strict JSON only: {"title":"...","outline":"...","queries":["..."],"max_iterations":1}.\n' +
+          "The plan must preserve the existing report structure and must focus on evidence needed for the user's rewrite comment.\n" +
+          "Return 1 to 3 precise search queries. Use max_iterations between 1 and 2.\n\n" +
+          `Original research task:\n${input.query}\n\n` +
+          `Existing section:\n${input.target.title}\n${input.target.outline}\n\n` +
+          `Neighbor context before:\n${input.target.beforeContext || "(none)"}\n\n` +
+          `Selected passage:\n${input.target.selectedText}\n\n` +
+          `Neighbor context after:\n${input.target.afterContext || "(none)"}\n\n` +
+          `User rewrite instruction:\n${input.instruction}`,
+      },
+    },
+  ]);
+  const parsed = parseJsonObject(text);
+  return {
+    title: String(parsed?.title || input.target.title).trim(),
+    outline: String(parsed?.outline || "").trim(),
+    queries: uniqueQueries(Array.isArray(parsed?.queries) ? parsed.queries : []),
+    maxIterations: Math.min(Math.max(Number(parsed?.max_iterations || 1), 1), 2),
+  };
+}
+
+function nextRewriteResearchIteration(job: ResearchJob, sectionId: string, fallback: number): number {
+  const existing = job.section_iterations?.[sectionId] || [];
+  const max = existing.reduce((value, entry) => Math.max(value, Number(entry.iteration || 0)), 0);
+  return max + fallback;
+}
+
+function mergeCommentReferences(base: CommentReference[], additions: CommentReference[]): CommentReference[] {
+  const out: CommentReference[] = [];
+  const seen = new Set<string>();
+  for (const reference of [...base, ...additions]) {
+    const url = String(reference.url || "").trim();
+    if (!url || !reference.number) continue;
+    const key = `${reference.number}:${url}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ ...reference, url });
+  }
+  return out;
+}
+
+function normalizeSelectedText(text: string): string {
+  return text.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function replaceSelectedText(markdown: string, selectedText: string, rewrittenText: string): string {
+  const index = markdown.indexOf(selectedText);
+  if (index < 0) throw new Error("Target text changed. Select the passage again.");
+  return `${markdown.slice(0, index)}${rewrittenText.trim()}${markdown.slice(index + selectedText.length)}`;
+}
+
+function extractCitations(text: string): string[] {
+  return Array.from(new Set(Array.from(text.matchAll(/\[(\d+)\]/g)).map((match) => match[1])));
+}
+
+async function rewriteTargetText(
+  api: ResearchApi,
+  input: {
+    query: string;
+    role?: ConfirmedResearchRole | null;
+    targetTitle: string;
+    targetOutline: string;
+    selectedText: string;
+    beforeContext: string;
+    afterContext: string;
+    references?: CommentReference[];
+    freshContext?: string;
+    allowFreshResearch?: boolean;
+    instruction: string;
+  },
+): Promise<string> {
+  const system = [
+    input.role?.agent_role_prompt || "You are a careful research report editor.",
+    "Rewrite one local passage inside a research report.",
+    input.allowFreshResearch
+      ? "You may add new facts only when they are directly grounded in the fresh research context."
+      : "Do not introduce new facts, numbers, companies, claims, sources, or citations.",
+    "Use the relevant references provided by the user message as grounding context.",
+    "Preserve existing citation markers exactly when the cited claim remains.",
+    input.allowFreshResearch
+      ? "If you use fresh research evidence, cite it with one of the provided reference numbers. Do not invent citation markers."
+      : "Do not invent citation markers.",
+    'Return strict JSON only: {"rewritten_text":"..."}',
+  ].join("\n");
+  const referenceBlock = input.references?.length
+    ? input.references.map((reference) => `[${reference.number}] ${reference.url} (${reference.scope})`).join("\n")
+    : "(none)";
+  const text = await completeText(api, [
+    { role: "system", content: { type: "text", text: system } },
+    {
+      role: "user",
+      content: {
+        type: "text",
+        text:
+          `Original research task:\n${input.query}\n\n` +
+          `Report area:\n${input.targetTitle}\n${input.targetOutline}\n\n` +
+          `Neighbor context before:\n${input.beforeContext || "(none)"}\n\n` +
+          `Target passage:\n${input.selectedText}\n\n` +
+          `Neighbor context after:\n${input.afterContext || "(none)"}\n\n` +
+          `Relevant references:\n${referenceBlock}\n\n` +
+          `Fresh research context:\n${input.freshContext || "(none)"}\n\n` +
+          `User rewrite instruction:\n${input.instruction}`,
+      },
+    },
+  ]);
+  const parsed = parseJsonObject(text);
+  const rewritten = String(parsed?.rewritten_text || "").trim();
+  if (rewritten) return rewritten;
+  const fallback = text.trim();
+  if (!fallback) throw new Error("Anna returned an empty rewrite.");
+  return fallback;
+}
+
+function headingFromMarkdown(markdown: string): string {
+  const match = /^#\s+(.+)$/m.exec(markdown);
+  return match?.[1]?.trim() || "Research Report";
 }
 
 async function updateJob(api: ResearchApi, job: ResearchJob, updates: Record<string, unknown>): Promise<ResearchJob> {
@@ -608,25 +1494,32 @@ async function runSection(input: {
     const sourceId = allowedSources.some((source) => source.id === decision.source_id) ? String(decision.source_id) : allowedSources[0].id;
     const queries = uniqueQueries(decision.queries.length ? decision.queries : [section.title]);
     if (!queries.length) break;
-    const call = await api.callSectionResearchSource({
-      research_id: requiredResearchId(job),
-      section_id: section.id,
-      iteration,
-      source_id: sourceId,
-      queries,
-    });
-    if (call.source_call) {
-      onEvent?.(sourceCallEvent(section, call.source_call));
-      history.push({
+    let stopAfterIteration = false;
+    for (const query of queries) {
+      const call = await api.callSectionResearchSource({
+        research_id: requiredResearchId(job),
+        section_id: section.id,
         iteration,
-        source_id: call.source_call.source_id,
-        source_name: call.source_call.source_name,
-        queries: call.source_call.queries,
-        results_count: call.source_call.results_count,
-        source_calls: call.source_call.calls,
+        source_id: sourceId,
+        queries: [query],
       });
+      if (call.source_call) {
+        onEvent?.(sourceCallEvent(section, call.source_call));
+        history.push({
+          iteration,
+          source_id: call.source_call.source_id,
+          source_name: call.source_call.source_name,
+          queries: call.source_call.queries,
+          results_count: call.source_call.results_count,
+          source_calls: call.source_call.calls,
+        });
+      }
+      if (call.source_call?.error && iteration >= section.max_iterations) {
+        stopAfterIteration = true;
+        break;
+      }
     }
-    if (call.source_call?.error && iteration >= section.max_iterations) break;
+    if (stopAfterIteration) break;
   }
   const selected = await api.selectSectionContext({ research_id: requiredResearchId(job), section_id: section.id });
   onEvent?.({
@@ -769,7 +1662,8 @@ async function generateReportFraming(
 }
 
 function assembleReport(framing: ReportFraming, results: Array<{ markdown: string }>): string {
-  return [`# ${framing.title || "Research Report"}`, framing.introduction, ...results.map((result) => result.markdown), "## Conclusion", framing.conclusion]
+  const conclusionHeading = conclusionHeadingFor(framing, results);
+  return [`# ${framing.title || "Research Report"}`, framing.introduction, ...results.map((result) => result.markdown), `## ${conclusionHeading}`, framing.conclusion]
     .map((part) => part.trim())
     .filter(Boolean)
     .join("\n\n");
@@ -877,6 +1771,18 @@ function uniqueQueries(queries: unknown): string[] {
 
 function sortedUnique(items: string[]): string[] {
   return Array.from(new Set(items.filter(Boolean))).sort();
+}
+
+function mergeSourceUrlsPreservingOrder(primary: string[], additions: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of [...primary, ...additions]) {
+    const normalized = String(item || "").trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
 }
 
 function deriveSummary(markdown: string): string {

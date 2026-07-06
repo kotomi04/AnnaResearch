@@ -701,6 +701,165 @@ describe("ReportView", () => {
     expect(screen.getByText("[1]")).toBeTruthy();
     expect(screen.getByText("[2]")).toBeTruthy();
   });
+
+  it("keeps selected report text highlighted while the rewrite panel is open", () => {
+    const t = createTranslator("en");
+    render(
+      <ReportView
+        result={{ report_markdown: "**Anna** has a useful product.", source_urls: [] }}
+        t={t}
+        onSemanticRewritePreview={vi.fn()}
+      />,
+    );
+
+    const walker = document.createTreeWalker(document.querySelector("#report") as HTMLElement, NodeFilter.SHOW_TEXT);
+    const textNodes: Text[] = [];
+    let node = walker.nextNode();
+    while (node) {
+      textNodes.push(node as Text);
+      node = walker.nextNode();
+    }
+    const annaNode = textNodes.find((item) => item.data.includes("Anna"));
+    const productNode = textNodes.find((item) => item.data.includes("has a useful product."));
+    expect(annaNode).toBeTruthy();
+    expect(productNode).toBeTruthy();
+    const range = document.createRange();
+    range.setStart(annaNode as Text, 0);
+    range.setEnd(productNode as Text, (productNode as Text).data.length);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+
+    fireEvent.contextMenu(screen.getByText("Anna"));
+
+    expect(Array.from(document.querySelectorAll(".report-rewrite-highlight")).map((node) => node.textContent).join("")).toBe("Anna has a useful product.");
+  });
+
+  it("keeps multi-paragraph report selections highlighted", () => {
+    const t = createTranslator("en");
+    render(
+      <ReportView
+        result={{
+          report_markdown:
+            "Soul texture: Foo is silky [6].\n\nVisual close-up: It looks dense and hot [6].\n\nShop to visit: A classic store [4].",
+          source_urls: [],
+        }}
+        t={t}
+        onSemanticRewritePreview={vi.fn()}
+      />,
+    );
+
+    const walker = document.createTreeWalker(document.querySelector("#report") as HTMLElement, NodeFilter.SHOW_TEXT);
+    const textNodes: Text[] = [];
+    let node = walker.nextNode();
+    while (node) {
+      textNodes.push(node as Text);
+      node = walker.nextNode();
+    }
+    const firstNode = textNodes.find((item) => item.data.includes("Soul texture"));
+    const lastNode = textNodes.find((item) => item.data.includes("Shop to visit"));
+    expect(firstNode).toBeTruthy();
+    expect(lastNode).toBeTruthy();
+    const range = document.createRange();
+    range.setStart(firstNode as Text, 0);
+    range.setEnd(lastNode as Text, (lastNode as Text).data.length);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+
+    fireEvent.contextMenu(screen.getByText("Soul texture: Foo is silky [6]."));
+
+    const highlightedText = Array.from(document.querySelectorAll(".report-rewrite-highlight")).map((item) => item.textContent).join("\n");
+    expect(highlightedText).toContain("Soul texture: Foo is silky [6].");
+    expect(highlightedText).toContain("Visual close-up: It looks dense and hot [6].");
+    expect(highlightedText).toContain("Shop to visit: A classic store [4].");
+  });
+
+  it("lets users edit report markdown and save explicitly", async () => {
+    const t = createTranslator("en");
+    const save = vi.fn(async () => {});
+    render(
+      <ReportView
+        result={{ report_markdown: "# Done\n\nOriginal report.", source_urls: [] }}
+        t={t}
+        onManualReportSave={save}
+      />,
+    );
+
+    expect(save).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Edit Report" }));
+    const editor = screen.getByLabelText("Report Markdown editor");
+    fireEvent.change(editor, { target: { value: "# Done\n\nManual edit." } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    await waitFor(() => expect(save).toHaveBeenCalledWith({ reportMarkdown: "# Done\n\nManual edit." }));
+  });
+
+  it("shows relevant sources returned with a rewrite proposal", async () => {
+    const t = createTranslator("en");
+    const preview = vi.fn(async () => ({
+      proposalId: "proposal-1",
+      originalText: "Anna has a useful product [1].",
+      rewrittenText: "Anna has a sharper product wedge [1].",
+      references: [{ number: 1, url: "https://example.com/a", scope: "selected" as const }],
+    }));
+    render(
+      <ReportView
+        result={{ report_markdown: "Anna has a useful product [1].", source_urls: ["https://example.com/a"] }}
+        t={t}
+        onSemanticRewritePreview={preview}
+      />,
+    );
+    const textNode = screen.getByText("Anna has a useful product [1].").firstChild as Text;
+    const range = document.createRange();
+    range.setStart(textNode, 0);
+    range.setEnd(textNode, textNode.data.length);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+
+    fireEvent.contextMenu(screen.getByText("Anna has a useful product [1]."));
+    fireEvent.click(screen.getByRole("button", { name: "Revise" }));
+    fireEvent.change(screen.getByLabelText("Comment"), { target: { value: "make it sharper" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("Relevant sources")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "[1] https://example.com/a" })).toBeTruthy();
+  });
+
+  it("can request fresh research before creating a rewrite proposal", async () => {
+    const t = createTranslator("en");
+    const preview = vi.fn(async () => ({
+      proposalId: "proposal-1",
+      originalText: "Anna has a useful product.",
+      rewrittenText: "Anna has a better evidenced product wedge.",
+      references: [{ number: 2, url: "https://example.com/fresh", scope: "fresh" as const }],
+    }));
+    render(
+      <ReportView
+        result={{ report_markdown: "Anna has a useful product.", source_urls: ["https://example.com/a"] }}
+        t={t}
+        onSemanticRewritePreview={preview}
+      />,
+    );
+    const textNode = screen.getByText("Anna has a useful product.").firstChild as Text;
+    const range = document.createRange();
+    range.setStart(textNode, 0);
+    range.setEnd(textNode, textNode.data.length);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+
+    fireEvent.contextMenu(screen.getByText("Anna has a useful product."));
+    fireEvent.click(screen.getByRole("button", { name: "Revise" }));
+    fireEvent.change(screen.getByLabelText("Comment"), { target: { value: "find more evidence" } });
+    fireEvent.click(screen.getByRole("button", { name: "Research then revise" }));
+
+    await waitFor(() =>
+      expect(preview).toHaveBeenCalledWith({
+        selectedText: "Anna has a useful product.",
+        instruction: "find more evidence",
+        refreshResearch: true,
+      }),
+    );
+  });
 });
 
 describe("ReportDisplayPage", () => {

@@ -118,6 +118,19 @@ export function App() {
     }
   }, [research.roleCandidates.length, selectedRoleIndex]);
 
+  useEffect(() => {
+    if (research.job?.confirmed_focuses?.length && research.focusCandidates.length) {
+      setSelectedFocusIds(research.focusCandidates.map((focus) => focus.id));
+    }
+  }, [research.focusCandidates, research.job?.confirmed_focuses]);
+
+  useEffect(() => {
+    if (!research.job?.query) return;
+    const parsed = parseResearchQuery(research.job.query);
+    setBriefNameDraft(parsed.briefName);
+    setResearchNeedDraft(parsed.researchNeed);
+  }, [research.job?.research_id, research.job?.query]);
+
   function start(input: { briefName: string; researchNeed: string }) {
     setValidationMessage("");
     setSelectedRoleIndex(0);
@@ -192,6 +205,10 @@ export function App() {
   function startGeneration() {
     setRegenInstruction("");
     setRequestedStep("generate");
+    if (canResumeResearchJob(research.job)) {
+      void research.resumeResearchJob();
+      return;
+    }
     void research.confirmOutlineAndRun(research.outlineDraft);
   }
 
@@ -210,6 +227,8 @@ export function App() {
 
   function showNewResearch() {
     setValidationMessage("");
+    setBriefNameDraft("");
+    setResearchNeedDraft("");
     setSelectedRoleIndex(0);
     setSelectedFocusIds([]);
     setRegenInstruction("");
@@ -237,6 +256,10 @@ export function App() {
       return;
     }
     if (research.job?.research_id) {
+      if (canResumeResearchJob(research.job)) {
+        setRequestedStep("generate");
+        void research.resumeResearchJob();
+      }
       setAppPage("workflow");
     }
   }
@@ -246,6 +269,9 @@ export function App() {
     const selected = await research.openResearchJob(researchId);
     if (selected?.status === "completed" && selected.result) {
       setRequestedStep("report");
+    } else if (canResumeResearchJob(selected)) {
+      setRequestedStep("generate");
+      void research.resumeResearchJob(researchId).catch((err) => setValidationMessage(localizedError(err, t)));
     } else {
       setRequestedStep("need");
     }
@@ -480,8 +506,14 @@ export function App() {
                   result={sourceResult}
                   events={research.runEvents}
                   previews={research.sectionPreviews}
+                  isBusy={research.isBusy}
                   t={t}
                   onNewResearch={showNewResearch}
+                  onSemanticRewrite={research.semanticRewriteSelection}
+                  onSemanticRewritePreview={research.previewSemanticRewriteSelection}
+                  onApplySemanticRewrite={research.applySemanticRewriteProposal}
+                  onDiscardSemanticRewrite={research.discardSemanticRewriteProposal}
+                  onManualReportSave={research.saveManualReportMarkdown}
                 />
               )}
             </div>
@@ -511,6 +543,15 @@ export function formatResearchQuery(input: { briefName: string; researchNeed: st
   ].join("\n");
 }
 
+export function parseResearchQuery(query: string): { briefName: string; researchNeed: string } {
+  const text = String(query || "").trim();
+  const zh = /^研究主题：([\s\S]*?)\n\s*\n研究具体内容：\n?([\s\S]*)$/u.exec(text);
+  if (zh) return { briefName: zh[1].trim(), researchNeed: zh[2].trim() };
+  const en = /^Research topic: ([\s\S]*?)\n\s*\nResearch need:\n?([\s\S]*)$/u.exec(text);
+  if (en) return { briefName: en[1].trim(), researchNeed: en[2].trim() };
+  return { briefName: "", researchNeed: text };
+}
+
 export function makeStepLabel(input: { phase: string; iteration?: number; maxIterations?: number }): string {
   const max = Math.max(1, input.maxIterations || MAX_RESEARCH_ITERATIONS);
   const current = input.phase === "completed"
@@ -528,4 +569,10 @@ export function hasCompletedResearchResult(
   result: unknown,
 ): boolean {
   return job?.status === "completed" && Boolean(result || job.result);
+}
+
+export function canResumeResearchJob(
+  job: { status?: string; confirmed_role?: unknown; confirmed_focuses?: unknown[]; confirmed_outline?: unknown[] } | null | undefined,
+): boolean {
+  return job?.status !== "completed" && Boolean(job?.confirmed_role && job.confirmed_focuses?.length && job.confirmed_outline?.length);
 }

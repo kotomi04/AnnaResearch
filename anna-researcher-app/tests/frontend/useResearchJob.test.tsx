@@ -191,7 +191,26 @@ function makeApi(options: ApiOptions = {}) {
     },
     async saveSectionResult(input) {
       calls.push(["saveSectionResult", input]);
-      return { research_id: input.research_id, status: "running", stage: "section_research", progress: 80 };
+      return {
+        research_id: input.research_id,
+        status: "running",
+        stage: "section_research",
+        progress: 80,
+        section_results: {
+          [input.section_id]: {
+            section_id: input.section_id,
+            status: input.status || "completed",
+            section_markdown: input.section_markdown,
+            section_summary: input.section_summary,
+            source_urls: input.source_urls || [],
+          },
+        },
+      };
+    },
+    async getSectionResult(researchId, sectionId) {
+      calls.push(["getSectionResult", researchId, sectionId]);
+      const sectionResult = options.latestJob?.section_results?.[sectionId];
+      return sectionResult ?? null;
     },
     async failSection(input) {
       calls.push(["failSection", input]);
@@ -505,6 +524,351 @@ describe("useResearchJob (iterative loop)", () => {
     expect(calls.some((call) => Array.isArray(call) && call[0] === "saveSectionResult")).toBe(true);
     expect(calls.some((call) => Array.isArray(call) && call[0] === "saveReportFraming")).toBe(true);
     expect(calls.some((call) => Array.isArray(call) && call[0] === "saveAssembledResearchResult")).toBe(true);
+  });
+
+  it("uses a Chinese conclusion heading for Chinese reports", async () => {
+    const chineseSection = '{"section_markdown":"## 市场\\n\\n福州有明确的本地需求 [1]","section_summary":"本地需求"}';
+    const { api } = makeApi({
+      llmReplies: [
+        ROLE_REPLY,
+        FOCUS_REPLY,
+        OUTLINE_REPLY,
+        ASSIGN_REPLY,
+        '{"type":"finish"}',
+        chineseSection,
+        '{"type":"finish"}',
+        chineseSection,
+        '{"type":"finish"}',
+        chineseSection,
+        '{"type":"finish"}',
+        chineseSection,
+        '{"title":"福州市场备忘录","introduction":"这是一份中文报告。","conclusion":"整体机会清晰。"}',
+      ],
+    });
+    const { result } = renderHook(() => useResearchJob(api));
+
+    await waitFor(() => expect(result.current.phase).toBe("idle"));
+    await planToOutline(result);
+    await act(async () => {
+      await result.current.confirmOutlineAndRun(result.current.outlineDraft);
+    });
+
+    expect(result.current.result?.report_markdown).toContain("## 结论");
+    expect(result.current.result?.report_markdown).not.toContain("## Conclusion");
+  });
+
+  it("semantically rewrites selected report text and reassembles the saved report", async () => {
+    const latestJob = {
+      research_id: "done-1",
+      status: "completed",
+      stage: "completed",
+      progress: 100,
+      query: "Research topic: Anna\n\nResearch need:\nStudy Anna.",
+      confirmed_role: { server: "Analyst", agent_role_prompt: "Use precise evidence." },
+      confirmed_focuses: ["market"],
+      confirmed_outline: [{ id: "section-1", title: "Market", outline: "Cover market.", allowed_source_ids: ["tavily"], max_iterations: 1 }],
+      report_framing: { title: "Done", introduction: "Intro", conclusion: "Conclusion" },
+      section_results: {
+        "section-1": {
+          section_id: "section-1",
+          status: "completed",
+          section_markdown: "## Market\n\nAnna has a useful product [1].",
+          section_summary: "Anna product",
+          source_urls: ["https://example.com/a"],
+        },
+      },
+      result: {
+        report_markdown: "# Done\n\nIntro\n\n## Market\n\nAnna has a useful product [1].\n\n## Conclusion\n\nConclusion",
+        source_urls: ["https://example.com/a"],
+      },
+    };
+    const { api, calls, llmCalls } = makeApi({
+      latestJob,
+      llmReplies: ['{"rewritten_text":"Anna reads as a more investor-relevant product wedge [1]."}'],
+    });
+    const { result } = renderHook(() => useResearchJob(api));
+
+    await waitFor(() => expect(result.current.phase).toBe("completed"));
+    await act(async () => {
+      await result.current.semanticRewriteSelection({
+        selectedText: "Anna has a useful product [1].",
+        instruction: "改成投资人视角",
+      });
+    });
+
+    expect(llmCalls).toHaveLength(1);
+    expect(JSON.stringify(llmCalls[0])).toContain("Do not introduce new facts");
+    const sectionSave = calls.find((call) => Array.isArray(call) && call[0] === "saveSectionResult") as unknown[];
+    expect(sectionSave[1]).toMatchObject({
+      section_id: "section-1",
+      section_markdown: "## Market\n\nAnna reads as a more investor-relevant product wedge [1].",
+    });
+    const assembledSave = calls.find((call) => Array.isArray(call) && call[0] === "saveAssembledResearchResult") as unknown[];
+    expect(assembledSave[1]).toMatchObject({ source_urls: ["https://example.com/a"] });
+    expect(JSON.stringify(assembledSave[1])).toContain("Anna reads as a more investor-relevant product wedge [1].");
+    expect(result.current.result?.report_markdown).toContain("Anna reads as a more investor-relevant product wedge [1].");
+  });
+
+  it("saves a manual report markdown edit and syncs framing plus section results", async () => {
+    const latestJob = {
+      research_id: "done-1",
+      status: "completed",
+      stage: "completed",
+      progress: 100,
+      query: "Research topic: Anna\n\nResearch need:\nStudy Anna.",
+      confirmed_outline: [{ id: "section-1", title: "Market", outline: "Cover market.", allowed_source_ids: ["tavily"], max_iterations: 1 }],
+      report_framing: { title: "Done", introduction: "Original intro.", conclusion: "Original conclusion." },
+      section_results: {
+        "section-1": {
+          section_id: "section-1",
+          status: "completed",
+          section_markdown: "## Market\n\nOriginal report [1].",
+          section_summary: "Original report",
+          source_urls: ["https://example.com/a"],
+        },
+      },
+      result: {
+        report_markdown: "# Done\n\nOriginal intro.\n\n## Market\n\nOriginal report [1].\n\n## 结论\n\nOriginal conclusion.",
+        source_urls: ["https://example.com/a"],
+      },
+    };
+    const { api, calls } = makeApi({ latestJob });
+    const { result } = renderHook(() => useResearchJob(api));
+
+    await waitFor(() => expect(result.current.phase).toBe("completed"));
+    await act(async () => {
+      await result.current.saveManualReportMarkdown({
+        reportMarkdown: "# Better Done\n\nManual intro.\n\n## Market\n\nManual edit [1].\n\n## 结论\n\nManual conclusion.",
+      });
+    });
+
+    const framingSave = calls.find((call) => Array.isArray(call) && call[0] === "saveReportFraming") as unknown[];
+    expect(framingSave[1]).toMatchObject({
+      framing: {
+        title: "Better Done",
+        introduction: "Manual intro.",
+        conclusion: "Manual conclusion.",
+      },
+    });
+    const sectionSave = calls.find((call) => Array.isArray(call) && call[0] === "saveSectionResult") as unknown[];
+    expect(sectionSave[1]).toMatchObject({
+      section_id: "section-1",
+      section_markdown: "## Market\n\nManual edit [1].",
+      source_urls: ["https://example.com/a"],
+    });
+    const assembledSave = calls.find((call) => Array.isArray(call) && call[0] === "saveAssembledResearchResult") as unknown[];
+    expect(assembledSave[1]).toMatchObject({
+      report_markdown: "# Better Done\n\nManual intro.\n\n## Market\n\nManual edit [1].\n\n## 结论\n\nManual conclusion.",
+      source_urls: ["https://example.com/a"],
+    });
+    expect(result.current.result?.report_markdown).toBe("# Better Done\n\nManual intro.\n\n## Market\n\nManual edit [1].\n\n## 结论\n\nManual conclusion.");
+  });
+
+  it("previews a semantic rewrite before applying it", async () => {
+    const latestJob = {
+      research_id: "done-1",
+      status: "completed",
+      stage: "completed",
+      progress: 100,
+      query: "Research topic: Anna\n\nResearch need:\nStudy Anna.",
+      confirmed_role: { server: "Analyst", agent_role_prompt: "Use precise evidence." },
+      confirmed_focuses: ["market"],
+      confirmed_outline: [{ id: "section-1", title: "Market", outline: "Cover market.", allowed_source_ids: ["tavily"], max_iterations: 1 }],
+      report_framing: { title: "Done", introduction: "Intro", conclusion: "Conclusion" },
+      section_results: {
+        "section-1": {
+          section_id: "section-1",
+          status: "completed",
+          section_markdown: "## Market\n\nAnna has a useful product [1].",
+          section_summary: "Anna product",
+          source_urls: ["https://example.com/a"],
+        },
+      },
+      result: {
+        report_markdown: "# Done\n\nIntro\n\n## Market\n\nAnna has a useful product [1].\n\n## Conclusion\n\nConclusion",
+        source_urls: ["https://example.com/a"],
+      },
+    };
+    const { api, calls, llmCalls } = makeApi({
+      latestJob,
+      llmReplies: ['{"rewritten_text":"Anna reads as a more investor-relevant product wedge [1]."}'],
+    });
+    const { result } = renderHook(() => useResearchJob(api));
+
+    await waitFor(() => expect(result.current.phase).toBe("completed"));
+    let proposalId = "";
+    await act(async () => {
+      const proposal = await result.current.previewSemanticRewriteSelection({
+        selectedText: "Anna has a useful product [1].",
+        instruction: "改成投资人视角",
+      });
+      proposalId = proposal.proposalId || "";
+      expect(proposal.rewrittenText).toBe("Anna reads as a more investor-relevant product wedge [1].");
+      expect(proposal.references).toEqual([{ number: 1, url: "https://example.com/a", scope: "selected" }]);
+    });
+
+    expect(proposalId).toBeTruthy();
+    expect(JSON.stringify(llmCalls[0])).toContain("[1] https://example.com/a (selected)");
+    expect(calls.some((call) => Array.isArray(call) && call[0] === "saveSectionResult")).toBe(false);
+    expect(result.current.result?.report_markdown).toContain("Anna has a useful product [1].");
+
+    await act(async () => {
+      await result.current.applySemanticRewriteProposal(proposalId);
+    });
+
+    expect(calls.some((call) => Array.isArray(call) && call[0] === "saveSectionResult")).toBe(true);
+    expect(result.current.result?.report_markdown).toContain("Anna reads as a more investor-relevant product wedge [1].");
+  });
+
+  it("semantically rewrites report introduction and reassembles the saved report", async () => {
+    const latestJob = {
+      research_id: "done-1",
+      status: "completed",
+      stage: "completed",
+      progress: 100,
+      query: "Research topic: Anna\n\nResearch need:\nStudy Anna.",
+      confirmed_role: { server: "Analyst", agent_role_prompt: "Use precise evidence." },
+      confirmed_focuses: ["market"],
+      confirmed_outline: [{ id: "section-1", title: "Market", outline: "Cover market.", allowed_source_ids: ["tavily"], max_iterations: 1 }],
+      report_framing: { title: "Done", introduction: "Anna has an early product wedge.", conclusion: "Conclusion" },
+      section_results: {
+        "section-1": {
+          section_id: "section-1",
+          status: "completed",
+          section_markdown: "## Market\n\nAnna has a useful product [1].",
+          section_summary: "Anna product",
+          source_urls: ["https://example.com/a"],
+        },
+      },
+      result: {
+        report_markdown: "# Done\n\nAnna has an early product wedge.\n\n## Market\n\nAnna has a useful product [1].\n\n## Conclusion\n\nConclusion",
+        source_urls: ["https://example.com/a"],
+      },
+    };
+    const { api, calls } = makeApi({
+      latestJob,
+      llmReplies: ['{"rewritten_text":"Anna already shows an investor-relevant early product wedge."}'],
+    });
+    const { result } = renderHook(() => useResearchJob(api));
+
+    await waitFor(() => expect(result.current.phase).toBe("completed"));
+    await act(async () => {
+      await result.current.semanticRewriteSelection({
+        selectedText: "Anna has an early product wedge.",
+        instruction: "改成投资人视角",
+      });
+    });
+
+    const framingSave = calls.find((call) => Array.isArray(call) && call[0] === "saveReportFraming") as unknown[];
+    expect(framingSave[1]).toMatchObject({
+      framing: {
+        title: "Done",
+        introduction: "Anna already shows an investor-relevant early product wedge.",
+        conclusion: "Conclusion",
+      },
+    });
+    expect(calls.some((call) => Array.isArray(call) && call[0] === "saveSectionResult")).toBe(false);
+    const assembledSave = calls.find((call) => Array.isArray(call) && call[0] === "saveAssembledResearchResult") as unknown[];
+    expect(JSON.stringify(assembledSave[1])).toContain("Anna already shows an investor-relevant early product wedge.");
+    expect(result.current.result?.report_markdown).toContain("Anna already shows an investor-relevant early product wedge.");
+  });
+
+  it("semantically rewrites report title and reassembles the saved report", async () => {
+    const latestJob = {
+      research_id: "done-1",
+      status: "completed",
+      stage: "completed",
+      progress: 100,
+      query: "Research topic: Anna\n\nResearch need:\nStudy Anna.",
+      confirmed_role: { server: "Analyst", agent_role_prompt: "Use precise evidence." },
+      confirmed_focuses: ["market"],
+      confirmed_outline: [{ id: "section-1", title: "Market", outline: "Cover market.", allowed_source_ids: ["tavily"], max_iterations: 1 }],
+      report_framing: { title: "Done", introduction: "Intro", conclusion: "Conclusion" },
+      section_results: {
+        "section-1": {
+          section_id: "section-1",
+          status: "completed",
+          section_markdown: "## Market\n\nAnna has a useful product [1].",
+          section_summary: "Anna product",
+          source_urls: ["https://example.com/a"],
+        },
+      },
+      result: {
+        report_markdown: "# Done\n\nIntro\n\n## Market\n\nAnna has a useful product [1].\n\n## Conclusion\n\nConclusion",
+        source_urls: ["https://example.com/a"],
+      },
+    };
+    const { api, calls } = makeApi({
+      latestJob,
+      llmReplies: ['{"rewritten_text":"Anna Market Memo"}'],
+    });
+    const { result } = renderHook(() => useResearchJob(api));
+
+    await waitFor(() => expect(result.current.phase).toBe("completed"));
+    await act(async () => {
+      await result.current.semanticRewriteSelection({
+        selectedText: "Done",
+        instruction: "改成更清晰的标题",
+      });
+    });
+
+    const framingSave = calls.find((call) => Array.isArray(call) && call[0] === "saveReportFraming") as unknown[];
+    expect(framingSave[1]).toMatchObject({
+      framing: {
+        title: "Anna Market Memo",
+        introduction: "Intro",
+        conclusion: "Conclusion",
+      },
+    });
+    expect(result.current.result?.report_markdown).toContain("# Anna Market Memo");
+  });
+
+  it("semantically rewrites report conclusion and reassembles the saved report", async () => {
+    const latestJob = {
+      research_id: "done-1",
+      status: "completed",
+      stage: "completed",
+      progress: 100,
+      query: "Research topic: Anna\n\nResearch need:\nStudy Anna.",
+      confirmed_role: { server: "Analyst", agent_role_prompt: "Use precise evidence." },
+      confirmed_focuses: ["market"],
+      confirmed_outline: [{ id: "section-1", title: "Market", outline: "Cover market.", allowed_source_ids: ["tavily"], max_iterations: 1 }],
+      report_framing: { title: "Done", introduction: "Intro", conclusion: "Anna should keep building with evidence [1]." },
+      section_results: {
+        "section-1": {
+          section_id: "section-1",
+          status: "completed",
+          section_markdown: "## Market\n\nAnna has a useful product [1].",
+          section_summary: "Anna product",
+          source_urls: ["https://example.com/a"],
+        },
+      },
+      result: {
+        report_markdown: "# Done\n\nIntro\n\n## Market\n\nAnna has a useful product [1].\n\n## Conclusion\n\nAnna should keep building with evidence [1].",
+        source_urls: ["https://example.com/a"],
+      },
+    };
+    const { api, calls } = makeApi({
+      latestJob,
+      llmReplies: ['{"rewritten_text":"Anna should keep compounding the wedge where evidence is strongest [1]."}'],
+    });
+    const { result } = renderHook(() => useResearchJob(api));
+
+    await waitFor(() => expect(result.current.phase).toBe("completed"));
+    await act(async () => {
+      await result.current.semanticRewriteSelection({
+        selectedText: "Anna should keep building with evidence [1].",
+        instruction: "更像结论洞察",
+      });
+    });
+
+    const framingSave = calls.find((call) => Array.isArray(call) && call[0] === "saveReportFraming") as unknown[];
+    expect(framingSave[1]).toMatchObject({
+      framing: {
+        conclusion: "Anna should keep compounding the wedge where evidence is strongest [1].",
+      },
+    });
+    expect(result.current.result?.report_markdown).toContain("Anna should keep compounding the wedge where evidence is strongest [1].");
   });
 
   it("uses a section-level allowed non-default source when the decision picks it", async () => {

@@ -46,6 +46,61 @@ describe("guided workflow projection", () => {
     expect(projected.availableSteps).toEqual(["report"]);
   });
 
+  it("allows completed sectioned jobs to revisit outline and generation pages", () => {
+    const job = {
+      research_id: "done-1",
+      status: "completed" as const,
+      confirmed_role: { server: "Analyst", agent_role_prompt: "Use sources." },
+      confirmed_focuses: ["market"],
+      confirmed_outline: [{ id: "section-1", title: "One", outline: "Cover one.", allowed_source_ids: ["duckduckgo"], max_iterations: 5 }],
+      result: { report_markdown: "# Done" },
+    };
+    const report = projectGuidedStep({
+      phase: "completed",
+      canStart: true,
+      job,
+      result: { report_markdown: "# Done" },
+    });
+    expect(report.current).toBe("report");
+    expect(report.availableSteps).toEqual(["need", "role", "focus", "outline", "generate", "report"]);
+
+    const role = projectGuidedStep({
+      requestedStep: "role",
+      phase: "completed",
+      canStart: true,
+      job,
+      result: { report_markdown: "# Done" },
+    });
+    expect(role.current).toBe("role");
+
+    const focus = projectGuidedStep({
+      requestedStep: "focus",
+      phase: "completed",
+      canStart: true,
+      job,
+      result: { report_markdown: "# Done" },
+    });
+    expect(focus.current).toBe("focus");
+
+    const outline = projectGuidedStep({
+      requestedStep: "outline",
+      phase: "completed",
+      canStart: true,
+      job,
+      result: { report_markdown: "# Done" },
+    });
+    expect(outline.current).toBe("outline");
+
+    const generate = projectGuidedStep({
+      requestedStep: "generate",
+      phase: "completed",
+      canStart: true,
+      job,
+      result: { report_markdown: "# Done" },
+    });
+    expect(generate.current).toBe("generate");
+  });
+
   it("allows opening the last completed report from a new idle draft", () => {
     const projected = projectGuidedStep({
       requestedStep: "report",

@@ -273,6 +273,55 @@ describe("AnnaResearchApi", () => {
     }
   });
 
+  it("opens an inline completed job when transfer URLs are unavailable", async () => {
+    const anna: AnnaRuntimeApi = {
+      tools: {
+        async invoke(request) {
+          expect(request).toEqual({ tool_id: TOOL_ID, method: "app_get_research_job", args: { research_id: "r1" } });
+          return {
+            success: true,
+            data: {
+              job: {
+                research_id: "r1",
+                status: "completed",
+                confirmed_outline: [],
+                result: { research_id: "r1", report_markdown: "# Inline", source_urls: ["https://example.com"] },
+                job_transfer: { method: "GET", url: "http://127.0.0.1:43123/jobs/r1", content_type: "application/json" },
+                result_transfer: { method: "GET", url: "http://127.0.0.1:43123/research-results/r1", content_type: "application/json" },
+              },
+            },
+          };
+        },
+      },
+      llm: {
+        async complete() {
+          return { content: { type: "text", text: "{}" } };
+        },
+      },
+    };
+    const oldFetch = globalThis.fetch;
+    const oldWarn = console.warn;
+    const warnings: unknown[] = [];
+    globalThis.fetch = (async () => {
+      throw new TypeError("Failed to fetch");
+    }) as typeof fetch;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args);
+    };
+
+    try {
+      const api = new AnnaResearchApi(anna);
+      const job = await api.getResearchJob("r1");
+
+      expect(job?.research_id).toBe("r1");
+      expect(job?.result?.report_markdown).toBe("# Inline");
+      expect(warnings.length).toBeGreaterThan(0);
+    } finally {
+      globalThis.fetch = oldFetch;
+      console.warn = oldWarn;
+    }
+  });
+
   it("keeps section and assembled large payloads out of tool invoke arguments", async () => {
     const calls: unknown[] = [];
     const anna: AnnaRuntimeApi = {

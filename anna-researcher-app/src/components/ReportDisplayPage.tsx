@@ -9,11 +9,29 @@ interface Props {
   result: ResearchResult | null;
   events: RunEvent[];
   previews: SectionPreview[];
+  isBusy?: boolean;
   t(key: MessageKey, params?: Record<string, string | number | undefined>): string;
   onNewResearch(): void;
+  onSemanticRewrite?(input: { selectedText: string; instruction: string }): Promise<unknown>;
+  onSemanticRewritePreview?(input: { selectedText: string; instruction: string }): Promise<{ proposalId?: string; originalText?: string; rewrittenText: string }>;
+  onApplySemanticRewrite?(proposalId: string): Promise<unknown>;
+  onDiscardSemanticRewrite?(proposalId: string): void;
+  onManualReportSave?(input: { reportMarkdown: string }): Promise<unknown>;
 }
 
-export function ReportDisplayPage({ result, events, previews, t, onNewResearch }: Props) {
+export function ReportDisplayPage({
+  result,
+  events,
+  previews,
+  isBusy = false,
+  t,
+  onNewResearch,
+  onSemanticRewrite,
+  onSemanticRewritePreview,
+  onApplySemanticRewrite,
+  onDiscardSemanticRewrite,
+  onManualReportSave,
+}: Props) {
   const markdown = result?.report_markdown || "";
   const [exportStatus, setExportStatus] = useState("");
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
@@ -64,7 +82,16 @@ export function ReportDisplayPage({ result, events, previews, t, onNewResearch }
           {exportStatus ? <span className="export-status">{exportStatus}</span> : null}
         </div>
       </header>
-      <ReportView result={result} t={t} />
+      <ReportView
+        result={result}
+        isBusy={isBusy}
+        t={t}
+        onSemanticRewrite={onSemanticRewrite}
+        onSemanticRewritePreview={onSemanticRewritePreview}
+        onApplySemanticRewrite={onApplySemanticRewrite}
+        onDiscardSemanticRewrite={onDiscardSemanticRewrite}
+        onManualReportSave={onManualReportSave}
+      />
       <details className="process-summary">
         <summary>{t("processSummaryTitle")}</summary>
         <div className="process-summary-grid">

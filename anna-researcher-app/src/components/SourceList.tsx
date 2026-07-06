@@ -7,7 +7,7 @@ interface Props {
 
 export function SourceList({ urls, t }: Props) {
   return (
-    <aside>
+    <aside className="source-references-panel">
       <h2>{t("sourcesHeading")}</h2>
       {urls.length === 0 ? (
         <p className="source-empty">{t("emptySources")}</p>

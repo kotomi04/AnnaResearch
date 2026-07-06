@@ -1,3 +1,9 @@
+declare global {
+  interface Window {
+    __ANNA_TOOL_IDS__?: Record<string, string>;
+  }
+}
+
 export const TOOL_ID = "tool-xhz-researcher-python-e7k8xa3s";
 
 export type ResearchStatus = "created" | "running" | "completed" | "failed" | "cancelled" | string;
@@ -92,6 +98,7 @@ export interface SourceCallResult {
   source_id: string;
   source_name: string;
   queries: string[];
+  skipped_queries?: string[];
   results_count: number;
   top_titles: string[];
   duration_ms: number;

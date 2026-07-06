@@ -9,6 +9,7 @@ import {
   type ResearchResult,
   type ResearchSourceTestResult,
   type ResearchSourceView,
+  type SectionResult,
   type ResultTransferDescriptor,
   type SearchResult,
   type SourceCallResult,
@@ -91,7 +92,7 @@ export interface ResearchApi {
     source_id: string;
     queries: string[];
   }): Promise<CallSourceResponse>;
-  selectSectionContext(input: { research_id: string; section_id: string }): Promise<ContextResponse>;
+  selectSectionContext(input: { research_id: string; section_id: string; query?: string; search_queries?: string[] }): Promise<ContextResponse>;
   saveSectionResult(input: {
     research_id: string;
     section_id: string;
@@ -101,6 +102,7 @@ export interface ResearchApi {
     status?: string;
     error?: unknown;
   }): Promise<ResearchJob>;
+  getSectionResult(researchId: string, sectionId: string): Promise<SectionResult | null>;
   failSection(input: { research_id: string; section_id: string; error: unknown }): Promise<ResearchJob>;
   saveReportFraming(input: { research_id: string; framing: ReportFraming }): Promise<ResearchJob>;
   saveAssembledResearchResult(input: { research_id: string; report_markdown: string; source_urls?: string[] }): Promise<ResearchJob>;
@@ -185,14 +187,26 @@ export class AnnaResearchApi implements ResearchApi {
     let job = response.job ?? null;
     const resultTransfer = job?.result_transfer;
     if (job?.job_transfer?.url) {
-      const data = await fetchTransfer<JobResponse>(job.job_transfer);
-      job = data.job ? { ...job, ...data.job } : job;
+      try {
+        const data = await fetchTransfer<JobResponse>(job.job_transfer);
+        job = data.job ? { ...job, ...data.job } : job;
+      } catch (err) {
+        console.warn("[anna-researcher] job transfer fetch failed; using inline job payload", err);
+      }
     }
     const transfer = job?.result_transfer ?? resultTransfer;
     if (!transfer) return job;
-    const data = await fetchTransfer<ResultResponse>(transfer);
-    if (!job) return data.result ? { result: data.result } : null;
-    return { ...job, result: data.result ?? job.result };
+    try {
+      const data = await fetchTransfer<ResultResponse>(transfer);
+      if (!job) return data.result ? { result: data.result } : null;
+      return { ...job, result: data.result ?? job.result };
+    } catch (err) {
+      if (job?.result?.report_markdown) {
+        console.warn("[anna-researcher] result transfer fetch failed; using inline result payload", err);
+        return job;
+      }
+      throw err;
+    }
   }
 
   async listResearchJobs(input: { limit?: number } = {}): Promise<ResearchJob[]> {
@@ -231,7 +245,7 @@ export class AnnaResearchApi implements ResearchApi {
     return (await this.call("app_call_section_research_source", input)) as CallSourceResponse;
   }
 
-  async selectSectionContext(input: { research_id: string; section_id: string }): Promise<ContextResponse> {
+  async selectSectionContext(input: { research_id: string; section_id: string; query?: string; search_queries?: string[] }): Promise<ContextResponse> {
     const response = (await this.call("app_select_section_context", input)) as ContextResponse;
     if (!response.context_transfer?.url) return response;
     const context = await fetchTransfer<ContextResponse>(response.context_transfer);
@@ -251,6 +265,18 @@ export class AnnaResearchApi implements ResearchApi {
     if (!response.transfer?.url) throw new Error("Section result save response did not include a transfer URL.");
     const data = await fetchTransfer<ResultResponse & { section_result?: unknown }>(response.transfer, input);
     return requireJob(data);
+  }
+
+  async getSectionResult(researchId: string, sectionId: string): Promise<SectionResult | null> {
+    const response = (await this.call("app_get_research_job", { research_id: researchId })) as JobResponse;
+    if (!response.job?.job_transfer?.url) return null;
+    const url = sectionResultTransferUrl(response.job.job_transfer.url, researchId, sectionId);
+    const data = await fetchTransfer<{ section_result?: SectionResult }>({
+      ...response.job.job_transfer,
+      method: "GET",
+      url,
+    });
+    return data.section_result ?? null;
   }
 
   async failSection(input: { research_id: string; section_id: string; error: unknown }): Promise<ResearchJob> {
@@ -321,6 +347,14 @@ function toolTimeoutMs(method: string, args: Record<string, unknown>): number | 
   return undefined;
 }
 
+function sectionResultTransferUrl(jobTransferUrl: string, researchId: string, sectionId: string): string {
+  const url = new URL(jobTransferUrl);
+  url.pathname = `/section-results/${encodeURIComponent(researchId)}/${encodeURIComponent(sectionId)}`;
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
 async function fetchTransfer<T>(transfer: ResultTransferDescriptor, input?: unknown): Promise<T> {
   const method = transfer.method || (input === undefined ? "GET" : "POST");
   const init: RequestInit = { method };
@@ -361,6 +395,7 @@ export function createStandaloneApi(): ResearchApi {
     callSectionResearchSource: fail,
     selectSectionContext: fail,
     saveSectionResult: fail,
+    getSectionResult: fail,
     failSection: fail,
     saveReportFraming: fail,
     saveAssembledResearchResult: fail,

@@ -50,7 +50,8 @@ def test_job_shell(tmp_path: Path):
     job = created["job"]
     assert_true(job["research_id"].startswith("research_"), "job should have id")
     loaded_status = dispatcher.dispatch("app_get_research_job", {})["job"]
-    assert_true("schema_version" not in loaded_status, "get job stdio latest should be status-only")
+    assert_true(loaded_status["schema_version"] == 2, "get job stdio latest should include compact job for transfer fallback")
+    assert_true(all("raw_results" not in it for it in loaded_status["iterations"]), "compact stdio job should not expose raw_results")
     loaded = get_json(loaded_status["job_transfer"]["url"])["job"]
     assert_true(loaded["research_id"] == job["research_id"], "latest job should load")
     assert_true(loaded["schema_version"] == 2, "loaded job should advertise v2")
@@ -113,8 +114,10 @@ def test_call_research_source_context_result(tmp_path: Path):
     assert_true(saved["result"]["report_markdown"].startswith("# Research Report"), "result should persist")
     assert_true("sources" not in saved["result"], "http result should be compact")
     immediate = dispatcher.dispatch("app_get_research_job", {"research_id": research_id})["job"]
-    assert_true("iterations" not in immediate, "get job stdio response should be status-only")
-    assert_true("source_urls" not in immediate, "get job stdio response should not include source urls")
+    assert_true(immediate["iterations"], "get job stdio response should include compact iterations for fallback")
+    assert_true(all("raw_results" not in it for it in immediate["iterations"]), "get job stdio response should not expose raw_results")
+    assert_true(immediate["source_urls"] == context["source_urls"], "get job stdio response should include source urls for fallback")
+    assert_true(immediate["result"]["report_markdown"].startswith("# Research Report"), "get job stdio response should include inline result fallback")
     assert_true(immediate["job_transfer"]["method"] == "GET", "get job should expose job transfer")
     loaded = get_json(immediate["job_transfer"]["url"])["job"]
     assert_true("report_markdown" not in loaded["result"], "loaded job should not include full result markdown")
@@ -175,6 +178,23 @@ def test_section_large_payload_transfer(tmp_path: Path):
     assert_true("selected_context" not in selected, "section context should not return through stdio")
     section_context = get_json(selected["context_transfer"]["url"])
     assert_true(bool(section_context["selected_context"]), "section context transfer should return context")
+    assert_true(bool(section_context["selected_sources"]), "section context transfer should return selected source metadata")
+    assert_true(
+        all("content" in source for source in section_context["selected_sources"]),
+        "section selected_sources should keep content so selected_context can be rebuilt",
+    )
+    assert_true(
+        all("index" in source and "source_label" in source and "content_chars" in source for source in section_context["selected_sources"]),
+        "section selected_sources should retain rebuild metadata",
+    )
+    loaded_job = dispatcher.jobs.load(research_id)
+    stored_context = loaded_job["section_selected_context"]["section-1"]
+    assert_true("selected_context" not in stored_context, "stored section context should be derived from selected_sources")
+    assert_true(stored_context["selected_context_format"] == "v1", "stored section context should record format")
+    assert_true(
+        all("content" in source for source in stored_context["selected_sources"]),
+        "stored section selected_sources should include content for resume rebuild",
+    )
     assert_true("section_selected_context" not in selected["job"], "section context stdio job should be status-only")
     section_transfer = dispatcher.dispatch("app_save_section_result", {"research_id": research_id, "section_id": "section-1"})["transfer"]
     section_saved = post_json(
@@ -321,7 +341,7 @@ def test_plugin_contract(tmp_path: Path):
         describe = plugin.call("describe")
         tools = [tool["name"] for tool in describe["result"]["tools"]]
         assert_true(describe["result"]["name"] == "tool-test-researcher-12345678", "describe should advertise tool")
-        assert_true(describe["result"]["version"] == "0.2.0", "describe should advertise breaking version")
+        assert_true(describe["result"]["version"] == "0.2.1", "describe should advertise breaking version")
         assert_true("research" not in tools, "legacy research method should be absent")
         assert_true("app_search_web" not in tools, "legacy app_search_web must be removed")
         assert_true("app_call_research_source" in tools, "new app_call_research_source must be advertised")

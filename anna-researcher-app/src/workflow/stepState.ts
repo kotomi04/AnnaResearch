@@ -43,7 +43,7 @@ export function projectGuidedStep(input: StepProjectionInput): StepProjection {
   const locked = isLockedPhase(input.phase) || phaseStep === "generate";
   const completed = completedFor(input, phaseStep);
   const available = availableFor(input, phaseStep, locked);
-  const terminal = phaseStep === "generate" || isTerminalReport(input);
+  const terminal = phaseStep === "generate";
   const requested = !terminal && input.requestedStep && available.includes(input.requestedStep) ? input.requestedStep : undefined;
   const current = requested ?? phaseStep;
   return {
@@ -57,10 +57,6 @@ export function projectGuidedStep(input: StepProjectionInput): StepProjection {
 
 export function stepIndex(step: GuidedStepId): number {
   return guidedSteps.findIndex((item) => item.id === step);
-}
-
-function isTerminalReport(input: StepProjectionInput): boolean {
-  return input.phase === "completed" || input.job?.status === "completed";
 }
 
 function stepForPhase(phase: string, job?: ResearchJob | null, result?: ResearchResult | null): GuidedStepId {
@@ -87,8 +83,21 @@ function completedFor(input: StepProjectionInput, phaseStep: GuidedStepId): Guid
 }
 
 function availableFor(input: StepProjectionInput, phaseStep: GuidedStepId, locked: boolean): GuidedStepId[] {
-  if (phaseStep === "report") return ["report"];
   if (locked) return [phaseStep];
+  if (phaseStep === "report") {
+    const available: GuidedStepId[] = input.job?.research_id ? ["need"] : [];
+    if (input.job?.confirmed_role) {
+      available.push("role");
+    }
+    if ((input.job?.confirmed_focuses || []).length) {
+      available.push("focus");
+    }
+    if ((input.job?.confirmed_outline || []).length) {
+      available.push("outline", "generate");
+    }
+    available.push("report");
+    return available;
+  }
   const available: GuidedStepId[] = ["need"];
   if (input.phase === "role_review" || input.job?.research_id) available.push("role");
   if (input.phase === "focus_review" || input.job?.confirmed_role) available.push("focus");

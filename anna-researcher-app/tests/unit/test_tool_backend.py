@@ -175,6 +175,12 @@ def test_job_store_has_called_dedup_uses_normalized_query(tmp_path):
         source_calls=[{"query": "Anna App", "items": [{"url": "https://x.example", "title": "t"}], "duration_ms": 1}],
         raw_results=[{"query": "Anna App", "url": "https://x.example", "title": "t", "content": "c"}],
     )
+    loaded = jobs.load(research_id)
+    assert "items" not in loaded["iterations"][0]["source_calls"][0]
+    assert loaded["iterations"][0]["source_calls"][0]["results_count"] == 1
+    assert loaded["iterations"][0]["source_calls"][0]["top_titles"] == ["t"]
+    assert loaded["iterations"][0]["raw_results"][0]["url"] == "https://x.example"
+    assert loaded["iterations"][0]["raw_results"][0]["content"] == "c"
     assert jobs.has_called(research_id, "tavily", normalize_query_for_dedup("anna  app")) is True
     assert jobs.has_called(research_id, "tavily", normalize_query_for_dedup("different")) is False
 
@@ -674,7 +680,7 @@ def test_extraction_fetcher_enriches_search_items(monkeypatch):
 
     assert enriched[0]["title"] == "Fetched title"
     assert enriched[0]["raw_content"] == "Full page text"
-    assert enriched[0]["content"] == "Snippet\n\nRelevant excerpts:\nFull page text"
+    assert enriched[0]["content"] == "Snippet"
     assert enriched[0]["extraction_status"] == "success"
     assert enriched[1] == {"url": "https://example.com/b", "content": "Untouched"}
 
@@ -1158,7 +1164,7 @@ def test_call_research_source_uses_native_duckduckgo_without_credential(tmp_path
             ]
         },
         extractor=lambda items, **kwargs: [
-            {**item, "raw_content": "Duck full content", "content": item["content"] + "\n\nFull content:\nDuck full content"}
+            {**item, "raw_content": "Duck full content"}
             for item in items
         ],
     )
@@ -1176,7 +1182,9 @@ def test_call_research_source_uses_native_duckduckgo_without_credential(tmp_path
     loaded = dispatcher.jobs.load(job["research_id"])
     item = loaded["iterations"][0]["raw_results"][0]
     assert item["source_id"] == "duckduckgo"
-    assert item["raw_content"] == "Duck full content"
+    assert item["content"] == "duck snippet"
+    assert item["url_body"] == "Duck full content"
+    assert "raw_content" not in item
     assert loaded["source_urls"] == ["https://duck.example/a"]
 
 
@@ -1278,9 +1286,14 @@ def test_call_section_research_source_uses_native_duckduckgo(tmp_path):
     assert call["source_id"] == "duckduckgo"
     assert call["results_count"] == 1
     loaded = dispatcher.jobs.load(job["research_id"])
+    stored_call = loaded["section_iterations"]["section-1"][0]["source_calls"][0]
+    assert "items" not in stored_call
+    assert stored_call["results_count"] == 1
+    assert stored_call["top_titles"] == ["Section result"]
     item = loaded["section_iterations"]["section-1"][0]["raw_results"][0]
     assert item["source_name"] == "DuckDuckGo"
     assert item["url"] == "https://duck.example/section"
+    assert item["content"] == "section snippet"
 
 
 def test_call_section_research_source_skips_duplicate_query(tmp_path):
