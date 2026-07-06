@@ -2,7 +2,7 @@ import { Fragment, cloneElement, isValidElement, useEffect, useRef, useState } f
 import type { ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { MessageKey } from "../i18n/messages";
-import type { ResearchResult } from "../types";
+import type { ResearchResult, SearchResult } from "../types";
 import { SourceList } from "./SourceList";
 
 interface Props {
@@ -35,6 +35,7 @@ export function ReportView({
 }: Props) {
   const markdown = result?.report_markdown || "";
   const sourceUrls = result?.source_urls || [];
+  const sourceItems = result?.sources || [];
   const reportRef = useRef<HTMLElement | null>(null);
   const [selectedText, setSelectedText] = useState("");
   const [instruction, setInstruction] = useState("");
@@ -47,13 +48,64 @@ export function ReportView({
   const [manualDraft, setManualDraft] = useState(markdown);
   const [manualStatus, setManualStatus] = useState("");
   const [manualError, setManualError] = useState("");
+  const [citationCard, setCitationCard] = useState<CitationCardState | null>(null);
+  const citationHideTimer = useRef<number | null>(null);
   const canRewrite = Boolean(markdown && (onSemanticRewritePreview || onSemanticRewrite));
   const canManualEdit = Boolean(markdown && onManualReportSave);
-  const markdownComponents = selectedText ? highlightedMarkdownComponents(selectedText) : undefined;
+  const markdownComponents = reportMarkdownComponents({
+    selectedText,
+    sourceUrls,
+    onShowCitation: showCitationCard,
+    onHideCitation: scheduleHideCitation,
+  });
 
   useEffect(() => {
     if (!editing) setManualDraft(markdown);
   }, [editing, markdown]);
+
+  useEffect(() => {
+    setCitationCard(null);
+  }, [markdown]);
+
+  useEffect(() => {
+    if (!citationCard) return;
+    const updateCitationPosition = () => {
+      setCitationCard((current) => (current ? { ...current, ...positionCitationCard(current.anchor) } : current));
+    };
+    window.addEventListener("scroll", updateCitationPosition, true);
+    window.addEventListener("resize", updateCitationPosition);
+    return () => {
+      window.removeEventListener("scroll", updateCitationPosition, true);
+      window.removeEventListener("resize", updateCitationPosition);
+    };
+  }, [citationCard]);
+
+  function clearCitationHideTimer() {
+    if (citationHideTimer.current !== null) {
+      window.clearTimeout(citationHideTimer.current);
+      citationHideTimer.current = null;
+    }
+  }
+
+  function scheduleHideCitation() {
+    clearCitationHideTimer();
+    citationHideTimer.current = window.setTimeout(() => setCitationCard(null), 140);
+  }
+
+  function showCitationCard(numbers: number[], activeNumber: number, anchor: HTMLElement) {
+    clearCitationHideTimer();
+    const validNumbers = numbers.filter((number) => sourceUrls[number - 1]);
+    const fallbackNumbers = sourceUrls[activeNumber - 1] ? [activeNumber] : [];
+    const nextNumbers = validNumbers.length ? validNumbers : fallbackNumbers;
+    if (!nextNumbers.length) return;
+    const activeIndex = Math.max(0, nextNumbers.indexOf(activeNumber));
+    setCitationCard({
+      numbers: nextNumbers,
+      activeIndex,
+      anchor,
+      ...positionCitationCard(anchor),
+    });
+  }
 
   function captureSelection(event: React.MouseEvent) {
     if (!canRewrite) return;
@@ -206,6 +258,25 @@ export function ReportView({
           </article>
         )}
       </div>
+      {citationCard ? (
+        <CitationCard
+          state={citationCard}
+          sourceUrls={sourceUrls}
+          sourceItems={sourceItems}
+          onMouseEnter={clearCitationHideTimer}
+          onMouseLeave={scheduleHideCitation}
+          onNavigate={(direction) =>
+            setCitationCard((current) =>
+              current
+                ? {
+                    ...current,
+                    activeIndex: (current.activeIndex + direction + current.numbers.length) % current.numbers.length,
+                  }
+                : current,
+            )
+          }
+        />
+      ) : null}
       {contextMenu ? (
         <div className="report-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }}>
           <button type="button" onClick={openRewritePanel}>{t("rewriteContextMenu")}</button>
@@ -288,23 +359,242 @@ export function ReportView({
             ) : null}
           </section>
         ) : null}
-        <SourceList urls={sourceUrls} t={t} />
+        <SourceList urls={sourceUrls} sources={sourceItems} t={t} />
       </div>
     </section>
   );
 }
 
-function highlightedMarkdownComponents(selectedText: string): Parameters<typeof ReactMarkdown>[0]["components"] {
-  const text = selectedText.trim();
+interface CitationCardState {
+  numbers: number[];
+  activeIndex: number;
+  anchor: HTMLElement;
+  x: number;
+  y: number;
+  placement: "above" | "below";
+}
+
+function CitationCard({
+  state,
+  sourceUrls,
+  sourceItems,
+  onMouseEnter,
+  onMouseLeave,
+  onNavigate,
+}: {
+  state: CitationCardState;
+  sourceUrls: string[];
+  sourceItems: SearchResult[];
+  onMouseEnter(): void;
+  onMouseLeave(): void;
+  onNavigate(direction: -1 | 1): void;
+}) {
+  const number = state.numbers[state.activeIndex] || state.numbers[0];
+  const url = sourceUrls[number - 1] || "";
+  const source = sourceForUrl(sourceItems, url);
+  const host = hostFromUrl(url);
+  const title = source?.title || url;
+  const snippet = source?.content ? compactSnippet(source.content) : "";
+  const icon = source?.icon || "";
+  const showIcon = Boolean(icon);
+  const fallbackInitial = (host || title || url || "S").trim().charAt(0).toUpperCase() || "S";
+
+  return (
+    <aside
+      className={`citation-card ${state.placement === "above" ? "above" : "below"}`}
+      style={{ left: state.x, top: state.y }}
+      aria-label={`Reference ${number}`}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
+    >
+      <div className="citation-card-nav">
+        <div className="citation-card-switchers">
+          <button type="button" className="citation-card-arrow" onClick={() => onNavigate(-1)} disabled={state.numbers.length <= 1} aria-label="Previous reference">
+            ←
+          </button>
+          <button type="button" className="citation-card-arrow" onClick={() => onNavigate(1)} disabled={state.numbers.length <= 1} aria-label="Next reference">
+            →
+          </button>
+        </div>
+        <span className="citation-card-count">{state.activeIndex + 1}/{state.numbers.length}</span>
+        <span className="citation-card-source-count">{state.numbers.length} 个来源</span>
+      </div>
+      <a className="citation-card-body" href={url} target="_blank" rel="noreferrer noopener">
+        <span className="citation-card-host">
+          {showIcon ? <img className="citation-card-icon" src={icon} alt="" aria-hidden="true" /> : <span className="citation-card-site-mark" aria-hidden="true">{fallbackInitial}</span>}
+          {host || "Source"}
+        </span>
+        <strong>{title}</strong>
+        {snippet ? <span className="citation-card-snippet">{snippet}</span> : null}
+      </a>
+    </aside>
+  );
+}
+
+function positionCitationCard(anchor: HTMLElement): Pick<CitationCardState, "x" | "y" | "placement"> {
+  const rect = anchor.getBoundingClientRect();
+  const gap = 8;
+  const cardWidth = Math.min(360, Math.max(280, window.innerWidth - 24));
+  const cardHeight = 160;
+  const maxX = Math.max(12, window.innerWidth - cardWidth - 12);
+  const centeredX = rect.left + rect.width / 2 - cardWidth / 2;
+  const placement = rect.bottom + gap + cardHeight <= window.innerHeight || rect.top < cardHeight + gap ? "below" : "above";
+  const rawY = placement === "below" ? rect.bottom + gap : rect.top - cardHeight - gap;
+  const maxY = Math.max(12, window.innerHeight - cardHeight - 12);
   return {
-    p: ({ children }) => <p>{highlightReactText(children, text)}</p>,
-    li: ({ children }) => <li>{highlightReactText(children, text)}</li>,
-    h1: ({ children }) => <h1>{highlightReactText(children, text)}</h1>,
-    h2: ({ children }) => <h2>{highlightReactText(children, text)}</h2>,
-    h3: ({ children }) => <h3>{highlightReactText(children, text)}</h3>,
-    h4: ({ children }) => <h4>{highlightReactText(children, text)}</h4>,
-    blockquote: ({ children }) => <blockquote>{highlightReactText(children, text)}</blockquote>,
+    x: Math.min(Math.max(12, centeredX), maxX),
+    y: Math.min(Math.max(12, rawY), maxY),
+    placement,
   };
+}
+
+function reportMarkdownComponents({
+  selectedText,
+  sourceUrls,
+  onShowCitation,
+  onHideCitation,
+}: {
+  selectedText: string;
+  sourceUrls: string[];
+  onShowCitation(numbers: number[], activeNumber: number, anchor: HTMLElement): void;
+  onHideCitation(): void;
+}): Parameters<typeof ReactMarkdown>[0]["components"] {
+  const text = selectedText.trim();
+  const wrap = (tag: "p" | "li" | "h1" | "h2" | "h3" | "h4" | "blockquote", children: ReactNode) => {
+    const blockText = textContentOf(children);
+    const cited = renderCitationButtons(children, blockText, sourceUrls, onShowCitation, onHideCitation);
+    const content = text ? highlightReactText(cited, text) : cited;
+    const Tag = tag;
+    return <Tag>{content}</Tag>;
+  };
+  return {
+    p: ({ children }) => wrap("p", children),
+    li: ({ children }) => wrap("li", children),
+    h1: ({ children }) => wrap("h1", children),
+    h2: ({ children }) => wrap("h2", children),
+    h3: ({ children }) => wrap("h3", children),
+    h4: ({ children }) => wrap("h4", children),
+    blockquote: ({ children }) => wrap("blockquote", children),
+  };
+}
+
+function renderCitationButtons(
+  children: ReactNode,
+  blockText: string,
+  sourceUrls: string[],
+  onShowCitation: (numbers: number[], activeNumber: number, anchor: HTMLElement) => void,
+  onHideCitation: () => void,
+  cursor: { current: number } = { current: 0 },
+): ReactNode {
+  if (typeof children === "string") return renderCitationString(children, blockText, sourceUrls, onShowCitation, onHideCitation, cursor);
+  if (typeof children === "number") return renderCitationString(String(children), blockText, sourceUrls, onShowCitation, onHideCitation, cursor);
+  if (Array.isArray(children)) {
+    return children.map((child, index) => (
+      <Fragment key={index}>{renderCitationButtons(child, blockText, sourceUrls, onShowCitation, onHideCitation, cursor)}</Fragment>
+    ));
+  }
+  if (isValidElement<{ children?: ReactNode }>(children)) {
+    const props = children.props;
+    return cloneElement(children, {
+      children: renderCitationButtons(props.children, blockText, sourceUrls, onShowCitation, onHideCitation, cursor),
+    });
+  }
+  return children;
+}
+
+function renderCitationString(
+  text: string,
+  blockText: string,
+  sourceUrls: string[],
+  onShowCitation: (numbers: number[], activeNumber: number, anchor: HTMLElement) => void,
+  onHideCitation: () => void,
+  cursor: { current: number },
+): ReactNode {
+  const parts: ReactNode[] = [];
+  const regex = /\[(\d+)\]/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(text))) {
+    const number = Number(match[1]);
+    const absoluteIndex = cursor.current + match.index;
+    if (match.index > lastIndex) parts.push(text.slice(lastIndex, match.index));
+    if (sourceUrls[number - 1]) {
+      const sentenceNumbers = citationNumbersForSentence(blockText, absoluteIndex).filter((candidate) => sourceUrls[candidate - 1]);
+      parts.push(
+        <button
+          key={`${cursor.current}-${match.index}-${number}`}
+          type="button"
+          className="citation-chip"
+          onMouseEnter={(event) => onShowCitation(sentenceNumbers.length ? sentenceNumbers : [number], number, event.currentTarget)}
+          onMouseLeave={onHideCitation}
+          onFocus={(event) => onShowCitation(sentenceNumbers.length ? sentenceNumbers : [number], number, event.currentTarget)}
+          onBlur={onHideCitation}
+          title={sourceUrls[number - 1]}
+        >
+          [{number}]
+        </button>,
+      );
+    } else {
+      parts.push(match[0]);
+    }
+    lastIndex = match.index + match[0].length;
+  }
+  if (!parts.length) {
+    cursor.current += text.length;
+    return text;
+  }
+  if (lastIndex < text.length) parts.push(text.slice(lastIndex));
+  cursor.current += text.length;
+  return <>{parts}</>;
+}
+
+function citationNumbersForSentence(blockText: string, citationIndex: number): number[] {
+  const start = Math.max(
+    blockText.lastIndexOf("。", citationIndex - 1),
+    blockText.lastIndexOf("！", citationIndex - 1),
+    blockText.lastIndexOf("？", citationIndex - 1),
+    blockText.lastIndexOf(".", citationIndex - 1),
+    blockText.lastIndexOf("!", citationIndex - 1),
+    blockText.lastIndexOf("?", citationIndex - 1),
+    blockText.lastIndexOf("\n", citationIndex - 1),
+  ) + 1;
+  const after = blockText.slice(citationIndex);
+  const nextPunctuation = after.search(/[。！？.!?\n]/);
+  const end = nextPunctuation >= 0 ? citationIndex + nextPunctuation + 1 : blockText.length;
+  return uniqueNumbers(Array.from(blockText.slice(start, end).matchAll(/\[(\d+)\]/g)).map((match) => Number(match[1])));
+}
+
+function uniqueNumbers(numbers: number[]): number[] {
+  return Array.from(new Set(numbers.filter((number) => Number.isFinite(number) && number > 0)));
+}
+
+function hostFromUrl(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
+}
+
+function sourceForUrl(sources: SearchResult[], url: string): SearchResult | null {
+  const normalized = normalizeUrlForMatch(url);
+  return sources.find((source) => normalizeUrlForMatch(source.url) === normalized) || null;
+}
+
+function normalizeUrlForMatch(url: string): string {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = "";
+    parsed.pathname = parsed.pathname.replace(/\/$/, "") || "/";
+    return parsed.toString();
+  } catch {
+    return String(url || "").trim().replace(/\/$/, "");
+  }
+}
+
+function compactSnippet(text: string): string {
+  const clean = String(text || "").replace(/\s+/g, " ").trim();
+  return clean.length > 260 ? `${clean.slice(0, 259).trim()}…` : clean;
 }
 
 function highlightReactText(children: ReactNode, selectedText: string): ReactNode {

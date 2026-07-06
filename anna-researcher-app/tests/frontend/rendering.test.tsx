@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { formatResearchQuery, hasCompletedResearchResult, makeIntroStepLabel, makeStepLabel } from "../../src/App";
 import { useState } from "react";
@@ -47,6 +47,21 @@ function ControlledResearchForm(props: Omit<Parameters<typeof ResearchForm>[0], 
       onResearchNeedChange={setResearchNeed}
     />
   );
+}
+
+function reportTextNodes(): Text[] {
+  const walker = document.createTreeWalker(document.querySelector("#report") as HTMLElement, NodeFilter.SHOW_TEXT);
+  const textNodes: Text[] = [];
+  let node = walker.nextNode();
+  while (node) {
+    textNodes.push(node as Text);
+    node = walker.nextNode();
+  }
+  return textNodes;
+}
+
+function normalizeWhitespace(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }
 
 describe("locale preference UI behavior", () => {
@@ -702,6 +717,49 @@ describe("ReportView", () => {
     expect(screen.getByText("[2]")).toBeTruthy();
   });
 
+  it("previews a citation card on hover and switches between references from the same sentence", () => {
+    const t = createTranslator("en");
+    render(
+      <ReportView
+        result={{
+          report_markdown: "A supported claim uses two sources [1][2].",
+          source_urls: ["https://weekly.chinacdc.cn/en/article/pdf/preview/1", "https://example.com/second"],
+          sources: [
+            {
+              url: "https://weekly.chinacdc.cn/en/article/pdf/preview/1",
+              title: "China CDC weekly",
+              content: "A concise evidence snippet from the selected source context.",
+              icon: "https://weekly.chinacdc.cn/icon.png",
+            },
+            {
+              url: "https://example.com/second",
+              title: "Second source",
+              content: "Another supporting snippet.",
+            },
+          ],
+        }}
+        t={t}
+      />,
+    );
+
+    const referenceButtons = screen.getAllByRole("button", { name: /\[\d+\]/ });
+    fireEvent.mouseEnter(referenceButtons[0]);
+
+    const card = document.querySelector(".citation-card") as HTMLElement;
+    expect(within(card).getByText("weekly.chinacdc.cn")).toBeTruthy();
+    expect(within(card).getByText("China CDC weekly")).toBeTruthy();
+    expect(within(card).getByText("A concise evidence snippet from the selected source context.")).toBeTruthy();
+    const icon = card.querySelector(".citation-card-icon") as HTMLImageElement;
+    expect(icon.getAttribute("src")).toBe("https://weekly.chinacdc.cn/icon.png");
+
+    fireEvent.click(within(card).getByRole("button", { name: "Next reference" }));
+    const nextCard = document.querySelector(".citation-card") as HTMLElement;
+    expect(nextCard.getAttribute("aria-label")).toBe("Reference 2");
+    expect(within(nextCard).getByText("example.com")).toBeTruthy();
+    expect(within(nextCard).getByText("Second source")).toBeTruthy();
+    expect(within(nextCard).getByText("E")).toBeTruthy();
+  });
+
   it("keeps selected report text highlighted while the rewrite panel is open", () => {
     const t = createTranslator("en");
     render(
@@ -760,15 +818,16 @@ describe("ReportView", () => {
     const lastNode = textNodes.find((item) => item.data.includes("Shop to visit"));
     expect(firstNode).toBeTruthy();
     expect(lastNode).toBeTruthy();
+    const finalNode = textNodes[textNodes.length - 1];
     const range = document.createRange();
     range.setStart(firstNode as Text, 0);
-    range.setEnd(lastNode as Text, (lastNode as Text).data.length);
+    range.setEnd(finalNode, finalNode.data.length);
     window.getSelection()?.removeAllRanges();
     window.getSelection()?.addRange(range);
 
     fireEvent.contextMenu(screen.getByText("Soul texture: Foo is silky [6]."));
 
-    const highlightedText = Array.from(document.querySelectorAll(".report-rewrite-highlight")).map((item) => item.textContent).join("\n");
+    const highlightedText = normalizeWhitespace(Array.from(document.querySelectorAll(".report-rewrite-highlight")).map((item) => item.textContent).join(""));
     expect(highlightedText).toContain("Soul texture: Foo is silky [6].");
     expect(highlightedText).toContain("Visual close-up: It looks dense and hot [6].");
     expect(highlightedText).toContain("Shop to visit: A classic store [4].");
@@ -809,14 +868,16 @@ describe("ReportView", () => {
         onSemanticRewritePreview={preview}
       />,
     );
-    const textNode = screen.getByText("Anna has a useful product [1].").firstChild as Text;
+    const textNodes = reportTextNodes();
+    const textNode = textNodes.find((node) => node.data.includes("Anna has a useful product")) as Text;
+    const endNode = textNodes[textNodes.length - 1];
     const range = document.createRange();
     range.setStart(textNode, 0);
-    range.setEnd(textNode, textNode.data.length);
+    range.setEnd(endNode, endNode.data.length);
     window.getSelection()?.removeAllRanges();
     window.getSelection()?.addRange(range);
 
-    fireEvent.contextMenu(screen.getByText("Anna has a useful product [1]."));
+    fireEvent.contextMenu(document.querySelector("#report p") as HTMLElement);
     fireEvent.click(screen.getByRole("button", { name: "Revise" }));
     fireEvent.change(screen.getByLabelText("Comment"), { target: { value: "make it sharper" } });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));

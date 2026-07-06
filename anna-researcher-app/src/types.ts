@@ -31,6 +31,7 @@ export interface SearchResult {
   url: string;
   title?: string;
   content?: string;
+  icon?: string;
   score?: number;
   source_id?: string;
   source_name?: string;

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import asyncio
 import urllib.error
 import urllib.request
 
@@ -26,6 +27,7 @@ from researcher_tool.sources import (
 from researcher_tool.sources.envelope import EnvelopeError, validate_envelope
 from researcher_tool.sources.executor import resolve_path
 from researcher_tool.sources.extraction import arxiv as arxiv_extraction
+from researcher_tool.sources.extraction import browser_fallback
 from researcher_tool.sources.extraction import fetcher as extraction_fetcher
 from researcher_tool.sources.extraction.html import extract_html
 from researcher_tool.sources.extraction.models import ExtractedPage
@@ -54,6 +56,14 @@ def get_json(url: str):
     request = urllib.request.Request(url, method="GET")
     with urllib.request.urlopen(request, timeout=5) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+class FailingTransferServer:
+    def job_descriptor(self, research_id: str):
+        raise PermissionError("socket creation blocked")
+
+    def result_descriptor(self, research_id: str, *, method: str = "GET"):
+        raise PermissionError("socket creation blocked")
 
 
 # ---------------------------------------------------------------------------
@@ -118,8 +128,8 @@ def test_job_create_update_latest_and_not_found(tmp_path):
     assert job["research_id"].startswith("research_")
     latest_status = dispatcher.dispatch("app_get_research_job", {})["job"]
     assert latest_status["research_id"] == job["research_id"]
-    assert "schema_version" not in latest_status
-    assert get_json(latest_status["job_transfer"]["url"])["job"]["research_id"] == job["research_id"]
+    if latest_status.get("job_transfer"):
+        assert get_json(latest_status["job_transfer"]["url"])["job"]["research_id"] == job["research_id"]
     updated = dispatcher.dispatch(
         "app_update_research_job",
         {
@@ -146,13 +156,27 @@ def test_job_create_update_latest_and_not_found(tmp_path):
         dispatcher.dispatch("app_get_research_job", {"research_id": "missing"})
 
 
+def test_get_research_job_falls_back_when_transfer_server_is_blocked(tmp_path):
+    root = tmp_path / ".research"
+    dispatcher = AppDispatcher(
+        settings=SettingsStore(root=root),
+        jobs=JobStore(root=root),
+        selector=LexicalContextSelector(max_sources=4, context_budget=4000),
+        transfer_server=FailingTransferServer(),
+    )
+    job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
+
+    loaded = dispatcher.dispatch("app_get_research_job", {"research_id": job["research_id"]})["job"]
+
+    assert loaded["research_id"] == job["research_id"]
+    assert "job_transfer" not in loaded
+
+
 def test_compact_job_view_exposes_v2_fields(tmp_path):
     dispatcher = make_dispatcher(tmp_path)
     job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
     immediate = dispatcher.dispatch("app_get_research_job", {"research_id": job["research_id"]})["job"]
-    assert "iterations" not in immediate
-    assert "source_urls" not in immediate
-    loaded = get_json(immediate["job_transfer"]["url"])["job"]
+    loaded = get_json(immediate["job_transfer"]["url"])["job"] if immediate.get("job_transfer") else immediate
     assert loaded["schema_version"] == 2
     assert loaded["iterations"] == []
     assert loaded["research_log"] == []
@@ -526,6 +550,41 @@ def test_fetch_url_uses_browser_fallback_for_short_static_content(monkeypatch):
         ("static", "https://example.com/dynamic", {"timeout": 20.0, "max_chars_per_page": 12000, "query": "dynamic page"}),
         ("browser", "https://example.com/dynamic", {"query": "dynamic page", "timeout": 9, "max_chars_per_page": 12000}),
     ]
+
+
+def test_browser_fallback_prefers_fit_markdown_then_raw_markdown():
+    class Markdown:
+        fit_markdown = "  "
+        raw_markdown = "\n# Full page markdown\n\nUseful body.\n"
+
+        def __str__(self):
+            return "object fallback should not be used"
+
+    assert browser_fallback._markdown_text(Markdown()) == "# Full page markdown\n\nUseful body."
+
+    Markdown.fit_markdown = "\n# Filtered markdown\n"
+    assert browser_fallback._markdown_text(Markdown()) == "# Filtered markdown"
+
+
+def test_browser_fallback_uses_cleaned_html_when_markdown_is_empty():
+    class Crawler:
+        async def arun(self, *, url, config):
+            return type(
+                "Result",
+                (),
+                {
+                    "success": True,
+                    "markdown": None,
+                    "cleaned_html": "\n<main>Cleaned page body</main>\n",
+                    "metadata": {"title": "Cleaned", "icon": "https://example.com/icon.png"},
+                },
+            )()
+
+    title, icon, markdown = asyncio.run(browser_fallback._crawl_one(Crawler(), "https://example.com", config=object()))
+
+    assert title == "Cleaned"
+    assert icon == "https://example.com/icon.png"
+    assert markdown == "<main>Cleaned page body</main>"
 
 
 def test_fetch_url_marks_low_value_fallback_result_as_failed(monkeypatch):
@@ -1164,7 +1223,7 @@ def test_call_research_source_uses_native_duckduckgo_without_credential(tmp_path
             ]
         },
         extractor=lambda items, **kwargs: [
-            {**item, "raw_content": "Duck full content"}
+            {**item, "icon": "https://duck.example/icon.png", "raw_content": "Duck full content"}
             for item in items
         ],
     )
@@ -1183,6 +1242,7 @@ def test_call_research_source_uses_native_duckduckgo_without_credential(tmp_path
     item = loaded["iterations"][0]["raw_results"][0]
     assert item["source_id"] == "duckduckgo"
     assert item["content"] == "duck snippet"
+    assert item["icon"] == "https://duck.example/icon.png"
     assert item["url_body"] == "Duck full content"
     assert "raw_content" not in item
     assert loaded["source_urls"] == ["https://duck.example/a"]

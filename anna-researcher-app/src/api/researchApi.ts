@@ -187,14 +187,24 @@ export class AnnaResearchApi implements ResearchApi {
     let job = response.job ?? null;
     const resultTransfer = job?.result_transfer;
     if (job?.job_transfer?.url) {
-      const data = await fetchTransfer<JobResponse>(job.job_transfer);
-      job = data.job ? { ...job, ...data.job } : job;
+      try {
+        const data = await fetchTransfer<JobResponse>(job.job_transfer);
+        job = data.job ? { ...job, ...data.job } : job;
+      } catch (err) {
+        console.warn("Research job transfer failed; using inline job.", err);
+        // Inline compact job is enough to open the task; local transfer may be blocked.
+      }
     }
     const transfer = job?.result_transfer ?? resultTransfer;
     if (!transfer) return job;
-    const data = await fetchTransfer<ResultResponse>(transfer);
-    if (!job) return data.result ? { result: data.result } : null;
-    return { ...job, result: data.result ?? job.result };
+    try {
+      const data = await fetchTransfer<ResultResponse>(transfer);
+      if (!job) return data.result ? { result: data.result } : null;
+      return { ...job, result: data.result ?? job.result };
+    } catch (err) {
+      console.warn("Research result transfer failed; using inline result.", err);
+      return job;
+    }
   }
 
   async listResearchJobs(input: { limit?: number } = {}): Promise<ResearchJob[]> {
@@ -256,7 +266,7 @@ export class AnnaResearchApi implements ResearchApi {
   }
 
   async getSectionResult(researchId: string, sectionId: string): Promise<SectionResult | null> {
-    const response = (await this.call("app_get_research_job", { research_id: researchId })) as JobResponse;
+    const response = (await this.call("app_get_research_job", { research_id: researchId, with_transfer: true })) as JobResponse;
     if (!response.job?.job_transfer?.url) return null;
     const url = sectionResultTransferUrl(response.job.job_transfer.url, researchId, sectionId);
     const data = await fetchTransfer<{ section_result?: SectionResult }>({
