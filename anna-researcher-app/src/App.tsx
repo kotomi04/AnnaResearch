@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { connectAnnaRuntime } from "./api/annaRuntime";
+import { uploadResearchFilesToAps } from "./api/apsFiles";
 import { AnnaResearchApi, createStandaloneApi, type ResearchApi } from "./api/researchApi";
 import { DraftGenerationPage } from "./components/DraftGenerationPage";
+import { FileUploadDemoPage } from "./components/FileUploadDemoPage";
 import { FocusReviewPage } from "./components/FocusReviewPage";
 import { LanguageToggle } from "./components/LanguageToggle";
 import { OutlineReviewPage } from "./components/OutlineReviewPage";
@@ -21,15 +23,16 @@ import { MAX_RESEARCH_ITERATIONS, useResearchJob } from "./hooks/useResearchJob"
 import type { FocusCandidate, RoleCandidate } from "./hooks/useResearchJob";
 import { localizedError, localizedJobMessage } from "./i18n/status";
 import { useLocale } from "./i18n/useLocale";
-import type { ReportSection } from "./types";
+import type { AnnaRuntimeApi, ReportSection } from "./types";
 import { summarizePlan } from "./workflow/planSummary";
 import { projectGuidedStep, type GuidedStepId } from "./workflow/stepState";
 
-type AppPage = "task-picker" | "workflow" | "library" | "sources" | "source-detail" | "source-new";
+type AppPage = "task-picker" | "workflow" | "library" | "sources" | "source-detail" | "source-new" | "file-upload-demo";
 
 export function App() {
   const { locale, setLocale, t } = useLocale();
   const [api, setApi] = useState<ResearchApi>(() => createStandaloneApi());
+  const [annaRuntime, setAnnaRuntime] = useState<AnnaRuntimeApi | null>(null);
   const [runtimeError, setRuntimeError] = useState<unknown>(null);
   const [validationMessage, setValidationMessage] = useState("");
   const [appPage, setAppPage] = useState<AppPage>("task-picker");
@@ -37,6 +40,7 @@ export function App() {
   const [selectedSourceId, setSelectedSourceId] = useState("");
   const [briefNameDraft, setBriefNameDraft] = useState("");
   const [researchNeedDraft, setResearchNeedDraft] = useState("");
+  const [pendingAttachments, setPendingAttachments] = useState<File[]>([]);
   const [selectedRoleIndex, setSelectedRoleIndex] = useState(0);
   const [selectedFocusIds, setSelectedFocusIds] = useState<string[]>([]);
   const [regenInstruction, setRegenInstruction] = useState("");
@@ -49,12 +53,14 @@ export function App() {
         const anna = await connectAnnaRuntime();
         if (!cancelled) {
           setRuntimeError(null);
+          setAnnaRuntime(anna);
           setApi(new AnnaResearchApi(anna));
         }
       } catch (err) {
         console.warn("[anna-researcher] standalone mode:", err instanceof Error ? err.message : err);
         if (!cancelled) {
           setRuntimeError(err);
+          setAnnaRuntime(null);
           setApi(createStandaloneApi());
         }
       }
@@ -72,6 +78,7 @@ export function App() {
   }, [requestedStep, research.lastCompletedResult, research.result]);
   const projectionJob = requestedStep === "report" && !research.job ? research.lastCompletedJob : research.job;
   const hasCompletedResult = hasCompletedResearchResult(research.lastCompletedJob ?? research.job, research.lastCompletedResult ?? sourceResult);
+  const mostRecentJob = research.historyJobs[0] ?? research.job;
   const projection = projectGuidedStep({
     requestedStep,
     phase: research.phase,
@@ -137,7 +144,20 @@ export function App() {
     setSelectedFocusIds([]);
     setRegenInstruction("");
     setRequestedStep("role");
-    void research.start(formatResearchQuery(input, locale));
+    const attachments = pendingAttachments;
+    void research.start(formatResearchQuery(input, locale), {
+      onJobCreated: async (createdJob) => {
+        if (!attachments.length) return;
+        if (!createdJob.research_id) throw new Error("Research job is missing research_id.");
+        const uploaded = await uploadResearchFilesToAps({
+          filesApi: annaRuntime?.files,
+          researchId: createdJob.research_id,
+          files: attachments,
+        });
+        await api.updateResearchJob(createdJob.research_id, { attachments: uploaded });
+        setPendingAttachments((current) => current.filter((file) => !attachments.includes(file)));
+      },
+    });
   }
 
   function updateRoleCandidate(index: number, patch: Partial<RoleCandidate>) {
@@ -225,10 +245,16 @@ export function App() {
     setAppPage("library");
   }
 
+  function showFileUploadDemo() {
+    setValidationMessage("");
+    setAppPage("file-upload-demo");
+  }
+
   function showNewResearch() {
     setValidationMessage("");
     setBriefNameDraft("");
     setResearchNeedDraft("");
+    setPendingAttachments([]);
     setSelectedRoleIndex(0);
     setSelectedFocusIds([]);
     setRegenInstruction("");
@@ -250,16 +276,13 @@ export function App() {
 
   function continueLatestTask() {
     setValidationMessage("");
-    if (hasCompletedResult) {
-      setRequestedStep("report");
-      setAppPage("workflow");
+    const recentId = mostRecentJob?.research_id;
+    if (recentId) {
+      void openHistoryTask(recentId).catch((err) => setValidationMessage(localizedError(err, t)));
       return;
     }
-    if (research.job?.research_id) {
-      if (canResumeResearchJob(research.job)) {
-        setRequestedStep("generate");
-        void research.resumeResearchJob();
-      }
+    if (hasCompletedResult) {
+      setRequestedStep("report");
       setAppPage("workflow");
     }
   }
@@ -321,6 +344,9 @@ export function App() {
             <button type="button" className="secondary source-button" onClick={showLibrary} disabled={research.isBusy}>
               {t("libraryButton")}
             </button>
+            <button type="button" className="secondary source-button" onClick={showFileUploadDemo}>
+              文件
+            </button>
             {projection.canOpenSources ? (
               <button type="button" className="secondary source-button" onClick={showSources} data-testid="open-source-panel">
                 {t("sourcesButton")}
@@ -333,8 +359,7 @@ export function App() {
           {appPage === "task-picker" ? (
             <TaskPickerPage
               jobs={research.historyJobs}
-              latestJob={research.lastCompletedJob ?? research.job}
-              canContinue={hasCompletedResult || Boolean(research.job?.research_id)}
+              canContinue={Boolean(mostRecentJob?.research_id) || hasCompletedResult}
               isBusy={research.isBusy}
               message={alertMessage}
               workspacePath={research.settings?.research_root}
@@ -395,6 +420,8 @@ export function App() {
               onBack={() => setAppPage("sources")}
               onAddSource={addSource}
             />
+          ) : appPage === "file-upload-demo" ? (
+            <FileUploadDemoPage filesApi={annaRuntime?.files ?? null} onBack={() => setAppPage("workflow")} />
           ) : (
             <div className="workflow-pages">
               <WorkflowStepper
@@ -432,6 +459,7 @@ export function App() {
                   canStart={research.canStart}
                   briefName={briefNameDraft}
                   researchNeed={researchNeedDraft}
+                  attachments={pendingAttachments}
                   t={t}
                   stepLabel={makeIntroStepLabel(research.job?.max_iterations)}
                   validationMessage={alertMessage}
@@ -439,6 +467,8 @@ export function App() {
                   onOpenLibrary={showLibrary}
                   onBriefNameChange={setBriefNameDraft}
                   onResearchNeedChange={setResearchNeedDraft}
+                  onAttachmentAdd={(files) => setPendingAttachments((current) => [...current, ...files])}
+                  onAttachmentRemove={(index) => setPendingAttachments((current) => current.filter((_, idx) => idx !== index))}
                   onShowLastResult={() => setRequestedStep("report")}
                   onStart={start}
                   onValidationError={setValidationMessage}

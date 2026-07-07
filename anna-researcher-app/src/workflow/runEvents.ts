@@ -106,14 +106,15 @@ export function projectStoredRunEvents(job: ResearchJob | null | undefined): Run
     }
     const context = job.section_selected_context?.[section.id];
     if (context) {
+      const sourceCount = context.source_count ?? context.source_urls?.length ?? 0;
       events.push({
         id: `${section.id}-context`,
         kind: "context_selected",
         sectionId: section.id,
         sectionTitle: section.title,
         title: titleFor("context_selected"),
-        detail: `${context.source_urls.length} sources selected`,
-        count: context.source_urls.length,
+        detail: `${sourceCount} sources selected`,
+        count: sourceCount,
       });
     }
     const result = job.section_results?.[section.id];

@@ -3,7 +3,6 @@ import type { ResearchJob } from "../types";
 
 interface Props {
   jobs: ResearchJob[];
-  latestJob: ResearchJob | null;
   canContinue: boolean;
   isBusy: boolean;
   message: string;
@@ -17,7 +16,6 @@ interface Props {
 
 export function TaskPickerPage({
   jobs,
-  latestJob,
   canContinue,
   isBusy,
   message,

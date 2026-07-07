@@ -1,3 +1,4 @@
+import { useRef } from "react";
 import type { MessageKey } from "../i18n/messages";
 
 interface Props {
@@ -5,6 +6,7 @@ interface Props {
   canStart: boolean;
   briefName: string;
   researchNeed: string;
+  attachments?: File[];
   t(key: MessageKey): string;
   stepLabel: string;
   validationMessage: string;
@@ -12,6 +14,8 @@ interface Props {
   onOpenLibrary(): void;
   onBriefNameChange(value: string): void;
   onResearchNeedChange(value: string): void;
+  onAttachmentAdd?(files: File[]): void;
+  onAttachmentRemove?(index: number): void;
   onShowLastResult(): void;
   onStart(input: { briefName: string; researchNeed: string }): void;
   onValidationError(message: string): void;
@@ -22,6 +26,7 @@ export function ResearchForm({
   canStart,
   briefName,
   researchNeed,
+  attachments = [],
   t,
   stepLabel,
   validationMessage,
@@ -29,10 +34,14 @@ export function ResearchForm({
   onOpenLibrary,
   onBriefNameChange,
   onResearchNeedChange,
+  onAttachmentAdd,
+  onAttachmentRemove,
   onShowLastResult,
   onStart,
   onValidationError,
 }: Props) {
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
   function submit() {
     const trimmedNeed = researchNeed.trim();
     if (!trimmedNeed) {
@@ -40,6 +49,12 @@ export function ResearchForm({
       return;
     }
     onStart({ briefName: briefName.trim(), researchNeed: trimmedNeed });
+  }
+
+  function selectFiles(files: FileList | null) {
+    const next = Array.from(files || []);
+    if (next.length) onAttachmentAdd?.(next);
+    if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
   return (
@@ -73,17 +88,55 @@ export function ResearchForm({
       </div>
       <div className="field-stack">
         <label htmlFor="research-need-input">{t("researchNeedLabel")}</label>
-        <textarea
-          id="research-need-input"
-          rows={5}
-          placeholder={t("researchNeedPlaceholder")}
-          value={researchNeed}
-          onChange={(event) => onResearchNeedChange(event.target.value)}
-        />
+        <div className="research-need-box">
+          <textarea
+            id="research-need-input"
+            rows={5}
+            placeholder={t("researchNeedPlaceholder")}
+            value={researchNeed}
+            onChange={(event) => onResearchNeedChange(event.target.value)}
+          />
+          <button
+            type="button"
+            className="attachment-add-button"
+            aria-label={t("attachmentAdd")}
+            title={t("attachmentAdd")}
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isBusy}
+          >
+            +
+          </button>
+          <input
+            ref={fileInputRef}
+            className="visually-hidden"
+            type="file"
+            multiple
+            onChange={(event) => selectFiles(event.target.files)}
+          />
+        </div>
+        {attachments.length ? (
+          <div className="attachment-list" aria-label={t("attachmentList")}>
+            {attachments.map((file, index) => (
+              <span className="attachment-chip" key={`${file.name}-${file.size}-${file.lastModified}-${index}`}>
+                <span>{file.name}</span>
+                <small>{formatFileSize(file.size)}</small>
+                <button type="button" aria-label={t("attachmentRemove")} onClick={() => onAttachmentRemove?.(index)} disabled={isBusy}>
+                  x
+                </button>
+              </span>
+            ))}
+          </div>
+        ) : null}
         <p className="helper-text">{t("researchHelperText")}</p>
       </div>
       {validationMessage ? <p className="form-hint" data-error="true">{validationMessage}</p> : null}
       {!canStart ? <p className="form-hint" data-error="true">{t("settingsMissing")}</p> : null}
     </section>
   );
+}
+
+function formatFileSize(size: number): string {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
 }

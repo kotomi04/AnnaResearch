@@ -10,6 +10,7 @@ interface ApiOptions {
   configured?: boolean;
   llmReplies?: LlmReply[];
   callOverrides?: Array<Partial<SourceCallResult>>;
+  selectedSectionContext?: { selected_context: string; source_urls: string[] };
   sources?: ResearchSourceView[];
   latestJob?: Awaited<ReturnType<ResearchApi["getResearchJob"]>>;
   historyJobs?: Awaited<ReturnType<ResearchApi["listResearchJobs"]>>;
@@ -182,11 +183,12 @@ function makeApi(options: ApiOptions = {}) {
     },
     async selectSectionContext(input) {
       calls.push(["selectSectionContext", input]);
+      const selected = options.selectedSectionContext;
       return {
         job: { research_id: input.research_id, status: "running", stage: "select_context", progress: 88 },
-        selected_context: `FULL CONTEXT ${input.section_id}`,
+        selected_context: selected?.selected_context ?? `FULL CONTEXT ${input.section_id}`,
         selected_sources: [],
-        source_urls: [`https://example.com/${input.section_id}`],
+        source_urls: selected?.source_urls ?? [`https://example.com/${input.section_id}`],
       };
     },
     async saveSectionResult(input) {
@@ -607,6 +609,243 @@ describe("useResearchJob (iterative loop)", () => {
     expect(assembledSave[1]).toMatchObject({ source_urls: ["https://example.com/a"] });
     expect(JSON.stringify(assembledSave[1])).toContain("Anna reads as a more investor-relevant product wedge [1].");
     expect(result.current.result?.report_markdown).toContain("Anna reads as a more investor-relevant product wedge [1].");
+  });
+
+  it("keeps only actually cited fresh references when re-search rewrite is applied", async () => {
+    const latestJob = {
+      research_id: "done-1",
+      status: "completed",
+      stage: "completed",
+      progress: 100,
+      query: "Research topic: Anna\n\nResearch need:\nStudy Anna.",
+      confirmed_role: { server: "Analyst", agent_role_prompt: "Use precise evidence." },
+      confirmed_focuses: ["market"],
+      confirmed_outline: [{ id: "section-1", title: "Market", outline: "Cover market.", allowed_source_ids: ["tavily"], max_iterations: 1 }],
+      report_framing: { title: "Done", introduction: "Intro", conclusion: "Conclusion" },
+      section_results: {
+        "section-1": {
+          section_id: "section-1",
+          status: "completed",
+          section_markdown: "## Market\n\nAnna has a useful product [1].",
+          section_summary: "Anna product",
+          source_urls: ["https://example.com/a"],
+        },
+      },
+      result: {
+        report_markdown: "# Done\n\nIntro\n\n## Market\n\nAnna has a useful product [1].\n\n## Conclusion\n\nConclusion",
+        source_urls: ["https://example.com/a"],
+      },
+    };
+    const { api, calls } = makeApi({
+      latestJob,
+      selectedSectionContext: {
+        selected_context: "Fresh evidence A and B.",
+        source_urls: ["https://fresh.example/unused", "https://fresh.example/used"],
+      },
+      llmReplies: [
+        '{"title":"Market","outline":"Find new evidence.","queries":["anna market evidence"],"max_iterations":1}',
+        '{"rewritten_text":"Anna now has stronger evidence from the refreshed source [3]."}',
+      ],
+    });
+    const { result } = renderHook(() => useResearchJob(api));
+
+    await waitFor(() => expect(result.current.phase).toBe("completed"));
+    await act(async () => {
+      await result.current.semanticRewriteSelection({
+        selectedText: "Anna has a useful product [1].",
+        instruction: "重新搜索并补充证据",
+        refreshResearch: true,
+      });
+    });
+
+    const sectionSave = calls.find((call) => Array.isArray(call) && call[0] === "saveSectionResult") as unknown[];
+    expect(sectionSave[1]).toMatchObject({
+      section_markdown: "## Market\n\nAnna now has stronger evidence from the refreshed source [2].",
+      source_urls: ["https://example.com/a", "https://fresh.example/used"],
+    });
+    const assembledSave = calls.find((call) => Array.isArray(call) && call[0] === "saveAssembledResearchResult") as unknown[];
+    expect(assembledSave[1]).toMatchObject({
+      source_urls: ["https://example.com/a", "https://fresh.example/used"],
+    });
+    expect(JSON.stringify(assembledSave[1])).not.toContain("https://fresh.example/unused");
+    expect(result.current.result?.report_markdown).toContain("refreshed source [2]");
+  });
+
+  it("does not renumber existing citations when compacting fresh rewrite references", async () => {
+    const existingUrls = Array.from({ length: 36 }, (_, index) => `https://example.com/${index + 1}`);
+    const latestJob = {
+      research_id: "done-1",
+      status: "completed",
+      stage: "completed",
+      progress: 100,
+      query: "Research topic: US GDP",
+      confirmed_role: { server: "Analyst", agent_role_prompt: "Use precise evidence." },
+      confirmed_focuses: ["labor"],
+      confirmed_outline: [{ id: "section-1", title: "Labor", outline: "Cover labor.", allowed_source_ids: ["tavily"], max_iterations: 1 }],
+      report_framing: { title: "Done", introduction: "Intro", conclusion: "Conclusion" },
+      section_results: {
+        "section-1": {
+          section_id: "section-1",
+          status: "completed",
+          section_markdown: "## Labor\n\nLabor pressure remains visible [36].",
+          section_summary: "Labor",
+          source_urls: [existingUrls[35]],
+        },
+      },
+      result: {
+        report_markdown: "# Done\n\nIntro\n\n## Labor\n\nLabor pressure remains visible [36].\n\n## Conclusion\n\nConclusion",
+        source_urls: existingUrls,
+      },
+    };
+    const { api, calls } = makeApi({
+      latestJob,
+      selectedSectionContext: {
+        selected_context: "Fresh evidence A and B.",
+        source_urls: ["https://fresh.example/unused", "https://fresh.example/used"],
+      },
+      llmReplies: [
+        '{"title":"Labor","outline":"Find new labor evidence.","queries":["labor evidence"],"max_iterations":1}',
+        '{"rewritten_text":"Labor pressure remains visible [36], with fresh corroboration [38]."}',
+      ],
+    });
+    const { result } = renderHook(() => useResearchJob(api));
+
+    await waitFor(() => expect(result.current.phase).toBe("completed"));
+    await act(async () => {
+      await result.current.semanticRewriteSelection({
+        selectedText: "Labor pressure remains visible [36].",
+        instruction: "重新搜索并补充一句证据",
+        refreshResearch: true,
+      });
+    });
+
+    const sectionSave = calls.find((call) => Array.isArray(call) && call[0] === "saveSectionResult") as unknown[];
+    expect(sectionSave[1]).toMatchObject({
+      section_markdown: "## Labor\n\nLabor pressure remains visible [36], with fresh corroboration [37].",
+      source_urls: [existingUrls[35], "https://fresh.example/used"],
+    });
+    const assembledSave = calls.find((call) => Array.isArray(call) && call[0] === "saveAssembledResearchResult") as unknown[];
+    expect(assembledSave[1]).toMatchObject({
+      source_urls: [...existingUrls, "https://fresh.example/used"],
+    });
+    expect(JSON.stringify(assembledSave[1])).not.toContain("https://fresh.example/unused");
+  });
+
+  it("can re-search rewrite an introduction by anchoring search to the first section", async () => {
+    const latestJob = {
+      research_id: "done-1",
+      status: "completed",
+      stage: "completed",
+      progress: 100,
+      query: "Research topic: Anna\n\nResearch need:\nStudy Anna.",
+      confirmed_role: { server: "Analyst", agent_role_prompt: "Use precise evidence." },
+      confirmed_focuses: ["market"],
+      confirmed_outline: [{ id: "section-1", title: "Market", outline: "Cover market.", allowed_source_ids: ["tavily"], max_iterations: 1 }],
+      report_framing: { title: "Done", introduction: "Intro opening.", conclusion: "Conclusion" },
+      section_results: {
+        "section-1": {
+          section_id: "section-1",
+          status: "completed",
+          section_markdown: "## Market\n\nAnna has a useful product [1].",
+          section_summary: "Anna product",
+          source_urls: ["https://example.com/a"],
+        },
+      },
+      result: {
+        report_markdown: "# Done\n\nIntro opening.\n\n## Market\n\nAnna has a useful product [1].\n\n## Conclusion\n\nConclusion",
+        source_urls: ["https://example.com/a"],
+      },
+    };
+    const { api, calls } = makeApi({
+      latestJob,
+      selectedSectionContext: {
+        selected_context: "Fresh intro evidence.",
+        source_urls: ["https://fresh.example/intro"],
+      },
+      llmReplies: [
+        '{"title":"Introduction","outline":"Find framing evidence.","queries":["anna framing evidence"],"max_iterations":1}',
+        '{"rewritten_text":"Intro opening with fresher evidence [2]."}',
+      ],
+    });
+    const { result } = renderHook(() => useResearchJob(api));
+
+    await waitFor(() => expect(result.current.phase).toBe("completed"));
+    await act(async () => {
+      await result.current.semanticRewriteSelection({
+        selectedText: "Intro opening.",
+        instruction: "重新搜索并加强开头",
+        refreshResearch: true,
+      });
+    });
+
+    expect(calls).toContainEqual([
+      "callSectionResearchSource",
+      expect.objectContaining({ section_id: "section-1", queries: ["anna framing evidence"] }),
+    ]);
+    const framingSave = calls.find((call) => Array.isArray(call) && call[0] === "saveReportFraming") as unknown[];
+    expect(framingSave[1]).toMatchObject({
+      framing: { introduction: "Intro opening with fresher evidence [2]." },
+    });
+    const assembledSave = calls.find((call) => Array.isArray(call) && call[0] === "saveAssembledResearchResult") as unknown[];
+    expect(assembledSave[1]).toMatchObject({
+      source_urls: ["https://example.com/a", "https://fresh.example/intro"],
+    });
+    expect(result.current.result?.report_markdown).toContain("Intro opening with fresher evidence [2].");
+  });
+
+  it("matches rendered report text back to markdown with formatting markers", async () => {
+    const sectionMarkdown =
+      "## Labor\n\n" +
+      "2026年的劳动力市场呈现“供给萎缩”导致的结构性紧缩。受移民政策收紧影响，劳动力供应总量出现下滑，黄金年龄参与率在2026年中期降至83.3% [36]。\n\n" +
+      "*   **薪资与消费支撑：** 虽然月均新增就业降至约4万人的低位，且名义薪资增速在2026年初一度降至3%以下，但生产率的提振抑制了单位劳动力成本（2025年Q3下降1.9%），这为2026年下半年的实际薪资回升和消费支出提供了空间 [31][35][36]。\n" +
+      "*   **失业率预测：** 预计2026年失业率将微升至4.5%左右，但这种上升更多反映了劳动力需求的结构性调整而非周期性衰退 [34]。";
+    const selectedText =
+      "2026年的劳动力市场呈现“供给萎缩”导致的结构性紧缩。受移民政策收紧影响，劳动力供应总量出现下滑，黄金年龄参与率在2026年中期降至83.3% [36]。 " +
+      "薪资与消费支撑： 虽然月均新增就业降至约4万人的低位，且名义薪资增速在2026年初一度降至3%以下，但生产率的提振抑制了单位劳动力成本（2025年Q3下降1.9%），这为2026年下半年的实际薪资回升和消费支出提供了空间 [31][35][36]。 " +
+      "失业率预测： 预计2026年失业率将微升至4.5%左右，但这种上升更多反映了劳动力需求的结构性调整而非周期性衰退 [34]。";
+    const latestJob = {
+      research_id: "done-1",
+      status: "completed",
+      stage: "completed",
+      progress: 100,
+      query: "Research topic: US GDP",
+      confirmed_role: { server: "Analyst", agent_role_prompt: "Use precise evidence." },
+      confirmed_focuses: ["labor"],
+      confirmed_outline: [{ id: "section-1", title: "Labor", outline: "Cover labor.", allowed_source_ids: ["tavily"], max_iterations: 1 }],
+      report_framing: { title: "Done", introduction: "Intro", conclusion: "Conclusion" },
+      section_results: {
+        "section-1": {
+          section_id: "section-1",
+          status: "completed",
+          section_markdown: sectionMarkdown,
+          section_summary: "Labor",
+          source_urls: ["https://example.com/31", "https://example.com/34", "https://example.com/35", "https://example.com/36"],
+        },
+      },
+      result: {
+        report_markdown: `# Done\n\nIntro\n\n${sectionMarkdown}\n\n## Conclusion\n\nConclusion`,
+        source_urls: ["https://example.com/31", "https://example.com/34", "https://example.com/35", "https://example.com/36"],
+      },
+    };
+    const { api, calls } = makeApi({
+      latestJob,
+      llmReplies: ['{"rewritten_text":"劳动力市场仍偏紧，但压力主要来自结构性供给约束而非全面衰退 [36]。"}'],
+    });
+    const { result } = renderHook(() => useResearchJob(api));
+
+    await waitFor(() => expect(result.current.phase).toBe("completed"));
+    await act(async () => {
+      await result.current.semanticRewriteSelection({
+        selectedText,
+        instruction: "压缩为更清晰的投资人视角",
+      });
+    });
+
+    const sectionSave = calls.find((call) => Array.isArray(call) && call[0] === "saveSectionResult") as unknown[];
+    expect(sectionSave[1]).toMatchObject({
+      section_id: "section-1",
+      section_markdown: "## Labor\n\n劳动力市场仍偏紧，但压力主要来自结构性供给约束而非全面衰退 [36]。",
+    });
   });
 
   it("saves a manual report markdown edit and syncs framing plus section results", async () => {

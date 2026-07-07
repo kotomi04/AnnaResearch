@@ -85,6 +85,11 @@ export interface ManualReportSaveInput {
   reportMarkdown: string;
 }
 
+interface StartOptions {
+  regenerationInstruction?: string;
+  onJobCreated?: (job: ResearchJob) => Promise<void> | void;
+}
+
 export function useResearchJob(api: ResearchApi) {
   const [job, setJob] = useState<ResearchJob | null>(null);
   const [result, setResult] = useState<ResearchResult | null>(null);
@@ -246,7 +251,8 @@ export function useResearchJob(api: ResearchApi) {
   }, [sources]);
 
   const start = useCallback(
-    async (query: string, regenerationInstruction = "") => {
+    async (query: string, options: StartOptions | string = {}) => {
+      const regenerationInstruction = typeof options === "string" ? options : options.regenerationInstruction || "";
       const runId = runIdRef.current + 1;
       runIdRef.current = runId;
       setPhase("generating_roles");
@@ -266,6 +272,10 @@ export function useResearchJob(api: ResearchApi) {
         const nextJob = await api.createResearchJob({ query });
         if (runId !== runIdRef.current) return;
         setJob(nextJob);
+        if (typeof options !== "string" && options.onJobCreated) {
+          await options.onJobCreated(nextJob);
+          if (runId !== runIdRef.current) return;
+        }
         const candidates = await generateRoleCandidates(api, query, regenerationInstruction);
         if (runId !== runIdRef.current) return;
         setRoleCandidates(candidates);
@@ -501,10 +511,26 @@ export function useResearchJob(api: ResearchApi) {
       if (addedCitations.length && !researchContext) {
         throw new Error("Rewrite introduced new citations. Try a style-only instruction or reselect the passage.");
       }
+      let finalRewrittenText = rewrittenText;
+      let finalReferences = references;
+      let finalSourceUrls = researchContext?.sourceUrls;
+      let finalGlobalSourceUrls = researchContext?.globalSourceUrls;
       if (researchContext?.globalSourceUrls?.length) {
         const allowed = new Set(researchContext.globalSourceUrls.map((_, index) => String(index + 1)));
         const invalid = afterCitations.filter((citation) => !allowed.has(citation));
         if (invalid.length) throw new Error("Rewrite cited sources outside the selected research context.");
+        const compacted = compactRewriteCitations({
+          text: rewrittenText,
+          baseGlobalSourceUrls: researchContext.baseGlobalSourceUrls,
+          freshSourceUrls: researchContext.sourceUrls,
+        });
+        finalRewrittenText = compacted.text;
+        finalSourceUrls = compacted.usedFreshSourceUrls;
+        finalGlobalSourceUrls = compacted.globalSourceUrls;
+        finalReferences = mergeCommentReferences(
+          target.references,
+          compacted.references.map((reference) => ({ ...reference, scope: "fresh" as const })),
+        );
       }
 
       const proposalId = `rewrite-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -512,22 +538,22 @@ export function useResearchJob(api: ResearchApi) {
         proposalId,
         hydratedJob,
         target,
-        rewrittenText,
-        references,
-        sourceUrls: researchContext?.sourceUrls,
-        globalSourceUrls: researchContext?.globalSourceUrls,
+        rewrittenText: finalRewrittenText,
+        references: finalReferences,
+        sourceUrls: finalSourceUrls,
+        globalSourceUrls: finalGlobalSourceUrls,
       });
       return target.kind === "section"
         ? {
             proposalId,
-            rewrittenText,
+            rewrittenText: finalRewrittenText,
             originalText: target.selectedText,
             targetKind: "section",
             sectionId: target.section.id,
             sectionTitle: target.section.title,
-            references,
+            references: finalReferences,
           }
-        : { proposalId, rewrittenText, originalText: target.selectedText, targetKind: target.kind, references };
+        : { proposalId, rewrittenText: finalRewrittenText, originalText: target.selectedText, targetKind: target.kind, references: finalReferences };
     },
     [api, job, sources],
   );
@@ -1062,16 +1088,77 @@ function findRewriteTarget(job: ResearchJob, selectedText: string): RewriteTarge
 
 function matchRewriteText(markdown: string, selectedText: string, normalizedSelection: string) {
   const exactIndex = markdown.indexOf(selectedText);
-  const index = exactIndex >= 0 ? exactIndex : markdown.indexOf(normalizedSelection);
-  const targetText = exactIndex >= 0 ? selectedText : normalizedSelection;
-  if (index < 0) return null;
-  const duplicateIndex = markdown.indexOf(targetText, index + targetText.length);
-  if (duplicateIndex >= 0) throw new Error("The selected text appears more than once in this report area. Select a longer passage.");
+  const normalizedIndex = exactIndex >= 0 ? -1 : markdown.indexOf(normalizedSelection);
+  const visibleRange = exactIndex >= 0 || normalizedIndex >= 0 ? null : findVisibleMarkdownRange(markdown, selectedText);
+  const index = exactIndex >= 0 ? exactIndex : normalizedIndex >= 0 ? normalizedIndex : visibleRange?.start ?? -1;
+  const end = exactIndex >= 0 ? exactIndex + selectedText.length : normalizedIndex >= 0 ? normalizedIndex + normalizedSelection.length : visibleRange?.end ?? -1;
+  if (index < 0 || end < index) return null;
+  const targetText = markdown.slice(index, end);
+  const duplicate = exactIndex >= 0 || normalizedIndex >= 0
+    ? markdown.indexOf(targetText, index + targetText.length) >= 0
+    : visibleRange?.duplicate;
+  if (duplicate) throw new Error("The selected text appears more than once in this report area. Select a longer passage.");
   return {
     selectedText: targetText,
     beforeContext: markdown.slice(Math.max(0, index - 900), index).trim(),
-    afterContext: markdown.slice(index + targetText.length, index + targetText.length + 900).trim(),
+    afterContext: markdown.slice(end, end + 900).trim(),
   };
+}
+
+function findVisibleMarkdownRange(markdown: string, selectedText: string): { start: number; end: number; duplicate: boolean } | null {
+  const markdownIndex = buildVisibleMarkdownIndex(markdown);
+  const selectionIndex = buildVisibleMarkdownIndex(selectedText);
+  const needle = selectionIndex.text.trim();
+  if (!needle) return null;
+  const start = markdownIndex.text.indexOf(needle);
+  if (start < 0) return null;
+  const duplicate = markdownIndex.text.indexOf(needle, start + needle.length) >= 0;
+  const firstVisible = markdownIndex.map[start];
+  const lastVisible = markdownIndex.map[start + needle.length - 1];
+  if (firstVisible === undefined || lastVisible === undefined) return null;
+  const expanded = expandMarkdownFormattingRange(markdown, firstVisible, lastVisible + 1);
+  return { ...expanded, duplicate };
+}
+
+function buildVisibleMarkdownIndex(text: string): { text: string; map: number[] } {
+  let out = "";
+  const map: number[] = [];
+  let previousWasSpace = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (shouldSkipMarkdownVisibleChar(text, index)) continue;
+    if (/\s/.test(char)) {
+      if (!previousWasSpace && out) {
+        out += " ";
+        map.push(index);
+        previousWasSpace = true;
+      }
+      continue;
+    }
+    out += char;
+    map.push(index);
+    previousWasSpace = false;
+  }
+  return { text: out.trim(), map };
+}
+
+function shouldSkipMarkdownVisibleChar(text: string, index: number): boolean {
+  const char = text[index];
+  if (char === "\u200b" || char === "\ufeff") return true;
+  if (char === "*" || char === "_" || char === "`") return true;
+  const linePrefix = index === 0 || text[index - 1] === "\n";
+  if (!linePrefix) return false;
+  const rest = text.slice(index);
+  return /^#{1,6}\s/.test(rest) || /^>\s/.test(rest) || /^[-+*]\s+/.test(rest) || /^\d+\.\s+/.test(rest);
+}
+
+function expandMarkdownFormattingRange(markdown: string, start: number, end: number): { start: number; end: number } {
+  let nextStart = start;
+  let nextEnd = end;
+  if (markdown.slice(nextStart - 2, nextStart) === "**" && markdown.slice(nextStart, nextEnd).includes("**")) nextStart -= 2;
+  if (markdown.slice(nextStart - 1, nextStart) === "*" && markdown.slice(nextStart, nextEnd).includes("*")) nextStart -= 1;
+  if (markdown.slice(nextStart - 1, nextStart) === "`" && markdown.slice(nextStart, nextEnd).includes("`")) nextStart -= 1;
+  return { start: Math.max(0, nextStart), end: nextEnd };
 }
 
 function referencesForCommentTarget(
@@ -1107,6 +1194,14 @@ function referencesForCommentTarget(
   return references;
 }
 
+function rewriteResearchAnchorSection(job: ResearchJob, target: RewriteTarget): ReportSection | null {
+  if (target.kind === "section") return target.section;
+  const sections = job.confirmed_outline || [];
+  if (!sections.length) return null;
+  if (target.kind === "conclusion") return sections[sections.length - 1] || null;
+  return sections[0] || null;
+}
+
 async function refreshRewriteResearchContext(
   api: ResearchApi,
   input: {
@@ -1115,15 +1210,14 @@ async function refreshRewriteResearchContext(
     instruction: string;
     sources: ResearchSourceView[];
   },
-): Promise<{ selectedContext: string; sourceUrls: string[]; globalSourceUrls: string[]; references: CommentReference[] }> {
+): Promise<{ selectedContext: string; sourceUrls: string[]; baseGlobalSourceUrls: string[]; globalSourceUrls: string[]; references: CommentReference[] }> {
   const { job, target, instruction, sources } = input;
-  if (target.kind !== "section") {
-    throw new Error("Re-search rewrite is currently available for completed report sections. Select text inside a section.");
-  }
+  const anchorSection = rewriteResearchAnchorSection(job, target);
+  if (!anchorSection) throw new Error("Re-search rewrite needs at least one report section to anchor the evidence search.");
   const role = job.confirmed_role;
   if (!role) throw new Error("Research role is missing.");
-  const allowedSources = sources.filter((source) => target.section.allowed_source_ids.includes(source.id));
-  if (!allowedSources.length) throw new Error(`Section has no configured allowed source: ${target.section.title}`);
+  const allowedSources = sources.filter((source) => anchorSection.allowed_source_ids.includes(source.id));
+  if (!allowedSources.length) throw new Error(`Section has no configured allowed source: ${anchorSection.title}`);
   const plan = await generateRewriteResearchPlan(api, {
     query: job.query || "",
     role,
@@ -1131,9 +1225,9 @@ async function refreshRewriteResearchContext(
     instruction,
   });
   const focusedSection: ReportSection = {
-    ...target.section,
-    title: plan.title || target.section.title,
-    outline: plan.outline || `${target.section.outline}\n\nSelected passage:\n${target.selectedText}\n\nRewrite request:\n${instruction}`,
+    ...anchorSection,
+    title: plan.title || target.title,
+    outline: plan.outline || `${target.outline}\n\nSelected passage:\n${target.selectedText}\n\nRewrite request:\n${instruction}`,
     max_iterations: Math.min(Math.max(plan.maxIterations || 1, 1), 2),
   };
   const history: IterationEntry[] = [];
@@ -1159,8 +1253,8 @@ async function refreshRewriteResearchContext(
     if (!queries.length) break;
     const call = await api.callSectionResearchSource({
       research_id: requiredResearchId(job),
-      section_id: target.section.id,
-      iteration: nextRewriteResearchIteration(job, target.section.id, iteration),
+      section_id: anchorSection.id,
+      iteration: nextRewriteResearchIteration(job, anchorSection.id, iteration),
       source_id: sourceId,
       queries,
     });
@@ -1186,7 +1280,7 @@ async function refreshRewriteResearchContext(
     .join("\n\n");
   const selected = await api.selectSectionContext({
     research_id: requiredResearchId(job),
-    section_id: target.section.id,
+    section_id: anchorSection.id,
     query: contextQuery,
     search_queries: sortedUnique(history.flatMap((entry) => entry.queries)),
   });
@@ -1200,6 +1294,7 @@ async function refreshRewriteResearchContext(
   return {
     selectedContext: selected.selected_context || "",
     sourceUrls,
+    baseGlobalSourceUrls: existingGlobalUrls,
     globalSourceUrls,
     references,
   };
@@ -1210,7 +1305,7 @@ async function generateRewriteResearchPlan(
   input: {
     query: string;
     role: ConfirmedResearchRole;
-    target: Extract<RewriteTarget, { kind: "section" }>;
+    target: RewriteTarget;
     instruction: string;
   },
 ): Promise<{ title: string; outline: string; queries: string[]; maxIterations: number }> {
@@ -1274,6 +1369,40 @@ function replaceSelectedText(markdown: string, selectedText: string, rewrittenTe
 
 function extractCitations(text: string): string[] {
   return Array.from(new Set(Array.from(text.matchAll(/\[(\d+)\]/g)).map((match) => match[1])));
+}
+
+function compactRewriteCitations(input: {
+  text: string;
+  baseGlobalSourceUrls: string[];
+  freshSourceUrls: string[];
+}): { text: string; usedFreshSourceUrls: string[]; globalSourceUrls: string[]; references: Array<{ number: number; url: string }> } {
+  const baseGlobalSourceUrls = input.baseGlobalSourceUrls.map((url) => String(url || "").trim()).filter(Boolean);
+  const fullSourceUrls = mergeSourceUrlsPreservingOrder(baseGlobalSourceUrls, input.freshSourceUrls);
+  const usedFreshSourceUrls: string[] = [];
+  const references = new Map<number, string>();
+  const text = input.text.replace(/\[(\d+)\]/g, (match, rawNumber: string) => {
+    const oldNumber = Number(rawNumber);
+    const url = fullSourceUrls[oldNumber - 1];
+    if (!url) return match;
+    const existingIndex = baseGlobalSourceUrls.indexOf(url);
+    if (existingIndex >= 0) {
+      return `[${existingIndex + 1}]`;
+    }
+    let freshIndex = usedFreshSourceUrls.indexOf(url);
+    if (freshIndex < 0) {
+      usedFreshSourceUrls.push(url);
+      freshIndex = usedFreshSourceUrls.length - 1;
+    }
+    const number = baseGlobalSourceUrls.length + freshIndex + 1;
+    references.set(number, url);
+    return `[${number}]`;
+  });
+  return {
+    text,
+    usedFreshSourceUrls,
+    globalSourceUrls: mergeSourceUrlsPreservingOrder(baseGlobalSourceUrls, usedFreshSourceUrls),
+    references: Array.from(references.entries()).map(([number, url]) => ({ number, url })).sort((a, b) => a.number - b.number),
+  };
 }
 
 async function rewriteTargetText(

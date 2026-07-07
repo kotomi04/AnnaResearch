@@ -133,7 +133,8 @@ export interface ReportSection {
 export interface SectionContext {
   selected_context?: string;
   selected_sources?: SearchResult[];
-  source_urls: string[];
+  source_urls?: string[];
+  source_count?: number;
   selected_at?: string;
   selected_context_chars?: number;
   selected_sources_count?: number;
@@ -156,6 +157,15 @@ export interface ReportFraming {
   introduction: string;
   conclusion: string;
   created_at?: string;
+}
+
+export interface ResearchAttachment {
+  name: string;
+  path: string;
+  content_type?: string;
+  size_bytes?: number;
+  etag?: string;
+  uploaded_at?: string;
 }
 
 export interface ResearchJob {
@@ -202,6 +212,7 @@ export interface ResearchJob {
   section_results?: Record<string, SectionResult>;
   report_framing?: ReportFraming | null;
   assembled_result?: Record<string, unknown> | null;
+  attachments?: ResearchAttachment[];
   job_transfer?: ResultTransferDescriptor;
   result_transfer?: ResultTransferDescriptor;
 }
@@ -267,9 +278,60 @@ export interface AnnaLlmApi {
   complete(request: AnnaLlmCompleteRequest): Promise<AnnaLlmCompleteResponse>;
 }
 
+export interface AnnaFilesUploadInitRequest {
+  path: string;
+  content_type: string;
+  size: number;
+}
+
+export interface AnnaFilesUploadInitResponse {
+  put_url: string;
+  headers?: Record<string, string>;
+  upload_id?: string;
+}
+
+export interface AnnaFilesUploadFinalizeRequest {
+  path: string;
+  etag: string;
+  size_bytes: number;
+}
+
+export interface AnnaFilesUploadFinalizeResponse {
+  path?: string;
+  size_bytes?: number;
+  etag?: string;
+}
+
+export interface AnnaFilesDownloadUrlResponse {
+  get_url?: string;
+  url?: string;
+  expires_at?: string;
+}
+
+export interface AnnaFilesListItem {
+  path: string;
+  size_bytes?: number;
+  content_type?: string;
+  updated_at?: string;
+}
+
+export interface AnnaFilesListResponse {
+  items?: AnnaFilesListItem[];
+  next_cursor?: string | null;
+}
+
+export interface AnnaFilesApi {
+  upload_init(request: AnnaFilesUploadInitRequest): Promise<AnnaFilesUploadInitResponse>;
+  upload_finalize(request: AnnaFilesUploadFinalizeRequest): Promise<AnnaFilesUploadFinalizeResponse>;
+  download_url(request: { path: string }): Promise<AnnaFilesDownloadUrlResponse>;
+  list(request: { prefix: string; cursor?: string | null }): Promise<AnnaFilesListResponse>;
+  delete?(request: { path: string }): Promise<unknown>;
+}
+
 export interface AnnaRuntimeApi {
   tools: AnnaToolsApi;
   llm: AnnaLlmApi;
+  files?: AnnaFilesApi;
 }
 
 export interface AnnaRuntimeGlobal {

@@ -760,6 +760,37 @@ describe("ReportView", () => {
     expect(within(nextCard).getByText("E")).toBeTruthy();
   });
 
+  it("places citation cards above the marker when there is not enough room below", () => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 900 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 600 });
+    const t = createTranslator("en");
+    render(
+      <ReportView
+        result={{ report_markdown: "Anna has a useful product [1].", source_urls: ["https://example.com/a"] }}
+        sources={[{ url: "https://example.com/a", title: "Example", content: "Evidence snippet." }]}
+        t={t}
+      />,
+    );
+
+    const referenceButton = screen.getByRole("button", { name: "[1]" });
+    vi.spyOn(referenceButton, "getBoundingClientRect").mockReturnValue({
+      x: 420,
+      y: 520,
+      top: 520,
+      right: 442,
+      bottom: 540,
+      left: 420,
+      width: 22,
+      height: 20,
+      toJSON: () => ({}),
+    } as DOMRect);
+    fireEvent.mouseEnter(referenceButton);
+
+    const card = document.querySelector(".citation-card") as HTMLElement;
+    expect(card.classList.contains("above")).toBe(true);
+    expect(Number.parseFloat(card.style.top)).toBeLessThan(520);
+  });
+
   it("keeps selected report text highlighted while the rewrite panel is open", () => {
     const t = createTranslator("en");
     render(
@@ -1007,12 +1038,6 @@ describe("TaskPickerPage", () => {
             source_count: 4,
           },
         ]}
-        latestJob={{
-          research_id: "research_recent",
-          query: "Research topic: Recent market brief",
-          status: "completed",
-          source_count: 4,
-        }}
         canContinue={true}
         isBusy={false}
         message=""

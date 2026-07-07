@@ -118,7 +118,7 @@ def test_credential_store_set_clear_remove(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Job store v2
+# Job store v3
 # ---------------------------------------------------------------------------
 
 
@@ -172,12 +172,12 @@ def test_get_research_job_falls_back_when_transfer_server_is_blocked(tmp_path):
     assert "job_transfer" not in loaded
 
 
-def test_compact_job_view_exposes_v2_fields(tmp_path):
+def test_compact_job_view_exposes_v3_fields(tmp_path):
     dispatcher = make_dispatcher(tmp_path)
     job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
     immediate = dispatcher.dispatch("app_get_research_job", {"research_id": job["research_id"]})["job"]
     loaded = get_json(immediate["job_transfer"]["url"])["job"] if immediate.get("job_transfer") else immediate
-    assert loaded["schema_version"] == 2
+    assert loaded["schema_version"] == 3
     assert loaded["iterations"] == []
     assert loaded["research_log"] == []
     assert loaded["iteration"] == 0
@@ -1354,6 +1354,22 @@ def test_call_section_research_source_uses_native_duckduckgo(tmp_path):
     assert item["source_name"] == "DuckDuckGo"
     assert item["url"] == "https://duck.example/section"
     assert item["content"] == "section snippet"
+    assert loaded["source_urls"] == []
+    assert loaded["source_count"] == 0
+
+    dispatcher.jobs.save_section_result(
+        job["research_id"],
+        "section-1",
+        {
+            "section_markdown": "## Background\n\nSelected evidence [1].",
+            "section_summary": "Selected evidence.",
+            "source_urls": ["https://duck.example/selected"],
+            "status": "completed",
+        },
+    )
+    loaded = dispatcher.jobs.load(job["research_id"])
+    assert loaded["source_urls"] == ["https://duck.example/selected"]
+    assert loaded["source_count"] == 1
 
 
 def test_call_section_research_source_skips_duplicate_query(tmp_path):

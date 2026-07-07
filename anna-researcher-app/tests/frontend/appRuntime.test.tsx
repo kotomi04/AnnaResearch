@@ -63,9 +63,47 @@ describe("App Anna runtime integration", () => {
     expect(await screen.findByRole("heading", { name: "What are you researching?" })).toBeTruthy();
     expect(screen.queryByRole("heading", { name: "Choose task" })).toBeNull();
   });
+
+  it("continues the most recently updated history job instead of the latest pointer", async () => {
+    const calls: unknown[] = [];
+    runtimeMock.connect.mockResolvedValue(makeAnnaRuntime(calls, {
+      currentJob: {
+        research_id: "research_stale",
+        query: "Research topic: Stale current task",
+        status: "created",
+        updated_at: "2026-07-01T00:00:00Z",
+      },
+      historyJobs: [
+        {
+          research_id: "research_recent",
+          query: "Research topic: Recently edited task",
+          status: "created",
+          updated_at: "2026-07-06T00:00:00Z",
+        },
+        {
+          research_id: "research_stale",
+          query: "Research topic: Stale current task",
+          status: "created",
+          updated_at: "2026-07-01T00:00:00Z",
+        },
+      ],
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByText("Recently edited task")).toBeTruthy();
+    fireEvent.click(await screen.findByRole("button", { name: "Open latest" }));
+
+    await waitFor(() =>
+      expect(calls).toContainEqual({ tool_id: TOOL_ID, method: "app_get_research_job", args: { research_id: "research_recent" } }),
+    );
+  });
 });
 
-function makeAnnaRuntime(calls: unknown[]): AnnaRuntimeApi {
+function makeAnnaRuntime(
+  calls: unknown[],
+  options: { currentJob?: Record<string, unknown> | null; historyJobs?: Record<string, unknown>[] } = {},
+): AnnaRuntimeApi {
   return {
     tools: {
       async invoke(request) {
@@ -92,10 +130,14 @@ function makeAnnaRuntime(calls: unknown[]): AnnaRuntimeApi {
           };
         }
         if (request.method === "app_get_research_job") {
-          return { success: true, data: { job: null } };
+          if (request.args.research_id) {
+            const selected = (options.historyJobs || []).find((job) => job.research_id === request.args.research_id) || null;
+            return { success: true, data: { job: selected } };
+          }
+          return { success: true, data: { job: options.currentJob ?? null } };
         }
         if (request.method === "app_list_research_jobs") {
-          return { success: true, data: { jobs: [] } };
+          return { success: true, data: { jobs: options.historyJobs || [] } };
         }
         return { success: true, data: {} };
       },

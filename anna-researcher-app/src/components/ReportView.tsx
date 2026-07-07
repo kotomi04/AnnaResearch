@@ -434,16 +434,18 @@ function CitationCard({
 function positionCitationCard(anchor: HTMLElement): Pick<CitationCardState, "x" | "y" | "placement"> {
   const rect = anchor.getBoundingClientRect();
   const gap = 8;
+  const margin = 12;
   const cardWidth = Math.min(360, Math.max(280, window.innerWidth - 24));
-  const cardHeight = 160;
-  const maxX = Math.max(12, window.innerWidth - cardWidth - 12);
+  const cardHeight = Math.min(240, Math.max(160, window.innerHeight - margin * 2));
+  const maxX = Math.max(margin, window.innerWidth - cardWidth - margin);
   const centeredX = rect.left + rect.width / 2 - cardWidth / 2;
-  const placement = rect.bottom + gap + cardHeight <= window.innerHeight || rect.top < cardHeight + gap ? "below" : "above";
+  const belowFits = rect.bottom + gap + cardHeight <= window.innerHeight - margin;
+  const placement = belowFits ? "below" : "above";
   const rawY = placement === "below" ? rect.bottom + gap : rect.top - cardHeight - gap;
-  const maxY = Math.max(12, window.innerHeight - cardHeight - 12);
+  const maxY = Math.max(margin, window.innerHeight - cardHeight - margin);
   return {
-    x: Math.min(Math.max(12, centeredX), maxX),
-    y: Math.min(Math.max(12, rawY), maxY),
+    x: Math.min(Math.max(margin, centeredX), maxX),
+    y: Math.min(Math.max(margin, rawY), maxY),
     placement,
   };
 }

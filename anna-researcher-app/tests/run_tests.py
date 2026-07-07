@@ -49,12 +49,32 @@ def test_job_shell(tmp_path: Path):
     created = dispatcher.dispatch("app_create_research_job", {"query": "Anna App"})
     job = created["job"]
     assert_true(job["research_id"].startswith("research_"), "job should have id")
+    assert_true(
+        dispatcher.jobs.path_for(job["research_id"]).name == "job.json",
+        "job store should use directory-backed job.json",
+    )
+    assert_true(
+        dispatcher.jobs.path_for(job["research_id"]).exists(),
+        "job directory should contain job.json",
+    )
+    assert_true(
+        not (dispatcher.jobs.jobs_dir / f"{job['research_id']}.json").exists(),
+        "job store should not write legacy flat job json",
+    )
+    assert_true(
+        (dispatcher.jobs.job_dir_for(job["research_id"]) / "section_results.json").exists(),
+        "job directory should contain split section result store",
+    )
+    assert_true(
+        not (dispatcher.jobs.root / "latest_research_id").exists(),
+        "job store should not maintain a latest_research_id file",
+    )
     loaded_status = dispatcher.dispatch("app_get_research_job", {})["job"]
-    assert_true(loaded_status["schema_version"] == 2, "get job stdio latest should include compact job for transfer fallback")
+    assert_true(loaded_status["schema_version"] == 3, "get job without id should return the most recently updated compact job")
     assert_true(all("raw_results" not in it for it in loaded_status["iterations"]), "compact stdio job should not expose raw_results")
     loaded = get_json(loaded_status["job_transfer"]["url"])["job"]
     assert_true(loaded["research_id"] == job["research_id"], "latest job should load")
-    assert_true(loaded["schema_version"] == 2, "loaded job should advertise v2")
+    assert_true(loaded["schema_version"] == 3, "loaded job should advertise v3")
     updated = dispatcher.dispatch(
         "app_update_research_job",
         {
@@ -78,13 +98,19 @@ def test_job_shell(tmp_path: Path):
     listed_ids = {job["research_id"] for job in listed}
     assert_true(second["research_id"] in listed_ids and job["research_id"] in listed_ids, "job list should include both ids")
     assert_true(any(item["query"] == "Second research" for item in listed), "job list should include compact query")
+    dispatcher.dispatch(
+        "app_update_research_job",
+        {"research_id": job["research_id"], "updates": {"progress": 33}},
+    )
+    recent = dispatcher.dispatch("app_get_research_job", {})["job"]
+    assert_true(recent["research_id"] == job["research_id"], "get job without id should return most recently updated job")
     try:
         dispatcher.dispatch("app_update_research_job", {"research_id": job["research_id"], "updates": {"tavily_api_key": "leak"}})
         raise AssertionError("secret-like field should be rejected")
     except ValidationError:
         pass
     empty = AppDispatcher(settings=SettingsStore(root=tmp_path / "empty"), jobs=JobStore(root=tmp_path / "empty"))
-    assert_true(empty.dispatch("app_get_research_job", {})["job"] is None, "empty latest should be null")
+    assert_true(empty.dispatch("app_get_research_job", {})["job"] is None, "empty recent job should be null")
     try:
         dispatcher.dispatch("app_get_research_job", {"research_id": "missing"})
         raise AssertionError("missing explicit id should fail")
@@ -112,15 +138,19 @@ def test_call_research_source_context_result(tmp_path: Path):
     assert_true(transfer["method"] == "POST", "save should return transfer descriptor")
     saved = post_json(transfer["url"], {"report_markdown": "# Research Report\n\nDone", "source_urls": context["source_urls"]})
     assert_true(saved["result"]["report_markdown"].startswith("# Research Report"), "result should persist")
-    assert_true("sources" not in saved["result"], "http result should be compact")
+    assert_true("sources" in saved["result"], "http result should include source metadata for citation cards")
     immediate = dispatcher.dispatch("app_get_research_job", {"research_id": research_id})["job"]
     assert_true(immediate["iterations"], "get job stdio response should include compact iterations for fallback")
     assert_true(all("raw_results" not in it for it in immediate["iterations"]), "get job stdio response should not expose raw_results")
-    assert_true(immediate["source_urls"] == context["source_urls"], "get job stdio response should include source urls for fallback")
-    assert_true(immediate["result"]["report_markdown"].startswith("# Research Report"), "get job stdio response should include inline result fallback")
+    assert_true(immediate["source_count"] == len(context["source_urls"]), "get job stdio response should expose source count without inlining all urls")
+    assert_true("source_urls" not in immediate, "get job stdio response should omit source_urls instead of returning an empty list")
+    assert_true("research_log" not in immediate, "get job stdio response should omit research_log instead of returning an empty list")
+    assert_true("report_markdown" not in immediate["result"], "get job stdio response should not inline full result markdown")
     assert_true(immediate["job_transfer"]["method"] == "GET", "get job should expose job transfer")
     loaded = get_json(immediate["job_transfer"]["url"])["job"]
     assert_true("report_markdown" not in loaded["result"], "loaded job should not include full result markdown")
+    assert_true("source_urls" not in loaded, "loaded compact job should omit source_urls")
+    assert_true("research_log" not in loaded, "loaded compact job should omit research_log")
     assert_true(immediate["result_transfer"]["method"] == "GET", "completed job status should expose result transfer")
     restored = get_json(immediate["result_transfer"]["url"])
     assert_true(restored["result"]["report_markdown"].startswith("# Research Report"), "result transfer should restore markdown")
@@ -340,7 +370,7 @@ def test_plugin_contract(tmp_path: Path):
         assert_true(init["result"].get("client_capabilities") == {"embeddings": {}}, "tool should declare embeddings")
         describe = plugin.call("describe")
         tools = [tool["name"] for tool in describe["result"]["tools"]]
-        assert_true(describe["result"]["name"] == "tool-test-researcher-12345678", "describe should advertise tool")
+        assert_true(describe["result"]["name"] == "tool-xhz-researcher-python-e7k8xa3s", "describe should advertise tool")
         assert_true(describe["result"]["version"] == "0.2.2", "describe should advertise breaking version")
         assert_true("research" not in tools, "legacy research method should be absent")
         assert_true("app_search_web" not in tools, "legacy app_search_web must be removed")
@@ -372,7 +402,7 @@ def get_json(url: str):
 def test_bundle_contract():
     bundle_js = "\n".join(path.read_text(encoding="utf-8") for path in (APP_ROOT / "bundle").glob("assets/*.js"))
     manifest = (APP_ROOT / "manifest.json").read_text(encoding="utf-8")
-    assert_true("tool-test-researcher-12345678" in manifest, "manifest should reference tool")
+    assert_true("bundled:researcher" in manifest, "manifest should reference bundled researcher tool")
     assert_true('"min_version":"0.2.2"' in manifest.replace(" ", ""), "manifest should require tool 0.2.2")
     assert_true('"llm":["complete","embed"]' in manifest.replace(" ", ""), "manifest should authorize llm.complete and llm.embed")
     assert_true('method:"research"' not in bundle_js and 'method: "research"' not in bundle_js, "bundle should not call legacy research method")

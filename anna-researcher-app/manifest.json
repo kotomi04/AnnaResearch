@@ -41,6 +41,7 @@
       "chat": [],
       "artifact": [],
       "llm": ["complete", "embed"],
+      "files": ["upload_init", "upload_finalize", "download_url", "list", "delete"],
       "fs": [],
       "storage": [],
       "prefs": [],
@@ -49,6 +50,7 @@
     "csp_overrides": {
       "connect-src": [
         "'self'",
+        "https:",
         "http://127.0.0.1:*",
         "http://localhost:*"
       ],
