@@ -134,6 +134,7 @@ export interface SectionContext {
   selected_context?: string;
   selected_sources?: SearchResult[];
   source_urls?: string[];
+  citation_sources?: CitationSource[];
   source_count?: number;
   selected_at?: string;
   selected_context_chars?: number;
@@ -146,7 +147,12 @@ export interface SectionResult {
   section_markdown?: string;
   section_markdown_chars?: number;
   section_summary: string;
-  source_urls: string[];
+  source_urls?: string[];
+  source_count?: number;
+  citation_sources?: CitationSource[];
+  citation_source_count?: number;
+  attachment_citation_count?: number;
+  url_citation_count?: number;
   error?: ResearchError | null;
   completed_at?: string | null;
   updated_at?: string;
@@ -167,6 +173,84 @@ export interface ResearchAttachment {
   etag?: string;
   uploaded_at?: string;
 }
+
+export interface AttachmentPrepareInput {
+  name: string;
+  path: string;
+  content_type?: string;
+  size_bytes?: number;
+  download_url: string;
+}
+
+export interface AttachmentContextFile {
+  id: string;
+  name: string;
+  path?: string;
+  content_type?: string;
+  size_bytes?: number;
+  text_chars?: number;
+  chunk_count?: number;
+  status: "ready" | "failed";
+  error?: string | null;
+  ai_summary?: string;
+  ai_key_points?: string[];
+  ai_relevance?: string;
+  summary_selected_chunk_ids?: string[];
+}
+
+export interface AttachmentContextChunk {
+  chunk_id: string;
+  file_id: string;
+  file_name: string;
+  index: number;
+  text: string;
+  embedding?: number[];
+  embedding_model?: string;
+  embedding_dimensions?: number;
+}
+
+export interface AttachmentContext {
+  version: number;
+  prepared_at: string;
+  files: AttachmentContextFile[];
+  chunks: AttachmentContextChunk[];
+  summary: string;
+  embedding_model?: string;
+  embedding_batch_size?: number;
+  embedding_status?: "ready" | "partial" | "failed";
+  summary_status?: "ready" | "partial" | "failed";
+  summary_mode?: string;
+  summary_query?: string;
+  summary_top_k?: number;
+  summary_generated_at?: string;
+}
+
+export interface EmbedTextsResponse {
+  count: number;
+  dimensions: number;
+  vectors: number[][];
+  first_vector_preview?: number[];
+  model?: string;
+  usage?: unknown;
+  _meta?: Record<string, unknown>;
+}
+
+export type CitationSource =
+  | {
+      kind: "url";
+      url: string;
+      title?: string;
+      icon?: string;
+      content?: string;
+    }
+  | {
+      kind: "attachment";
+      file_id: string;
+      file_name: string;
+      chunk_id?: string;
+      index?: number;
+      quote?: string;
+    };
 
 export interface ResearchJob {
   research_id?: string;
@@ -213,6 +297,7 @@ export interface ResearchJob {
   report_framing?: ReportFraming | null;
   assembled_result?: Record<string, unknown> | null;
   attachments?: ResearchAttachment[];
+  attachment_context?: AttachmentContext | null;
   job_transfer?: ResultTransferDescriptor;
   result_transfer?: ResultTransferDescriptor;
 }
@@ -223,6 +308,7 @@ export interface ResearchResult {
   report_markdown?: string;
   report_markdown_chars?: number;
   source_urls?: string[];
+  citation_sources?: CitationSource[];
   sources?: SearchResult[];
   status?: string;
   created_at?: string;

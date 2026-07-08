@@ -166,6 +166,16 @@ describe("AnnaResearchApi", () => {
       await api.updateResearchSourceCredential({ id: "tavily", credential: "tvly-test" });
       await api.createResearchJob({ query: "anna" });
       await api.updateResearchJob("r1", { stage: "plan_queries" });
+      await api.prepareAttachments("r1", [
+        {
+          name: "brief.md",
+          path: "research-jobs/r1/uploads/brief.md",
+          content_type: "text/markdown",
+          size_bytes: 12,
+          download_url: "https://files.example/brief.md",
+        },
+      ]);
+      await api.embedAttachmentChunks("r1");
       await api.getResearchJob("r1");
       await api.listResearchJobs({ limit: 20 });
       await api.testResearchSource({ id: "tavily", definition: { id: "tavily" }, query: "anna" });
@@ -185,6 +195,27 @@ describe("AnnaResearchApi", () => {
         { tool_id: TOOL_ID, method: "app_update_research_source_credential", args: { id: "tavily", credential: "tvly-test" } },
         { tool_id: TOOL_ID, method: "app_create_research_job", args: { query: "anna" } },
         { tool_id: TOOL_ID, method: "app_update_research_job", args: { research_id: "r1", updates: { stage: "plan_queries" } } },
+        {
+          tool_id: TOOL_ID,
+          method: "app_prepare_attachments",
+          args: {
+            research_id: "r1",
+            attachments: [
+              {
+                name: "brief.md",
+                path: "research-jobs/r1/uploads/brief.md",
+                content_type: "text/markdown",
+                size_bytes: 12,
+                download_url: "https://files.example/brief.md",
+              },
+            ],
+          },
+        },
+        {
+          tool_id: TOOL_ID,
+          method: "app_embed_attachment_chunks",
+          args: { research_id: "r1" },
+        },
         { tool_id: TOOL_ID, method: "app_get_research_job", args: { research_id: "r1" } },
         { tool_id: TOOL_ID, method: "app_list_research_jobs", args: { limit: 20 } },
         { tool_id: TOOL_ID, method: "app_test_research_source", args: { id: "tavily", definition: { id: "tavily" }, query: "anna" } },

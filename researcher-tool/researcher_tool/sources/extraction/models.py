@@ -11,3 +11,4 @@ class ExtractedPage:
     content_type: str = "unknown"
     status: str = "success"
     error: str | None = None
+    icon: str = ""

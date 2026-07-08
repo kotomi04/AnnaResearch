@@ -23,7 +23,7 @@ def extract_with_browser_fallback(
     if not clean_url:
         return ExtractedPage(url="", content_type="html", status="failed", error="empty_url")
     try:
-        title, markdown = asyncio.run(
+        title, icon, markdown = asyncio.run(
             _extract_with_crawl4ai(
                 clean_url,
                 query=query,
@@ -37,8 +37,8 @@ def extract_with_browser_fallback(
 
     content = truncate_text(markdown.strip(), max_chars_per_page)
     if not content:
-        return ExtractedPage(url=clean_url, title=title, content_type="html", status="failed", error="empty_content")
-    return ExtractedPage(url=clean_url, title=title, raw_content=content, content_type="html")
+        return ExtractedPage(url=clean_url, title=title, icon=icon, content_type="html", status="failed", error="empty_content")
+    return ExtractedPage(url=clean_url, title=title, icon=icon, raw_content=content, content_type="html")
 
 
 def extract_many_with_browser_fallback(
@@ -76,25 +76,25 @@ def extract_many_with_browser_fallback(
         if isinstance(result, ExtractedPage):
             page = result
         else:
-            title, markdown = result
+            title, icon, markdown = result
             content = truncate_text(markdown.strip(), max_chars_per_page)
             if content:
-                page = ExtractedPage(url=url, title=title, raw_content=content, content_type="html")
+                page = ExtractedPage(url=url, title=title, icon=icon, raw_content=content, content_type="html")
             else:
-                page = ExtractedPage(url=url, title=title, content_type="html", status="failed", error="empty_content")
+                page = ExtractedPage(url=url, title=title, icon=icon, content_type="html", status="failed", error="empty_content")
         pages.append(page)
     return pages
 
 
-async def _extract_with_crawl4ai(url: str, *, query: str, timeout: float) -> tuple[str, str]:
+async def _extract_with_crawl4ai(url: str, *, query: str, timeout: float) -> tuple[str, str, str]:
     crawler_cls, config = _crawl4ai_runtime(query=query, timeout=timeout)
     async with crawler_cls() as crawler:
         return await _crawl_one(crawler, url, config=config)
 
 
-async def _extract_many_with_crawl4ai(urls: list[str], *, query: str, timeout: float) -> list[tuple[str, str] | ExtractedPage]:
+async def _extract_many_with_crawl4ai(urls: list[str], *, query: str, timeout: float) -> list[tuple[str, str, str] | ExtractedPage]:
     crawler_cls, config = _crawl4ai_runtime(query=query, timeout=timeout)
-    results: list[tuple[str, str] | ExtractedPage] = []
+    results: list[tuple[str, str, str] | ExtractedPage] = []
     async with crawler_cls() as crawler:
         for url in urls:
             if not url:
@@ -137,7 +137,7 @@ def _crawl4ai_runtime(*, query: str, timeout: float):
     return AsyncWebCrawler, config
 
 
-async def _crawl_one(crawler: object, url: str, *, config: object) -> tuple[str, str]:
+async def _crawl_one(crawler: object, url: str, *, config: object) -> tuple[str, str, str]:
     result = await crawler.arun(url=url, config=config)
     success = bool(getattr(result, "success", True))
     if not success:
@@ -147,21 +147,28 @@ async def _crawl_one(crawler: object, url: str, *, config: object) -> tuple[str,
     markdown_obj = getattr(result, "markdown", None)
     markdown = _markdown_text(markdown_obj)
     title = _title_from_result(result)
+    icon = _icon_from_result(result)
     if not markdown:
-        markdown = str(getattr(result, "cleaned_html", "") or "")
-    return title, markdown
+        markdown = _first_non_empty_text(getattr(result, "cleaned_html", ""))
+    return title, icon, markdown
 
 
 def _markdown_text(markdown_obj: object) -> str:
     if markdown_obj is None:
         return ""
-    fit = getattr(markdown_obj, "fit_markdown", None)
-    if fit:
-        return str(fit)
-    raw = getattr(markdown_obj, "raw_markdown", None)
-    if raw:
-        return str(raw)
-    return str(markdown_obj or "")
+    return _first_non_empty_text(
+        getattr(markdown_obj, "fit_markdown", None),
+        getattr(markdown_obj, "raw_markdown", None),
+        markdown_obj,
+    )
+
+
+def _first_non_empty_text(*values: object) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def _title_from_result(result: object) -> str:
@@ -170,4 +177,15 @@ def _title_from_result(result: object) -> str:
         title = metadata.get("title")
         if title:
             return str(title)
+    return ""
+
+
+def _icon_from_result(result: object) -> str:
+    metadata = getattr(result, "metadata", None)
+    if not isinstance(metadata, dict):
+        return ""
+    for key in ("icon", "favicon", "favicon_url", "icon_url", "image"):
+        value = metadata.get(key)
+        if value:
+            return str(value)
     return ""

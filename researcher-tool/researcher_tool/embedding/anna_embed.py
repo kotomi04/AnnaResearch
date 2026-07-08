@@ -85,28 +85,25 @@ class AnnaEmbeddingsClient:
 def embed_texts(args: dict[str, Any], *, embeddings: AnnaEmbeddingsClient) -> dict[str, Any]:
     raw_texts = args.get("texts") or args.get("input") or []
     texts = [raw_texts] if isinstance(raw_texts, str) else list(raw_texts)
+    clean_texts = [str(text or "").strip() for text in texts if str(text or "").strip()]
     model = str(args.get("model") or "anna-managed-v1")
     timeout = float(args.get("timeout") or 30.0)
     vectors: list[list[Any]] = []
     usage: Any = None
     meta: dict[str, Any] = {}
-    for text in texts:
-        clean = str(text or "").strip()
-        if not clean:
-            continue
-        result = embeddings.create(texts=[clean], model=model, timeout=timeout)
-        data = result.get("data") or []
-        for item in data:
-            if isinstance(item, dict) and isinstance(item.get("embedding"), list):
-                vectors.append(item.get("embedding"))
-                break
-        usage = result.get("usage") or usage
-        if isinstance(result.get("_meta"), dict):
-            meta = result.get("_meta") or meta
+    result = embeddings.create(texts=clean_texts, model=model, timeout=timeout)
+    data = result.get("data") or []
+    for item in data:
+        if isinstance(item, dict) and isinstance(item.get("embedding"), list):
+            vectors.append(item.get("embedding"))
+    usage = result.get("usage") or usage
+    if isinstance(result.get("_meta"), dict):
+        meta = result.get("_meta") or meta
     first = vectors[0] if vectors else []
     return {
         "count": len(vectors),
         "dimensions": meta.get("dimensions") or (len(first) if first else 0),
+        "vectors": vectors,
         "first_vector_preview": first[:8] if isinstance(first, list) else [],
         "model": model,
         "usage": usage,

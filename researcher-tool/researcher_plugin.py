@@ -8,9 +8,12 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
+from researcher_tool.attachment_embeddings import embed_attachment_chunks
+from researcher_tool.attachment_summary import select_attachment_context, summarize_attachment_context
 from researcher_tool.dispatcher import AppDispatcher
 from researcher_tool.embedding import AnnaEmbeddingsClient, EmbeddingsError, embed_texts
 from researcher_tool.errors import ResearcherToolError, ValidationError
+from researcher_tool.sampling import AnnaSamplingClient, SamplingError
 from researcher_tool.sources.native.executor import NativeResearchSourceExecutor
 
 TOOL_ID = "tool-xhz-researcher-python-e7k8xa3s"
@@ -20,6 +23,10 @@ APP_METHODS = [
     "app_update_settings",
     "app_create_research_job",
     "app_update_research_job",
+    "app_prepare_attachments",
+    "app_embed_attachment_chunks",
+    "app_summarize_attachments",
+    "app_select_attachment_context",
     "app_save_confirmed_research_role",
     "app_save_confirmed_research_focuses",
     "app_save_confirmed_research_outline",
@@ -49,7 +56,7 @@ MANIFEST: dict[str, Any] = {
     "version": VERSION,
     "description": "Standalone backend tool for the Anna Researcher app.",
     "author": "Anna Research",
-    "host_capabilities": ["llm.embed"],
+    "host_capabilities": ["llm.embed", "llm.sample"],
     "tools": [
         {
             "name": method,
@@ -63,6 +70,7 @@ MANIFEST: dict[str, Any] = {
 
 _stdout_lock = threading.Lock()
 embeddings: AnnaEmbeddingsClient
+sampling: AnnaSamplingClient
 
 
 def write_frame(msg: dict[str, Any]) -> None:
@@ -73,6 +81,7 @@ def write_frame(msg: dict[str, Any]) -> None:
 
 
 embeddings = AnnaEmbeddingsClient(write_frame=write_frame)
+sampling = AnnaSamplingClient(write_frame=write_frame)
 
 
 dispatcher = AppDispatcher(native_executor=NativeResearchSourceExecutor())
@@ -96,7 +105,7 @@ def handle_initialize(req_id: Any, params: dict[str, Any]) -> dict[str, Any]:
             "protocolVersion": negotiated,
             "serverInfo": {"name": TOOL_ID, "version": VERSION},
             "client_capabilities": {"embeddings": {}},
-            "capabilities": {},
+            "capabilities": {"sampling": {}},
         },
     )
 
@@ -104,15 +113,46 @@ def handle_initialize(req_id: Any, params: dict[str, Any]) -> dict[str, Any]:
 def handle_invoke(req_id: Any, params: dict[str, Any]) -> dict[str, Any]:
     tool = str(params.get("tool") or "")
     args = params.get("arguments") or {}
+    context = params.get("context") or {}
+    invoke_id = str(context.get("invoke_id") or params.get("invoke_id") or "")
     if tool not in APP_METHODS:
         return make_response(req_id, error={"code": -32601, "message": f"unknown tool: {tool}"})
     if not isinstance(args, dict):
         return make_response(req_id, error={"code": -32602, "message": "`arguments` must be an object"})
     try:
-        data = embed_texts(args, embeddings=embeddings) if tool == "app_embed_texts" else dispatcher.dispatch(tool, args)
+        if tool == "app_embed_texts":
+            data = embed_texts(args, embeddings=embeddings)
+        elif tool == "app_embed_attachment_chunks":
+            data = embed_attachment_chunks(
+                jobs=dispatcher.jobs,
+                embeddings=embeddings,
+                research_id=str(args.get("research_id") or ""),
+            )
+        elif tool == "app_summarize_attachments":
+            data = summarize_attachment_context(
+                jobs=dispatcher.jobs,
+                embeddings=embeddings,
+                sampling=sampling,
+                research_id=str(args.get("research_id") or ""),
+                query=str(args.get("query") or ""),
+                top_k=int(args.get("top_k") or 8),
+                invoke_id=invoke_id,
+            )
+        elif tool == "app_select_attachment_context":
+            data = select_attachment_context(
+                jobs=dispatcher.jobs,
+                embeddings=embeddings,
+                research_id=str(args.get("research_id") or ""),
+                query=str(args.get("query") or ""),
+                top_k=int(args.get("top_k") or 8),
+            )
+        else:
+            data = dispatcher.dispatch(tool, args)
         return make_response(req_id, result={"success": True, "tool": tool, "data": data})
     except EmbeddingsError as exc:
         return make_response(req_id, result={"success": False, "tool": tool, "error": exc.message, "data": {"code": "embedding_error", "embedding_code": exc.code, **exc.data}})
+    except SamplingError as exc:
+        return make_response(req_id, result={"success": False, "tool": tool, "error": exc.message, "data": {"code": "sampling_error", "sampling_code": exc.code, **exc.data}})
     except ResearcherToolError as exc:
         return make_response(req_id, result={"success": False, "tool": tool, "error": exc.message, "data": {"code": exc.code, **exc.data}})
     except Exception as exc:  # noqa: BLE001
@@ -125,7 +165,7 @@ def handle_message(line: str) -> None:
     except json.JSONDecodeError as exc:
         write_frame(make_response(None, error={"code": -32700, "message": f"parse error: {exc}"}))
         return
-    if "method" not in msg and embeddings.dispatch_response(msg):
+    if "method" not in msg and (embeddings.dispatch_response(msg) or sampling.dispatch_response(msg)):
         return
 
     method = msg.get("method")
@@ -157,7 +197,7 @@ def main() -> None:
             except json.JSONDecodeError:
                 pool.submit(handle_message, line)
                 continue
-            if "method" not in msg and embeddings.dispatch_response(msg):
+            if "method" not in msg and (embeddings.dispatch_response(msg) or sampling.dispatch_response(msg)):
                 continue
             pool.submit(handle_message, line)
 

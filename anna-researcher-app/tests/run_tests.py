@@ -62,8 +62,8 @@ def test_job_shell(tmp_path: Path):
         "job store should not write legacy flat job json",
     )
     assert_true(
-        (dispatcher.jobs.job_dir_for(job["research_id"]) / "section_results.json").exists(),
-        "job directory should contain split section result store",
+        not (dispatcher.jobs.job_dir_for(job["research_id"]) / "section_results.json").exists(),
+        "job directory should not write empty split section result store",
     )
     assert_true(
         not (dispatcher.jobs.root / "latest_research_id").exists(),
@@ -72,7 +72,7 @@ def test_job_shell(tmp_path: Path):
     loaded_status = dispatcher.dispatch("app_get_research_job", {})["job"]
     assert_true(loaded_status["schema_version"] == 3, "get job without id should return the most recently updated compact job")
     assert_true(all("raw_results" not in it for it in loaded_status["iterations"]), "compact stdio job should not expose raw_results")
-    loaded = get_json(loaded_status["job_transfer"]["url"])["job"]
+    loaded = get_json(loaded_status["job_transfer"]["url"])["job"] if loaded_status.get("job_transfer") else loaded_status
     assert_true(loaded["research_id"] == job["research_id"], "latest job should load")
     assert_true(loaded["schema_version"] == 3, "loaded job should advertise v3")
     updated = dispatcher.dispatch(

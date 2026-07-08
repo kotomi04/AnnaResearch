@@ -22,13 +22,19 @@ def status_view(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def result_view(job: dict[str, Any], *, include_sources: bool = True, include_markdown: bool = True) -> dict[str, Any]:
+def result_view(
+    job: dict[str, Any],
+    *,
+    include_sources: bool = True,
+    include_markdown: bool = True,
+) -> dict[str, Any]:
     data = {
         "research_id": job.get("research_id"),
         "status": job.get("status"),
         "query": job.get("query"),
         "report_type": "research_report",
         "source_urls": job.get("source_urls") or [],
+        "citation_sources": job.get("citation_sources") or [],
         "error": job.get("error"),
         "created_at": job.get("created_at"),
         "updated_at": job.get("updated_at"),
@@ -40,7 +46,7 @@ def result_view(job: dict[str, Any], *, include_sources: bool = True, include_ma
     else:
         data["report_markdown_chars"] = len(markdown)
     if include_sources:
-        data["sources"] = job.get("selected_sources") or []
+        data["sources"] = selected_sources_for_result(job)
     return data
 
 
@@ -50,10 +56,8 @@ def compact_job_view(job: dict[str, Any], *, include_section_markdown: bool = Fa
     data["agent_name"] = job.get("agent_name") or ""
     data["agent_role_prompt"] = job.get("agent_role_prompt") or ""
     data["search_queries"] = job.get("search_queries") or []
-    data["source_urls"] = job.get("source_urls") or []
     data["source_count"] = len(job.get("source_urls") or [])
     data["iterations"] = [iteration_view(it) for it in (job.get("iterations") or [])]
-    data["research_log"] = job.get("research_log") or []
     data["iteration"] = int(job.get("iteration") or 0)
     data["max_iterations"] = int(job.get("max_iterations") or 5)
     data["enabled_sources"] = job.get("enabled_sources") or []
@@ -64,12 +68,12 @@ def compact_job_view(job: dict[str, Any], *, include_section_markdown: bool = Fa
     data["confirmed_outline"] = job.get("confirmed_outline") or []
     data["active_section_index"] = job.get("active_section_index")
     data["section_iterations"] = {
-        section_id: [iteration_view(it) for it in (iterations or [])]
+        section_id: [iteration_summary_view(it) for it in (iterations or [])]
         for section_id, iterations in (job.get("section_iterations") or {}).items()
     }
     data["section_selected_context"] = {
         section_id: {
-            "source_urls": context.get("source_urls") or [],
+            "source_count": len(context.get("source_urls") or []),
             "selected_at": context.get("selected_at"),
             "selected_context_chars": int(context.get("selected_context_chars") or 0),
             "selected_sources_count": int(context.get("selected_sources_count") or 0),
@@ -78,14 +82,58 @@ def compact_job_view(job: dict[str, Any], *, include_section_markdown: bool = Fa
         if isinstance(context, dict)
     }
     data["section_results"] = {
-        section_id: section_result_view(result, include_markdown=include_section_markdown)
+        section_id: (
+            section_result_view(result, include_markdown=True)
+            if include_section_markdown
+            else compact_section_result_view(result)
+        )
         for section_id, result in (job.get("section_results") or {}).items()
         if isinstance(result, dict)
     }
     data["report_framing"] = job.get("report_framing")
     data["assembled_result"] = job.get("assembled_result")
-    data["result"] = result_view(job, include_sources=False, include_markdown=False) if job.get("report_markdown") else None
+    data["attachments"] = job.get("attachments") or []
+    attachment_context = _compact_attachment_context(job.get("attachment_context"))
+    if attachment_context:
+        data["attachment_context"] = attachment_context
+    data["result"] = compact_result_view(job) if job.get("report_markdown") else None
     return data
+
+
+def _compact_attachment_context(context: Any) -> dict[str, Any] | None:
+    if not isinstance(context, dict) or not context.get("summary"):
+        return None
+    files = []
+    for file in context.get("files") or []:
+        if not isinstance(file, dict):
+            continue
+        files.append(
+            {
+                "id": file.get("id"),
+                "name": file.get("name"),
+                "status": file.get("status"),
+                "chunk_count": file.get("chunk_count"),
+                "ai_summary": file.get("ai_summary"),
+                "ai_key_points": file.get("ai_key_points") or [],
+                "ai_relevance": file.get("ai_relevance"),
+                "summary_selected_chunk_ids": file.get("summary_selected_chunk_ids") or [],
+            }
+        )
+    return {
+        "version": context.get("version") or 1,
+        "prepared_at": context.get("prepared_at") or "",
+        "files": files,
+        "chunks": [],
+        "summary": context.get("summary") or "",
+        "embedding_model": context.get("embedding_model"),
+        "embedding_batch_size": context.get("embedding_batch_size"),
+        "embedding_status": context.get("embedding_status"),
+        "summary_status": context.get("summary_status"),
+        "summary_mode": context.get("summary_mode"),
+        "summary_query": context.get("summary_query"),
+        "summary_top_k": context.get("summary_top_k"),
+        "summary_generated_at": context.get("summary_generated_at"),
+    }
 
 
 def section_result_view(result: dict[str, Any], *, include_markdown: bool = False) -> dict[str, Any]:
@@ -95,6 +143,7 @@ def section_result_view(result: dict[str, Any], *, include_markdown: bool = Fals
         "status": result.get("status"),
         "section_summary": result.get("section_summary") or "",
         "source_urls": result.get("source_urls") or [],
+        "citation_sources": result.get("citation_sources") or [],
         "error": result.get("error"),
         "completed_at": result.get("completed_at"),
         "updated_at": result.get("updated_at"),
@@ -104,6 +153,56 @@ def section_result_view(result: dict[str, Any], *, include_markdown: bool = Fals
     else:
         data["section_markdown_chars"] = len(markdown)
     return data
+
+
+def compact_section_result_view(result: dict[str, Any]) -> dict[str, Any]:
+    markdown = result.get("section_markdown") or ""
+    source_urls = result.get("source_urls") or []
+    citation_sources = result.get("citation_sources") or []
+    attachment_count = sum(
+        1
+        for source in citation_sources
+        if isinstance(source, dict) and source.get("kind") == "attachment"
+    )
+    return {
+        "section_id": result.get("section_id"),
+        "status": result.get("status"),
+        "section_summary": result.get("section_summary") or "",
+        "source_count": len(source_urls),
+        "citation_source_count": len(citation_sources),
+        "attachment_citation_count": attachment_count,
+        "url_citation_count": len(citation_sources) - attachment_count,
+        "error": result.get("error"),
+        "completed_at": result.get("completed_at"),
+        "updated_at": result.get("updated_at"),
+        "section_markdown_chars": len(markdown),
+    }
+
+
+def compact_result_view(job: dict[str, Any]) -> dict[str, Any]:
+    markdown = job.get("report_markdown") or ""
+    source_urls = job.get("source_urls") or []
+    citation_sources = job.get("citation_sources") or []
+    attachment_count = sum(
+        1
+        for source in citation_sources
+        if isinstance(source, dict) and source.get("kind") == "attachment"
+    )
+    return {
+        "research_id": job.get("research_id"),
+        "status": job.get("status"),
+        "query": job.get("query"),
+        "report_type": "research_report",
+        "source_count": len(source_urls),
+        "citation_source_count": len(citation_sources),
+        "attachment_citation_count": attachment_count,
+        "url_citation_count": len(citation_sources) - attachment_count,
+        "report_markdown_chars": len(markdown),
+        "error": job.get("error"),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "completed_at": job.get("completed_at"),
+    }
 
 
 def iteration_view(entry: dict[str, Any]) -> dict[str, Any]:
@@ -122,8 +221,55 @@ def iteration_view(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def iteration_summary_view(entry: dict[str, Any]) -> dict[str, Any]:
+    """Small section timeline summary for task loading.
+
+    Full section iteration records can grow quickly because each iteration keeps
+    raw search material for resume and context selection. Library/task loading
+    only needs enough data to show progress, so avoid returning per-query call
+    details in the default compact job view.
+    """
+    return {
+        "iteration": int(entry.get("iteration") or 0),
+        "source_id": entry.get("source_id") or "",
+        "source_name": entry.get("source_name") or "",
+        "queries": entry.get("queries") or [],
+        "results_count": int(entry.get("results_count") or 0),
+        "appended_at": entry.get("appended_at"),
+    }
+
+
 def source_view(source: dict[str, Any]) -> dict[str, Any]:
     return dict(source)
+
+
+def selected_sources_for_result(job: dict[str, Any]) -> list[dict[str, Any]]:
+    source_urls = [str(url or "") for url in (job.get("source_urls") or []) if str(url or "").strip()]
+    by_url: dict[str, dict[str, Any]] = {}
+    loose: list[dict[str, Any]] = []
+
+    def add(source: dict[str, Any]) -> None:
+        item = dict(source or {})
+        url = str(item.get("url") or "").strip()
+        if url:
+            current = by_url.get(url) or {}
+            by_url[url] = {**item, **{key: value for key, value in current.items() if value}}
+        else:
+            loose.append(item)
+
+    for source in job.get("selected_sources") or []:
+        if isinstance(source, dict):
+            add(source)
+    for context in (job.get("section_selected_context") or {}).values():
+        if not isinstance(context, dict):
+            continue
+        for source in context.get("selected_sources") or []:
+            if isinstance(source, dict):
+                add(source)
+
+    ordered = [by_url[url] for url in source_urls if url in by_url]
+    extra = [source for url, source in by_url.items() if url not in set(source_urls)]
+    return ordered + extra + loose
 
 
 def job_view(job: dict[str, Any]) -> dict[str, Any]:

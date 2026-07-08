@@ -142,6 +142,8 @@ def enrich_items_with_extracted_content(
             next_item["content_type"] = page.content_type
             if page.title and not next_item.get("title"):
                 next_item["title"] = page.title
+            if page.icon:
+                next_item["icon"] = page.icon
             if page.status == "success" and page.raw_content:
                 next_item["raw_content"] = page.raw_content
         enriched.append(next_item)

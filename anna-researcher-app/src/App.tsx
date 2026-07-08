@@ -1,9 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { connectAnnaRuntime } from "./api/annaRuntime";
-import { uploadResearchFilesToAps } from "./api/apsFiles";
+import { getResearchFileDownloadDescriptors, uploadResearchFilesToAps } from "./api/apsFiles";
 import { AnnaResearchApi, createStandaloneApi, type ResearchApi } from "./api/researchApi";
 import { DraftGenerationPage } from "./components/DraftGenerationPage";
-import { FileUploadDemoPage } from "./components/FileUploadDemoPage";
 import { FocusReviewPage } from "./components/FocusReviewPage";
 import { LanguageToggle } from "./components/LanguageToggle";
 import { OutlineReviewPage } from "./components/OutlineReviewPage";
@@ -27,7 +26,7 @@ import type { AnnaRuntimeApi, ReportSection } from "./types";
 import { summarizePlan } from "./workflow/planSummary";
 import { projectGuidedStep, type GuidedStepId } from "./workflow/stepState";
 
-type AppPage = "task-picker" | "workflow" | "library" | "sources" | "source-detail" | "source-new" | "file-upload-demo";
+type AppPage = "task-picker" | "workflow" | "library" | "sources" | "source-detail" | "source-new";
 
 export function App() {
   const { locale, setLocale, t } = useLocale();
@@ -155,6 +154,13 @@ export function App() {
           files: attachments,
         });
         await api.updateResearchJob(createdJob.research_id, { attachments: uploaded });
+        const descriptors = await getResearchFileDownloadDescriptors({
+          filesApi: annaRuntime?.files,
+          attachments: uploaded,
+        });
+        await api.prepareAttachments(createdJob.research_id, descriptors);
+        await api.embedAttachmentChunks(createdJob.research_id);
+        await api.summarizeAttachments(createdJob.research_id, { query: createdJob.query, top_k: 6 });
         setPendingAttachments((current) => current.filter((file) => !attachments.includes(file)));
       },
     });
@@ -243,11 +249,6 @@ export function App() {
     void research.refreshHistoryJobs().catch((err) => setValidationMessage(localizedError(err, t)));
     setLibraryReturnPage(appPage === "library" ? "task-picker" : appPage);
     setAppPage("library");
-  }
-
-  function showFileUploadDemo() {
-    setValidationMessage("");
-    setAppPage("file-upload-demo");
   }
 
   function showNewResearch() {
@@ -344,9 +345,6 @@ export function App() {
             <button type="button" className="secondary source-button" onClick={showLibrary} disabled={research.isBusy}>
               {t("libraryButton")}
             </button>
-            <button type="button" className="secondary source-button" onClick={showFileUploadDemo}>
-              文件
-            </button>
             {projection.canOpenSources ? (
               <button type="button" className="secondary source-button" onClick={showSources} data-testid="open-source-panel">
                 {t("sourcesButton")}
@@ -420,8 +418,6 @@ export function App() {
               onBack={() => setAppPage("sources")}
               onAddSource={addSource}
             />
-          ) : appPage === "file-upload-demo" ? (
-            <FileUploadDemoPage filesApi={annaRuntime?.files ?? null} onBack={() => setAppPage("workflow")} />
           ) : (
             <div className="workflow-pages">
               <WorkflowStepper
@@ -460,6 +456,7 @@ export function App() {
                   briefName={briefNameDraft}
                   researchNeed={researchNeedDraft}
                   attachments={pendingAttachments}
+                  uploadedAttachments={research.job?.attachments || []}
                   t={t}
                   stepLabel={makeIntroStepLabel(research.job?.max_iterations)}
                   validationMessage={alertMessage}

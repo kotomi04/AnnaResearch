@@ -158,7 +158,7 @@ export function projectSectionPreviews(job: ResearchJob | null | undefined): Sec
       title: section.title,
       summary: result.section_summary,
       markdown: result.section_markdown || "",
-      sourceCount: result.source_urls.length,
+      sourceCount: result.source_count ?? result.source_urls?.length ?? 0,
     }];
   });
 }

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,38 @@ ALLOWED_UPDATE_FIELDS = {
     "max_iterations",
     "enabled_sources",
     "active_section_index",
+    "attachments",
+    "attachment_context",
+}
+
+SPLIT_JOB_FIELDS = {
+    "iterations": "iterations.json",
+    "search_results": "search_results.json",
+    "selected_context": "selected_context.json",
+    "selected_sources": "selected_sources.json",
+    "section_iterations": "section_iterations.json",
+    "section_selected_context": "section_selected_context.json",
+    "section_results": "section_results.json",
+    "report_framing": "report_framing.json",
+    "assembled_result": "assembled_result.json",
+    "report_markdown": "report_markdown.json",
+    "attachments": "attachments.json",
+    "attachment_context": "attachment_context.json",
+}
+
+SPLIT_DEFAULTS = {
+    "iterations": [],
+    "search_results": [],
+    "selected_context": "",
+    "selected_sources": [],
+    "section_iterations": {},
+    "section_selected_context": {},
+    "section_results": {},
+    "report_framing": None,
+    "assembled_result": None,
+    "report_markdown": "",
+    "attachments": [],
+    "attachment_context": None,
 }
 
 
@@ -31,14 +63,13 @@ def normalize_query_for_dedup(query: str) -> str:
 
 
 def utc_now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 class JobStore:
     def __init__(self, root: Path | None = None):
         self.root = root or default_research_root()
         self.jobs_dir = self.root / "jobs"
-        self.latest_path = self.root / "latest_research_id"
 
     def create(self, *, query: str, query_domains: Any = None) -> dict[str, Any]:
         clean_query = str(query or "").strip()
@@ -47,7 +78,7 @@ class JobStore:
         now = utc_now()
         research_id = f"research_{uuid.uuid4().hex[:12]}"
         job = {
-            "schema_version": 2,
+            "schema_version": 3,
             "research_id": research_id,
             "query": clean_query,
             "query_domains": normalize_domains(query_domains),
@@ -82,9 +113,10 @@ class JobStore:
             "section_results": {},
             "report_framing": None,
             "assembled_result": None,
+            "attachments": [],
+            "attachment_context": None,
         }
         self.save(job)
-        self._write_latest(research_id)
         return job
 
     def update_metadata(self, research_id: str, updates: dict[str, Any]) -> dict[str, Any]:
@@ -179,7 +211,7 @@ class JobStore:
         job["section_iterations"] = all_iterations
         job["iteration"] = max(int(job.get("iteration") or 0), iteration)
         job["research_log"] = _flatten_section_research_log(job)
-        job["source_urls"] = _all_section_source_urls(job)
+        job["source_urls"] = _section_result_source_urls(job)
         job["source_count"] = len(job["source_urls"])
         return self.save(job)
 
@@ -222,11 +254,14 @@ class JobStore:
             "section_markdown": markdown,
             "section_summary": summary,
             "source_urls": result.get("source_urls") or [],
+            "citation_sources": result.get("citation_sources") or [],
             "error": result.get("error"),
             "completed_at": utc_now() if status == "completed" else None,
             "updated_at": utc_now(),
         }
         job["section_results"] = results
+        job["source_urls"] = _section_result_source_urls(job)
+        job["source_count"] = len(job["source_urls"])
         if status == "failed":
             job["status"] = "failed"
             job["stage"] = "failed"
@@ -346,6 +381,7 @@ class JobStore:
         job = self.load(research_id)
         job["report_markdown"] = str(result.get("report_markdown") or "")
         job["source_urls"] = result.get("source_urls") or job.get("source_urls") or []
+        job["citation_sources"] = result.get("citation_sources") or job.get("citation_sources") or []
         job["selected_sources"] = result.get("selected_sources") or job.get("selected_sources") or []
         job["status"] = str(result.get("status") or "completed")
         job["stage"] = str(result.get("stage") or "completed")
@@ -355,7 +391,13 @@ class JobStore:
         return self.save(job)
 
     def path_for(self, research_id: str) -> Path:
-        return self.jobs_dir / f"{research_id}.json"
+        return self.job_dir_for(research_id) / "job.json"
+
+    def job_dir_for(self, research_id: str) -> Path:
+        clean_id = str(research_id or "").strip()
+        if not clean_id:
+            raise ValidationError("research_id is required")
+        return self.jobs_dir / clean_id
 
     def load(self, research_id: str) -> dict[str, Any]:
         clean_id = str(research_id or "").strip()
@@ -371,28 +413,20 @@ class JobStore:
             raise StoreError(f"malformed job record: {clean_id}") from exc
         if not isinstance(data, dict) or data.get("research_id") != clean_id:
             raise StoreError(f"invalid job record: {clean_id}")
-        return data
-
-    def load_latest(self) -> dict[str, Any] | None:
-        if not self.latest_path.exists():
-            return None
-        research_id = self.latest_path.read_text(encoding="utf-8").strip()
-        if not research_id:
-            return None
-        return self.load(research_id)
+        return self._hydrate_split_fields(data)
 
     def list_jobs(self, *, limit: int = 50) -> list[dict[str, Any]]:
         if not self.jobs_dir.exists():
             return []
         jobs: list[dict[str, Any]] = []
-        for path in self.jobs_dir.glob("*.json"):
+        for path in self.jobs_dir.glob("research_*/job.json"):
             try:
                 with path.open("r", encoding="utf-8") as f:
                     data = json.load(f)
             except json.JSONDecodeError as exc:
-                raise StoreError(f"malformed job record: {path.stem}") from exc
+                raise StoreError(f"malformed job record: {path.parent.name}") from exc
             if isinstance(data, dict) and data.get("research_id"):
-                jobs.append(data)
+                jobs.append(self._hydrate_split_fields(data))
         jobs.sort(key=lambda job: str(job.get("updated_at") or job.get("created_at") or ""), reverse=True)
         return jobs[: max(1, min(int(limit or 50), 200))]
 
@@ -400,18 +434,73 @@ class JobStore:
         research_id = str(job.get("research_id") or "").strip()
         if not research_id:
             raise StoreError("job is missing research_id")
+        job.pop("source_previews", None)
         job["updated_at"] = utc_now()
-        self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        job["schema_version"] = 3
         path = self.path_for(research_id)
-        tmp = path.with_suffix(".tmp")
+        job_dir = path.parent
+        job_dir.mkdir(parents=True, exist_ok=True)
+        refs = dict(job.get("refs") or {})
+        for field, filename in SPLIT_JOB_FIELDS.items():
+            value = job.get(field, SPLIT_DEFAULTS[field])
+            ref = str(refs.get(field) or filename).strip() or filename
+            split_path = job_dir / ref
+            if _is_default_split_value(field, value):
+                refs.pop(field, None)
+                self._delete_json_file(split_path)
+                if ref != filename:
+                    self._delete_json_file(job_dir / filename)
+                continue
+            refs[field] = filename
+            self._write_json_file(job_dir / filename, value)
+        stored = {
+            key: value
+            for key, value in job.items()
+            if key not in SPLIT_JOB_FIELDS
+        }
+        stored["refs"] = refs
+        tmp = path.with_name(path.name + ".tmp")
         with tmp.open("w", encoding="utf-8") as f:
-            json.dump(job, f, ensure_ascii=False, indent=2, sort_keys=True)
+            json.dump(stored, f, ensure_ascii=False, indent=2, sort_keys=True)
         tmp.replace(path)
+        return self._hydrate_split_fields(stored)
+
+    def _hydrate_split_fields(self, stored: dict[str, Any]) -> dict[str, Any]:
+        job = dict(stored)
+        research_id = str(job.get("research_id") or "").strip()
+        refs = job.get("refs") if isinstance(job.get("refs"), dict) else {}
+        job_dir = self.job_dir_for(research_id)
+        for field, filename in SPLIT_JOB_FIELDS.items():
+            ref = str(refs.get(field) or filename).strip()
+            path = job_dir / ref
+            if path.exists():
+                job[field] = self._read_json_file(path, research_id=research_id, field=field)
+            else:
+                job[field] = SPLIT_DEFAULTS[field]
         return job
 
-    def _write_latest(self, research_id: str) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.latest_path.write_text(research_id, encoding="utf-8")
+    def _read_json_file(self, path: Path, *, research_id: str, field: str) -> Any:
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except json.JSONDecodeError as exc:
+            raise StoreError(f"malformed {field} record: {research_id}") from exc
+
+    def _write_json_file(self, path: Path, value: Any) -> None:
+        tmp = path.with_name(path.name + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(value, f, ensure_ascii=False, indent=2, sort_keys=True)
+        tmp.replace(path)
+
+    def _delete_json_file(self, path: Path) -> None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _is_default_split_value(field: str, value: Any) -> bool:
+    return value == SPLIT_DEFAULTS[field]
 
 
 def _normalize_section(section: dict[str, Any], idx: int) -> dict[str, Any]:
@@ -531,16 +620,18 @@ def _source_call_top_titles(call: dict[str, Any]) -> list[str]:
     return [str(title or "") for title in ((call or {}).get("top_titles") or [])[:3]]
 
 
-def _all_section_source_urls(job: dict[str, Any]) -> list[str]:
-    urls = set()
-    for iterations in (job.get("section_iterations") or {}).values():
-        for entry in iterations or []:
-            for item in entry.get("raw_results") or []:
-                url = str(item.get("url") or "")
-                if url:
-                    urls.add(url)
-    for result in (job.get("section_results") or {}).values():
+def _section_result_source_urls(job: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    results = job.get("section_results") or {}
+    ordered_ids = [str(section.get("id") or "") for section in (job.get("confirmed_outline") or []) if isinstance(section, dict)]
+    ordered_ids.extend(section_id for section_id in results if section_id not in set(ordered_ids))
+    for section_id in ordered_ids:
+        result = results.get(section_id) or {}
         for url in result.get("source_urls") or []:
-            if url:
-                urls.add(str(url))
-    return sorted(urls)
+            normalized = str(url or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            urls.append(normalized)
+    return urls

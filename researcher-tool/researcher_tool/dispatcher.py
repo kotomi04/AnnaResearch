@@ -5,6 +5,7 @@ import json
 import os
 from typing import Any
 
+from .attachments import prepare_attachments
 from .context_selector import LexicalContextSelector
 from .errors import ConfigurationError, ValidationError
 from .job_store import JobStore, normalize_query_for_dedup
@@ -114,6 +115,8 @@ class AppDispatcher:
             if not isinstance(updates, dict):
                 raise ValidationError("updates must be an object")
             return {"job": status_view(self.jobs.update_metadata(research_id, updates))}
+        if method == "app_prepare_attachments":
+            return self._prepare_attachments(args)
         if method == "app_save_confirmed_research_role":
             research_id = required_string(args, "research_id")
             role = args.get("role")
@@ -134,13 +137,16 @@ class AppDispatcher:
             return {"job": compact_job_view(self.jobs.save_confirmed_outline(research_id, sections))}
         if method == "app_get_research_job":
             research_id = str(args.get("research_id") or "").strip()
-            job = self.jobs.load(research_id) if research_id else self.jobs.load_latest()
+            job = self.jobs.load(research_id) if research_id else next(iter(self.jobs.list_jobs(limit=1)), None)
             if not job:
                 return {"job": None}
             view = compact_job_view(job)
-            view["job_transfer"] = self.transfer_server.job_descriptor(str(job.get("research_id")))
-            if job.get("report_markdown"):
-                view["result_transfer"] = self.transfer_server.result_descriptor(str(job.get("research_id")), method="GET")
+            try:
+                view["job_transfer"] = self.transfer_server.job_descriptor(str(job.get("research_id")))
+                if job.get("report_markdown"):
+                    view["result_transfer"] = self.transfer_server.result_descriptor(str(job.get("research_id")), method="GET")
+            except OSError:
+                pass
             return {"job": view}
         if method == "app_list_research_jobs":
             limit = int(args.get("limit") or 50)
@@ -197,6 +203,27 @@ class AppDispatcher:
             if os.getenv("ANNA_RESEARCHER_FAKE_TAVILY") == "1":
                 return "fake-tavily-token"
         return ""
+
+    def _prepare_attachments(self, args: dict[str, Any]) -> dict[str, Any]:
+        research_id = required_string(args, "research_id")
+        attachments = args.get("attachments")
+        if not isinstance(attachments, list):
+            raise ValidationError("attachments must be an array")
+        self.jobs.load(research_id)
+        context = prepare_attachments(
+            research_id=research_id,
+            job_dir=self.jobs.job_dir_for(research_id),
+            attachments=attachments,
+        )
+        job = self.jobs.update_metadata(research_id, {"attachment_context": context})
+        view = compact_job_view(job)
+        view["attachment_context_summary"] = {
+            "chunk_count": len(context.get("chunks") or []),
+            "file_count": len(context.get("files") or []),
+            "ready_file_count": sum(1 for file in (context.get("files") or []) if isinstance(file, dict) and file.get("status") == "ready"),
+            "summary_chars": len(str(context.get("summary") or "")),
+        }
+        return {"job": view}
 
     def _update_credential(self, args: dict[str, Any]) -> dict[str, Any]:
         source_id = required_string(args, "id")

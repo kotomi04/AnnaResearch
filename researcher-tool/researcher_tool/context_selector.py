@@ -89,6 +89,7 @@ class LexicalContextSelector:
                     "extraction_status": result.get("extraction_status"),
                     "extraction_error": result.get("extraction_error"),
                     "content_type": result.get("content_type"),
+                    "icon": result.get("icon") or "",
                 },
             ))
 

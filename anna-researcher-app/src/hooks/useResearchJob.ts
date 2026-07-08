@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ResearchApi } from "../api/researchApi";
 import type {
+  CitationSource,
   ConfirmedResearchRole,
   IterationEntry,
   ReportFraming,
@@ -36,7 +37,7 @@ export interface FocusCandidate {
 
 interface CitationReference {
   number: number;
-  url: string;
+  source: CitationSource;
 }
 
 interface DecideCallSource {
@@ -57,6 +58,7 @@ interface SectionRunResult {
   markdown: string;
   summary: string;
   sourceUrls: string[];
+  citationSources: CitationSource[];
 }
 
 export interface CommentReference {
@@ -275,7 +277,12 @@ export function useResearchJob(api: ResearchApi) {
         if (typeof options !== "string" && options.onJobCreated) {
           await options.onJobCreated(nextJob);
           if (runId !== runIdRef.current) return;
+          const refreshed = await api.getResearchJob(nextJob.research_id);
+          if (runId !== runIdRef.current) return;
+          if (refreshed) setJob(refreshed);
         }
+        const activeJob = (await api.getResearchJob(nextJob.research_id).catch(() => null)) || nextJob;
+        setJob(activeJob);
         const candidates = await generateRoleCandidates(api, query, regenerationInstruction);
         if (runId !== runIdRef.current) return;
         setRoleCandidates(candidates);
@@ -311,7 +318,7 @@ export function useResearchJob(api: ResearchApi) {
       try {
         const saved = await api.saveConfirmedResearchRole(job.research_id, role);
         setJob({ ...job, ...saved, confirmed_role: role });
-        const candidates = await generateFocusCandidates(api, job.query || "", role);
+        const candidates = await generateFocusCandidates(api, promptQueryForJob(job), role);
         setFocusCandidates(candidates);
         setPhase("focus_review");
       } catch (err) {
@@ -328,7 +335,7 @@ export function useResearchJob(api: ResearchApi) {
       if (!job?.query || !role) return;
       setPhase("generating_focuses");
       try {
-        setFocusCandidates(await generateFocusCandidates(api, job.query, role, instruction));
+        setFocusCandidates(await generateFocusCandidates(api, promptQueryForJob(job), role, instruction));
         setPhase("focus_review");
       } catch (err) {
         setError(err);
@@ -345,7 +352,7 @@ export function useResearchJob(api: ResearchApi) {
       try {
         const saved = await api.saveConfirmedResearchFocuses(job.research_id, focuses);
         setJob({ ...job, ...saved, confirmed_focuses: focuses });
-        const outline = await generateOutlineDraft(api, job.query || "", job.confirmed_role, focuses);
+        const outline = await generateOutlineDraft(api, promptQueryForJob(job), job.confirmed_role, focuses);
         const assigned = await assignAllowedSources(api, outline, readyEnabledSources(sources));
         setOutlineDraft(assigned);
         setPhase("outline_review");
@@ -362,7 +369,7 @@ export function useResearchJob(api: ResearchApi) {
       if (!job?.query || !job.confirmed_role || !job.confirmed_focuses?.length) return;
       setPhase("generating_outline");
       try {
-        const outline = await generateOutlineDraft(api, job.query, job.confirmed_role, job.confirmed_focuses, instruction);
+        const outline = await generateOutlineDraft(api, promptQueryForJob(job), job.confirmed_role, job.confirmed_focuses, instruction);
         setOutlineDraft(await assignAllowedSources(api, outline, readyEnabledSources(sources), instruction));
         setPhase("outline_review");
       } catch (err) {
@@ -391,12 +398,12 @@ export function useResearchJob(api: ResearchApi) {
         setOutlineDraft(confirmedSections);
         setJob(currentJob);
         const sectionResults: SectionRunResult[] = [];
-        const citationRegistry: string[] = [];
+        const citationRegistry: CitationSource[] = [];
         for (let index = 0; index < confirmedSections.length; index++) {
           const section = confirmedSections[index];
           const reusable = options.resume ? reusableSectionResult(section, currentJob.section_results?.[section.id]) : null;
           if (reusable) {
-            registerCitationReferences(citationRegistry, reusable.sourceUrls);
+            registerCitationSources(citationRegistry, reusable.citationSources);
             sectionResults.push(reusable);
             continue;
           }
@@ -441,15 +448,16 @@ export function useResearchJob(api: ResearchApi) {
         const framing = await generateReportFraming(api, currentJob.query || initialJob.query || "", focuses, confirmedSections, sectionResults);
         currentJob = await api.saveReportFraming({ research_id: initialJob.research_id, framing });
         const reportMarkdown = assembleReport(framing, sectionResults);
-        const sourceUrls = citationRegistry.length ? [...citationRegistry] : sortedUnique(sectionResults.flatMap((section) => section.sourceUrls));
+        const citationSources = citationRegistry.length ? [...citationRegistry] : citationSourcesFromUrls(sortedUnique(sectionResults.flatMap((section) => section.sourceUrls)));
+        const sourceUrls = citationSources.filter(isUrlCitationSource).map((source) => source.url);
         appendRunEvent(setRunEvents, {
           kind: "final_assembly",
           title: "Final assembly",
           detail: `${sourceUrls.length} sources`,
           count: sourceUrls.length,
         });
-        currentJob = await api.saveAssembledResearchResult({ research_id: initialJob.research_id, report_markdown: reportMarkdown, source_urls: sourceUrls });
-        const completedResult = currentJob.result || { research_id: initialJob.research_id, report_markdown: reportMarkdown, source_urls: sourceUrls, status: "completed" };
+        currentJob = await api.saveAssembledResearchResult({ research_id: initialJob.research_id, report_markdown: reportMarkdown, source_urls: sourceUrls, citation_sources: citationSources });
+        const completedResult = currentJob.result || { research_id: initialJob.research_id, report_markdown: reportMarkdown, source_urls: sourceUrls, citation_sources: citationSources, status: "completed" };
         setJob(currentJob);
         setResult(completedResult);
         setLastCompletedJob(currentJob);
@@ -868,6 +876,7 @@ function reusableSectionResult(section: ReportSection, result: NonNullable<Resea
     markdown,
     summary: result.section_summary || deriveSummary(markdown),
     sourceUrls,
+    citationSources: result.citation_sources?.length ? result.citation_sources : citationSourcesFromUrls(sourceUrls),
   };
 }
 
@@ -911,6 +920,7 @@ function sectionRunResultsFromJob(job: ResearchJob): SectionRunResult[] {
         markdown,
         summary: result.section_summary || deriveSummary(markdown),
         sourceUrls: Array.isArray(result.source_urls) ? result.source_urls.filter(Boolean) : [],
+        citationSources: result.citation_sources?.length ? result.citation_sources : citationSourcesFromUrls(Array.isArray(result.source_urls) ? result.source_urls.filter(Boolean) : []),
       };
     })
     .filter((item): item is SectionRunResult => Boolean(item));
@@ -1469,7 +1479,8 @@ function headingFromMarkdown(markdown: string): string {
 }
 
 async function updateJob(api: ResearchApi, job: ResearchJob, updates: Record<string, unknown>): Promise<ResearchJob> {
-  return api.updateResearchJob(requiredResearchId(job), updates);
+  const updated = await api.updateResearchJob(requiredResearchId(job), updates);
+  return { ...job, ...updated };
 }
 
 function requiredResearchId(job: ResearchJob): string {
@@ -1479,6 +1490,49 @@ function requiredResearchId(job: ResearchJob): string {
 
 function progressForIteration(iteration: number, maxIterations: number): number {
   return Math.min(85, 40 + Math.round((iteration / Math.max(1, maxIterations)) * 35));
+}
+
+function promptQueryForJob(job: ResearchJob | null | undefined, fallbackQuery = ""): string {
+  const query = String(job?.query || fallbackQuery || "").trim();
+  const context = job?.attachment_context;
+  if (!context?.summary) return query;
+  const fileSummaries = (context.files || [])
+    .filter((file) => file.status === "ready" && (file.ai_summary || file.ai_key_points?.length))
+    .slice(0, 8)
+    .map((file) => {
+      const points = (file.ai_key_points || []).slice(0, 4).map((point) => `  - ${point}`).join("\n");
+      return [`File: ${file.name}`, file.ai_summary ? `Summary: ${file.ai_summary}` : "", points ? `Key points:\n${points}` : ""].filter(Boolean).join("\n");
+    })
+    .join("\n\n");
+  const attachmentBlock = [`Uploaded file summary:\n${context.summary}`, fileSummaries].filter(Boolean).join("\n\n").slice(0, 5000);
+  return [query, attachmentBlock].filter(Boolean).join("\n\n");
+}
+
+interface AttachmentCitationChunk {
+  chunk_id?: string;
+  file_id?: string;
+  file_name?: string;
+  index?: number;
+  quote?: string;
+}
+
+async function selectAttachmentContextForSection(api: ResearchApi, job: ResearchJob, section: ReportSection): Promise<{ context: string; chunks: AttachmentCitationChunk[] }> {
+  if (!job.attachment_context?.summary && !job.attachments?.length) return { context: "", chunks: [] };
+  try {
+    const response = await api.selectAttachmentContext({
+      research_id: requiredResearchId(job),
+      query: attachmentChunkQueryForSection(section),
+      top_k: 4,
+    });
+    return { context: response.selected_context || "", chunks: response.selected_chunks || [] };
+  } catch {
+    return { context: "", chunks: [] };
+  }
+}
+
+function attachmentChunkQueryForSection(section: ReportSection): string {
+  const outline = String(section.outline || "").replace(/\s+/g, " ").trim();
+  return [section.title, outline.slice(0, 160)].filter(Boolean).join("\n");
 }
 
 async function generateRoleCandidates(api: ResearchApi, query: string, instruction = ""): Promise<RoleCandidate[]> {
@@ -1592,9 +1646,9 @@ async function runSection(input: {
   role: ConfirmedResearchRole;
   focuses: string[];
   sources: ResearchSourceView[];
-  citationRegistry: string[];
+  citationRegistry: CitationSource[];
   onEvent?(event: Parameters<typeof makeLiveRunEvent>[0]): void;
-}): Promise<{ markdown: string; summary: string; sourceUrls: string[] }> {
+}): Promise<{ markdown: string; summary: string; sourceUrls: string[]; citationSources: CitationSource[] }> {
   const { api, job, section, role, focuses, sources, citationRegistry, onEvent } = input;
   const allowedSources = sources.filter((source) => section.allowed_source_ids.includes(source.id));
   if (!allowedSources.length) throw new Error(`Section has no configured allowed source: ${section.title}`);
@@ -1660,15 +1714,20 @@ async function runSection(input: {
     count: (selected.source_urls || []).length,
   });
   const sourceUrls = selected.source_urls || [];
-  const citationReferences = registerCitationReferences(citationRegistry, sourceUrls);
-  const writer = await writeSection(api, job.query || "", role, focuses, section, selected.selected_context || "", citationReferences);
+  const webReferences = registerCitationReferences(citationRegistry, sourceUrls);
+  const attachmentSelection = await selectAttachmentContextForSection(api, job, section);
+  const attachmentReferences = registerAttachmentCitationReferences(citationRegistry, attachmentSelection.chunks);
+  const citationReferences = [...webReferences, ...attachmentReferences];
+  const writer = await writeSection(api, job.query || "", role, focuses, section, selected.selected_context || "", citationReferences, attachmentSelection.context);
   const markdown = remapLocalCitations(writer.markdown, citationReferences);
+  const sectionCitationSources = citationReferences.map((reference) => reference.source);
   await api.saveSectionResult({
     research_id: requiredResearchId(job),
     section_id: section.id,
     section_markdown: markdown,
     section_summary: writer.summary,
     source_urls: sourceUrls,
+    citation_sources: sectionCitationSources,
     status: "completed",
   });
   onEvent?.({
@@ -1678,7 +1737,7 @@ async function runSection(input: {
     title: "Section written",
     detail: writer.summary,
   });
-  return { ...writer, markdown, sourceUrls };
+  return { ...writer, markdown, sourceUrls, citationSources: sectionCitationSources };
 }
 
 async function decideNextAction(input: {
@@ -1733,10 +1792,11 @@ async function writeSection(
   section: ReportSection,
   selectedContext: string,
   citationReferences: CitationReference[],
+  attachmentContext: string,
 ): Promise<{ markdown: string; summary: string }> {
   const citationGuide = citationReferences.length
-    ? citationReferences.map((reference) => `[${reference.number}] ${reference.url}`).join("\n")
-    : "No selected source URLs for this section.";
+    ? citationReferences.map((reference) => citationReferencePromptLine(reference)).join("\n")
+    : "No selected web or uploaded-file sources for this section.";
   const text = await completeText(api, [
     { role: "system", content: { type: "text", text: role.agent_role_prompt } },
     {
@@ -1746,9 +1806,9 @@ async function writeSection(
         text:
           'Write one report section. Return strict JSON only: {"section_markdown":"...","section_summary":"..."}.\n' +
           "Use only the provided context. The markdown should include the section heading.\n" +
-          "When citing evidence, use ONLY the global citation numbers listed below, such as [3]. Do not invent new citation numbers and do not restart citations from [1] for this section.\n\n" +
+          "When citing evidence, use ONLY the global citation numbers listed below, such as [3]. Use uploaded-file citation numbers when relying on attachment chunks. Do not invent new citation numbers and do not restart citations from [1] for this section.\n\n" +
           `Global citation map for this section:\n${citationGuide}\n\n` +
-          `Task:\n${query}\n\nFocuses:\n${focuses.map((focus) => `- ${focus}`).join("\n")}\n\nSection: ${section.title}\n${section.outline}\n\nContext:\n${selectedContext}`,
+          `Task:\n${query}\n\nFocuses:\n${focuses.map((focus) => `- ${focus}`).join("\n")}\n\nSection: ${section.title}\n${section.outline}\n\nWeb context:\n${selectedContext}\n\nAttachment chunk context:\n${attachmentContext || "(none)"}`,
       },
     },
   ]);
@@ -1798,19 +1858,77 @@ function assembleReport(framing: ReportFraming, results: Array<{ markdown: strin
     .join("\n\n");
 }
 
-function registerCitationReferences(registry: string[], urls: string[]): CitationReference[] {
+function registerCitationReferences(registry: CitationSource[], urls: string[]): CitationReference[] {
   const references: CitationReference[] = [];
   for (const url of urls) {
     const normalized = String(url || "").trim();
     if (!normalized) continue;
-    let index = registry.indexOf(normalized);
+    const source: CitationSource = { kind: "url", url: normalized };
+    let index = registry.findIndex((item) => item.kind === "url" && item.url === normalized);
     if (index === -1) {
-      registry.push(normalized);
+      registry.push(source);
       index = registry.length - 1;
     }
-    references.push({ number: index + 1, url: normalized });
+    references.push({ number: index + 1, source: registry[index] });
   }
   return references;
+}
+
+function registerCitationSources(registry: CitationSource[], sources: CitationSource[]): void {
+  for (const source of sources) {
+    if (source.kind === "url") {
+      registerCitationReferences(registry, [source.url]);
+    } else {
+      registerAttachmentCitationReferences(registry, [
+        {
+          file_id: source.file_id,
+          file_name: source.file_name,
+          chunk_id: source.chunk_id,
+          index: source.index,
+          quote: source.quote,
+        },
+      ]);
+    }
+  }
+}
+
+function registerAttachmentCitationReferences(registry: CitationSource[], chunks: AttachmentCitationChunk[]): CitationReference[] {
+  const references: CitationReference[] = [];
+  for (const chunk of chunks) {
+    const fileId = String(chunk.file_id || "").trim();
+    const fileName = String(chunk.file_name || fileId || "Uploaded file").trim();
+    const chunkId = String(chunk.chunk_id || "").trim();
+    if (!fileId && !chunkId) continue;
+    const source: CitationSource = {
+      kind: "attachment",
+      file_id: fileId || fileName,
+      file_name: fileName,
+      chunk_id: chunkId || undefined,
+      index: Number.isFinite(Number(chunk.index)) ? Number(chunk.index) : undefined,
+      quote: String(chunk.quote || "").trim(),
+    };
+    let index = registry.findIndex((item) => item.kind === "attachment" && item.file_id === source.file_id && item.chunk_id === source.chunk_id);
+    if (index === -1) {
+      registry.push(source);
+      index = registry.length - 1;
+    }
+    references.push({ number: index + 1, source: registry[index] });
+  }
+  return references;
+}
+
+function citationReferencePromptLine(reference: CitationReference): string {
+  const source = reference.source;
+  if (source.kind === "url") return `[${reference.number}] ${source.url}`;
+  return `[${reference.number}] Uploaded file: ${source.file_name}${source.chunk_id ? `, chunk ${source.chunk_id}` : ""}`;
+}
+
+function citationSourcesFromUrls(urls: string[]): CitationSource[] {
+  return urls.map((url) => ({ kind: "url", url: String(url || "").trim() })).filter((source) => source.url);
+}
+
+function isUrlCitationSource(source: CitationSource): source is Extract<CitationSource, { kind: "url" }> {
+  return source.kind === "url";
 }
 
 function remapLocalCitations(markdown: string, references: CitationReference[]): string {

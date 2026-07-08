@@ -287,6 +287,7 @@ def save_http_result(jobs: JobStore, research_id: str, body: dict[str, Any]) -> 
     result = {
         "report_markdown": report,
         "source_urls": body.get("source_urls") or existing.get("source_urls") or [],
+        "citation_sources": body.get("citation_sources") or existing.get("citation_sources") or [],
         "status": "completed",
         "stage": "completed",
         "progress": 100,
@@ -304,6 +305,7 @@ def save_http_assembled_result(jobs: JobStore, research_id: str, body: dict[str,
     result = {
         "report_markdown": report,
         "source_urls": body.get("source_urls") or existing.get("source_urls") or [],
+        "citation_sources": body.get("citation_sources") or existing.get("citation_sources") or [],
         "status": "completed",
         "stage": "completed",
         "progress": 100,
@@ -331,6 +333,7 @@ def save_http_section_result(jobs: JobStore, research_id: str, section_id: str, 
         "section_markdown": markdown,
         "section_summary": body.get("section_summary"),
         "source_urls": body.get("source_urls") or [],
+        "citation_sources": body.get("citation_sources") or [],
         "error": body.get("error"),
     }
     job = jobs.save_section_result(research_id, section_id, result)
@@ -388,7 +391,7 @@ def get_http_source_test(source_tests: dict[str, dict[str, Any]], test_id: str) 
 
 
 def compact_result_view(job: dict[str, Any]) -> dict[str, Any]:
-    return result_view(job, include_sources=False)
+    return result_view(job, include_sources=True)
 
 
 def error_body(exc: ResearcherToolError) -> dict[str, Any]:

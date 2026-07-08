@@ -4,7 +4,7 @@
   "tool_id": "tool-xhz-researcher-python-e7k8xa3s",
   "type": "python",
   "enabled": true,
-  "host_capabilities": ["llm.embed"],
+  "host_capabilities": ["llm.embed", "llm.sample"],
   "distribution": {
     "active": "local",
     "profiles": {

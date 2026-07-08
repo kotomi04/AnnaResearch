@@ -10,6 +10,8 @@ import urllib.request
 import pytest
 
 from researcher_tool.context_selector import LexicalContextSelector
+from researcher_tool.attachment_embeddings import embed_attachment_chunks
+from researcher_tool.attachment_summary import select_attachment_context, summarize_attachment_context
 from researcher_tool.dispatcher import AppDispatcher
 from researcher_tool.errors import ConfigurationError, NotFoundError, ValidationError
 from researcher_tool.job_store import JobStore, normalize_query_for_dedup
@@ -34,6 +36,7 @@ from researcher_tool.sources.extraction.models import ExtractedPage
 from researcher_tool.sources.extraction.pdf import extract_pdf
 from researcher_tool.sources.native import duckduckgo as duckduckgo_native
 from researcher_tool.sources.native.executor import NativeResearchSourceExecutor
+from researcher_tool.views import compact_job_view
 
 
 def make_dispatcher(tmp_path):
@@ -64,6 +67,45 @@ class FailingTransferServer:
 
     def result_descriptor(self, research_id: str, *, method: str = "GET"):
         raise PermissionError("socket creation blocked")
+
+
+class FakeEmbeddings:
+    def __init__(self):
+        self.calls = []
+
+    def create(self, *, texts, model="anna-managed-v1", timeout=30.0):
+        self.calls.append(list(texts))
+        return {
+            "data": [{"embedding": [1.0, float(index + 1)]} for index, _ in enumerate(texts)],
+            "_meta": {"dimensions": 2},
+        }
+
+
+class FakeSampling:
+    def __init__(self):
+        self.calls = []
+
+    def create_message(self, **kwargs):
+        self.calls.append(kwargs)
+        return {
+            "content": {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "summary": "附件显示英伟达短期下跌与估值和供应链预期有关。",
+                        "files": [
+                            {
+                                "file_id": "file-1",
+                                "summary": "nvidia.pdf 讨论了股价压力和近期动作。",
+                                "key_points": ["短期波动来自估值压力", "新产品和供应链仍是核心变量"],
+                                "relevance": "可用于股票走势分析",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +198,145 @@ def test_job_create_update_latest_and_not_found(tmp_path):
         dispatcher.dispatch("app_get_research_job", {"research_id": "missing"})
 
 
+def test_job_store_writes_split_files_only_for_non_default_values(tmp_path):
+    jobs = JobStore(root=tmp_path / ".research")
+    job = jobs.create(query="anna")
+    research_id = job["research_id"]
+    job_dir = jobs.job_dir_for(research_id)
+
+    assert (job_dir / "job.json").exists()
+    assert not (job_dir / "attachments.json").exists()
+    assert not (job_dir / "attachment_context.json").exists()
+    assert not (job_dir / "section_results.json").exists()
+    assert jobs.load(research_id)["attachments"] == []
+
+    jobs.update_metadata(research_id, {"attachments": [{"name": "brief.md"}]})
+
+    assert (job_dir / "attachments.json").exists()
+    assert jobs.load(research_id)["attachments"] == [{"name": "brief.md"}]
+
+    jobs.update_metadata(research_id, {"attachments": []})
+
+    assert not (job_dir / "attachments.json").exists()
+    assert jobs.load(research_id)["attachments"] == []
+
+
+def test_prepare_attachments_downloads_and_persists_text_chunks(tmp_path):
+    dispatcher = make_dispatcher(tmp_path)
+    job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
+    result = dispatcher.dispatch(
+        "app_prepare_attachments",
+        {
+            "research_id": job["research_id"],
+            "attachments": [
+                {
+                    "name": "brief.md",
+                    "path": "research-jobs/test/uploads/brief.md",
+                    "content_type": "text/markdown",
+                    "size_bytes": 38,
+                    "download_url": "data:text/markdown;base64,QXR0YWNobWVudCByZXNlYXJjaCBicmllZiBmb3IgQW5uYS4=",
+                }
+            ],
+        },
+    )
+
+    loaded = dispatcher.jobs.load(job["research_id"])
+    context = loaded["attachment_context"]
+    assert result["job"]["research_id"] == job["research_id"]
+    assert result["job"]["attachment_context_summary"]["chunk_count"] == 1
+    assert "attachment_context" not in result["job"]
+    assert context["files"][0]["status"] == "ready"
+    assert context["files"][0]["chunk_count"] == 1
+    assert context["chunks"][0]["file_name"] == "brief.md"
+    assert "Attachment research brief for Anna." in context["chunks"][0]["text"]
+
+
+def test_embed_attachment_chunks_batches_and_persists_vectors(tmp_path):
+    dispatcher = make_dispatcher(tmp_path)
+    job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
+    context = {
+        "version": 1,
+        "prepared_at": "now",
+        "files": [],
+        "summary": "",
+        "chunks": [
+            {"chunk_id": f"file-1:{index + 1:04d}", "file_id": "file-1", "file_name": "brief.md", "index": index + 1, "text": f"chunk {index + 1}"}
+            for index in range(7)
+        ],
+    }
+    dispatcher.jobs.update_metadata(job["research_id"], {"attachment_context": context})
+    fake = FakeEmbeddings()
+
+    embed_attachment_chunks(jobs=dispatcher.jobs, embeddings=fake, research_id=job["research_id"])
+
+    loaded = dispatcher.jobs.load(job["research_id"])["attachment_context"]
+    assert [len(call) for call in fake.calls] == [2, 2, 2, 1]
+    assert loaded["embedding_status"] == "ready"
+    assert all(chunk.get("embedding") for chunk in loaded["chunks"])
+
+
+def test_summarize_attachment_context_selects_top_chunks_and_writes_per_file_summary(tmp_path):
+    dispatcher = make_dispatcher(tmp_path)
+    job = dispatcher.dispatch("app_create_research_job", {"query": "nvidia stock"})["job"]
+    context = {
+        "version": 1,
+        "prepared_at": "now",
+        "files": [{"id": "file-1", "name": "nvidia.pdf", "status": "ready", "chunk_count": 2}],
+        "summary": "legacy summary",
+        "chunks": [
+            {"chunk_id": "file-1:0001", "file_id": "file-1", "file_name": "nvidia.pdf", "index": 1, "text": "Nvidia stock fell on valuation concerns.", "embedding": [1.0, 1.0]},
+            {"chunk_id": "file-1:0002", "file_id": "file-1", "file_name": "nvidia.pdf", "index": 2, "text": "Supply chain and product launch details.", "embedding": [0.1, 0.1]},
+        ],
+    }
+    dispatcher.jobs.update_metadata(job["research_id"], {"attachment_context": context})
+    sampling = FakeSampling()
+
+    summarize_attachment_context(
+        jobs=dispatcher.jobs,
+        embeddings=FakeEmbeddings(),
+        sampling=sampling,
+        research_id=job["research_id"],
+        query="why did nvidia stock fall",
+        top_k=1,
+        invoke_id="invoke-test",
+    )
+
+    loaded = dispatcher.jobs.load(job["research_id"])["attachment_context"]
+    assert loaded["summary_status"] == "ready"
+    assert loaded["summary_mode"] == "ai_topk_by_file"
+    assert loaded["files"][0]["ai_summary"] == "nvidia.pdf 讨论了股价压力和近期动作。"
+    assert loaded["files"][0]["summary_selected_chunk_ids"] == ["file-1:0001"]
+    assert "附件显示英伟达" in loaded["summary"]
+    assert "Nvidia stock fell" in sampling.calls[0]["messages"][0]["content"]["text"]
+
+
+def test_select_attachment_context_returns_ranked_chunk_text(tmp_path):
+    dispatcher = make_dispatcher(tmp_path)
+    job = dispatcher.dispatch("app_create_research_job", {"query": "nvidia stock"})["job"]
+    context = {
+        "version": 1,
+        "prepared_at": "now",
+        "files": [{"id": "file-1", "name": "nvidia.pdf", "status": "ready", "chunk_count": 1}],
+        "summary": "AI summary should not be the writing context",
+        "chunks": [
+            {"chunk_id": "file-1:0001", "file_id": "file-1", "file_name": "nvidia.pdf", "index": 1, "text": "Original filing chunk about Nvidia supply constraints.", "embedding": [1.0, 1.0]},
+        ],
+    }
+    dispatcher.jobs.update_metadata(job["research_id"], {"attachment_context": context})
+
+    selected = select_attachment_context(
+        jobs=dispatcher.jobs,
+        embeddings=FakeEmbeddings(),
+        research_id=job["research_id"],
+        query="nvidia supply constraints",
+        top_k=1,
+    )
+
+    assert selected["selected_chunk_count"] == 1
+    assert "Original filing chunk" in selected["selected_context"]
+    assert "AI summary should not" not in selected["selected_context"]
+
+
 def test_get_research_job_falls_back_when_transfer_server_is_blocked(tmp_path):
     root = tmp_path / ".research"
     dispatcher = AppDispatcher(
@@ -183,6 +364,37 @@ def test_compact_job_view_exposes_v3_fields(tmp_path):
     assert loaded["iteration"] == 0
     assert loaded["max_iterations"] == 5
     assert loaded["enabled_sources"] == []
+
+
+def test_compact_job_view_omits_full_section_citation_sources(tmp_path):
+    jobs = JobStore(root=tmp_path / ".research")
+    job = jobs.create(query="anna")
+    research_id = job["research_id"]
+    jobs.save_section_result(
+        research_id,
+        "section-1",
+        {
+            "status": "completed",
+            "section_markdown": "## Section\n\nEvidence [1][2]",
+            "section_summary": "Summary",
+            "source_urls": ["https://example.test/a"],
+            "citation_sources": [
+                {"kind": "url", "url": "https://example.test/a", "title": "A", "content": "x" * 1000},
+                {"kind": "attachment", "file_id": "file-1", "file_name": "a.pdf", "chunk_id": "file-1:0001", "quote": "y" * 1000},
+            ],
+        },
+    )
+
+    view = compact_job_view(jobs.load(research_id))
+    section = view["section_results"]["section-1"]
+
+    assert "section_markdown" not in section
+    assert "source_urls" not in section
+    assert "citation_sources" not in section
+    assert section["section_markdown_chars"] == len("## Section\n\nEvidence [1][2]")
+    assert section["source_count"] == 1
+    assert section["citation_source_count"] == 2
+    assert section["attachment_citation_count"] == 1
 
 
 def test_job_store_has_called_dedup_uses_normalized_query(tmp_path):

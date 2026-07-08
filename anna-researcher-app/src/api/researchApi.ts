@@ -1,6 +1,8 @@
 import {
   TOOL_ID,
+  type AttachmentPrepareInput,
   type AnnaRuntimeApi,
+  type CitationSource,
   type IterationEntry,
   type ConfirmedResearchRole,
   type ReportFraming,
@@ -55,6 +57,19 @@ interface ContextResponse extends JobResponse {
   context_transfer?: ResultTransferDescriptor;
 }
 
+interface AttachmentContextResponse {
+  selected_context?: string;
+  selected_chunks?: Array<{
+    chunk_id?: string;
+    file_id?: string;
+    file_name?: string;
+    index?: number;
+    score?: number;
+    quote?: string;
+  }>;
+  selected_chunk_count?: number;
+}
+
 interface ResultResponse extends JobResponse {
   result?: ResearchResult;
 }
@@ -74,6 +89,10 @@ export interface ResearchApi {
   testResearchSource(input: { id: string; definition: Record<string, unknown>; query: string }): Promise<ResearchSourceTestResult>;
   createResearchJob(input: StartResearchInput): Promise<ResearchJob>;
   updateResearchJob(researchId: string, updates: Record<string, unknown>): Promise<ResearchJob>;
+  prepareAttachments(researchId: string, attachments: AttachmentPrepareInput[]): Promise<ResearchJob>;
+  embedAttachmentChunks(researchId: string): Promise<ResearchJob>;
+  summarizeAttachments(researchId: string, input?: { query?: string; top_k?: number }): Promise<ResearchJob>;
+  selectAttachmentContext(input: { research_id: string; query: string; top_k?: number }): Promise<AttachmentContextResponse>;
   getResearchJob(researchId?: string): Promise<ResearchJob | null>;
   listResearchJobs(input?: { limit?: number }): Promise<ResearchJob[]>;
   callResearchSource(input: {
@@ -99,13 +118,14 @@ export interface ResearchApi {
     section_markdown: string;
     section_summary: string;
     source_urls?: string[];
+    citation_sources?: CitationSource[];
     status?: string;
     error?: unknown;
   }): Promise<ResearchJob>;
   getSectionResult(researchId: string, sectionId: string): Promise<SectionResult | null>;
   failSection(input: { research_id: string; section_id: string; error: unknown }): Promise<ResearchJob>;
   saveReportFraming(input: { research_id: string; framing: ReportFraming }): Promise<ResearchJob>;
-  saveAssembledResearchResult(input: { research_id: string; report_markdown: string; source_urls?: string[] }): Promise<ResearchJob>;
+  saveAssembledResearchResult(input: { research_id: string; report_markdown: string; source_urls?: string[]; citation_sources?: CitationSource[] }): Promise<ResearchJob>;
   selectContext(input: {
     research_id: string;
     search_queries?: string[];
@@ -114,7 +134,7 @@ export interface ResearchApi {
   saveResearchResult(input: { research_id: string }): Promise<ResultTransferDescriptor>;
   uploadResearchResult(
     transfer: ResultTransferDescriptor,
-    input: { report_markdown: string; source_urls?: string[] },
+    input: { report_markdown: string; source_urls?: string[]; citation_sources?: CitationSource[] },
   ): Promise<ResultResponse>;
   complete(messages: AnnaRuntimeApi["llm"]["complete"] extends (request: infer Req) => unknown ? Req : never): ReturnType<
     AnnaRuntimeApi["llm"]["complete"]
@@ -180,6 +200,22 @@ export class AnnaResearchApi implements ResearchApi {
 
   async updateResearchJob(researchId: string, updates: Record<string, unknown>): Promise<ResearchJob> {
     return requireJob(await this.call("app_update_research_job", { research_id: researchId, updates }));
+  }
+
+  async prepareAttachments(researchId: string, attachments: AttachmentPrepareInput[]): Promise<ResearchJob> {
+    return requireJob(await this.call("app_prepare_attachments", { research_id: researchId, attachments }));
+  }
+
+  async embedAttachmentChunks(researchId: string): Promise<ResearchJob> {
+    return requireJob(await this.call("app_embed_attachment_chunks", { research_id: researchId }));
+  }
+
+  async summarizeAttachments(researchId: string, input: { query?: string; top_k?: number } = {}): Promise<ResearchJob> {
+    return requireJob(await this.call("app_summarize_attachments", { research_id: researchId, ...input }));
+  }
+
+  async selectAttachmentContext(input: { research_id: string; query: string; top_k?: number }): Promise<AttachmentContextResponse> {
+    return (await this.call("app_select_attachment_context", input)) as AttachmentContextResponse;
   }
 
   async getResearchJob(researchId?: string): Promise<ResearchJob | null> {
@@ -256,6 +292,7 @@ export class AnnaResearchApi implements ResearchApi {
     section_markdown: string;
     section_summary: string;
     source_urls?: string[];
+    citation_sources?: CitationSource[];
     status?: string;
     error?: unknown;
   }): Promise<ResearchJob> {
@@ -287,7 +324,7 @@ export class AnnaResearchApi implements ResearchApi {
     return requireJob(await fetchTransfer<JobResponse>(response.transfer, input));
   }
 
-  async saveAssembledResearchResult(input: { research_id: string; report_markdown: string; source_urls?: string[] }): Promise<ResearchJob> {
+  async saveAssembledResearchResult(input: { research_id: string; report_markdown: string; source_urls?: string[]; citation_sources?: CitationSource[] }): Promise<ResearchJob> {
     const response = (await this.call("app_save_assembled_research_result", { research_id: input.research_id })) as TransferResponse;
     if (!response.transfer?.url) throw new Error("Assembled result save response did not include a transfer URL.");
     const data = await fetchTransfer<ResultResponse>(response.transfer, input);
@@ -312,7 +349,7 @@ export class AnnaResearchApi implements ResearchApi {
     return response.transfer;
   }
 
-  async uploadResearchResult(transfer: ResultTransferDescriptor, input: { report_markdown: string; source_urls?: string[] }): Promise<ResultResponse> {
+  async uploadResearchResult(transfer: ResultTransferDescriptor, input: { report_markdown: string; source_urls?: string[]; citation_sources?: CitationSource[] }): Promise<ResultResponse> {
     return fetchTransfer<ResultResponse>(transfer, input);
   }
 
@@ -384,6 +421,10 @@ export function createStandaloneApi(): ResearchApi {
     testResearchSource: fail,
     createResearchJob: fail,
     updateResearchJob: fail,
+    prepareAttachments: fail,
+    embedAttachmentChunks: fail,
+    summarizeAttachments: fail,
+    selectAttachmentContext: fail,
     getResearchJob: fail,
     listResearchJobs: fail,
     callResearchSource: fail,

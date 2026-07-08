@@ -6,6 +6,6 @@
   "description": "A Python Executa for the Anna Researcher App.",
   "tool_id": "tool-xhz-researcher-python-e7k8xa3s",
   "type": "python",
+  "host_capabilities": ["llm.embed", "llm.sample"],
   "enabled": true
 }
-

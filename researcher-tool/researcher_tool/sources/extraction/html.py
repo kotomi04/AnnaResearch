@@ -155,7 +155,7 @@ def extract_html(
 
     try:
         html = _load_html(clean_source, timeout=timeout, user_agent=user_agent)
-        title, content = extract_html_content(
+        title, content, icon = extract_html_content(
             html,
             max_chars_per_page=max_chars_per_page,
             query=query,
@@ -167,8 +167,8 @@ def extract_html(
         return ExtractedPage(url=clean_source, content_type="html", status="failed", error=str(exc))
 
     if not content:
-        return ExtractedPage(url=clean_source, title=title, content_type="html", status="failed", error="empty_content")
-    return ExtractedPage(url=clean_source, title=title, raw_content=content, content_type="html")
+        return ExtractedPage(url=clean_source, title=title, icon=icon, content_type="html", status="failed", error="empty_content")
+    return ExtractedPage(url=clean_source, title=title, icon=icon, raw_content=content, content_type="html")
 
 
 def extract_html_content(
@@ -179,16 +179,17 @@ def extract_html_content(
     excluded_tags: list[str] | None = None,
     excluded_selector: str = "",
     base_url: str = "",
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     soup = BeautifulSoup(html, "lxml")
     title = _extract_title(soup)
+    icon = _extract_icon_url(soup, base_url=base_url)
     cleaned = clean_html_for_markdown(soup, excluded_tags=excluded_tags, excluded_selector=excluded_selector)
     prune_content_tree(cleaned)
     markdown = generate_markdown(cleaned, query=query, base_url=base_url)
     content = markdown.fit_markdown
     if markdown.references_markdown:
         content = f"{content}\n\n{markdown.references_markdown}".strip()
-    return title, truncate_text(content, max_chars_per_page)
+    return title, truncate_text(content, max_chars_per_page), icon
 
 
 def _load_html(source: str, *, timeout: float, user_agent: str) -> bytes:
@@ -324,6 +325,28 @@ def _extract_title(soup: BeautifulSoup) -> str:
         return normalize_whitespace(soup.title.string)
     heading = soup.find(["h1", "h2"])
     return normalize_whitespace(heading.get_text(" ", strip=True)) if heading else ""
+
+
+def _extract_icon_url(soup: BeautifulSoup, *, base_url: str = "") -> str:
+    rel_priority = (
+        "icon",
+        "shortcut icon",
+        "apple-touch-icon",
+        "apple-touch-icon-precomposed",
+        "mask-icon",
+    )
+    links = soup.find_all("link")
+    for wanted in rel_priority:
+        wanted_tokens = set(wanted.split())
+        for link in links:
+            rel_values = link.get("rel") or []
+            rel_tokens = {str(value).lower() for value in rel_values} if isinstance(rel_values, list) else set(str(rel_values).lower().split())
+            if not wanted_tokens.issubset(rel_tokens):
+                continue
+            href = str(link.get("href") or "").strip()
+            if href:
+                return urljoin(base_url, href) if base_url else href
+    return ""
 
 
 def generate_markdown(root: Tag | BeautifulSoup, *, query: str = "", base_url: str = "") -> MarkdownGenerationResult:

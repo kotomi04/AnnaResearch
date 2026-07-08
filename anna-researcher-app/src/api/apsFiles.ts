@@ -1,4 +1,4 @@
-import type { AnnaFilesApi } from "../types";
+import type { AnnaFilesApi, AttachmentPrepareInput, ResearchAttachment } from "../types";
 
 export interface UploadedResearchFile {
   name: string;
@@ -54,6 +54,30 @@ export async function uploadResearchFilesToAps(input: {
     });
   }
   return uploaded;
+}
+
+export async function getResearchFileDownloadDescriptors(input: {
+  filesApi: AnnaFilesApi | null | undefined;
+  attachments: ResearchAttachment[];
+}): Promise<AttachmentPrepareInput[]> {
+  if (!input.attachments.length) return [];
+  if (!input.filesApi) throw new Error("Anna files API is unavailable.");
+  const descriptors: AttachmentPrepareInput[] = [];
+  for (const attachment of input.attachments) {
+    const path = String(attachment.path || "").trim();
+    if (!path) continue;
+    const response = await input.filesApi.download_url({ path });
+    const downloadUrl = String(response.get_url || response.url || "").trim();
+    if (!downloadUrl) throw new Error(`Anna files download_url did not return a URL for ${attachment.name || path}.`);
+    descriptors.push({
+      name: attachment.name,
+      path,
+      content_type: attachment.content_type,
+      size_bytes: attachment.size_bytes,
+      download_url: downloadUrl,
+    });
+  }
+  return descriptors;
 }
 
 function sanitizeFilename(name: string): string {

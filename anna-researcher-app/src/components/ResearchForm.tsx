@@ -1,5 +1,6 @@
 import { useRef } from "react";
 import type { MessageKey } from "../i18n/messages";
+import type { ResearchAttachment } from "../types";
 
 interface Props {
   isBusy: boolean;
@@ -7,6 +8,7 @@ interface Props {
   briefName: string;
   researchNeed: string;
   attachments?: File[];
+  uploadedAttachments?: ResearchAttachment[];
   t(key: MessageKey): string;
   stepLabel: string;
   validationMessage: string;
@@ -27,6 +29,7 @@ export function ResearchForm({
   briefName,
   researchNeed,
   attachments = [],
+  uploadedAttachments = [],
   t,
   stepLabel,
   validationMessage,
@@ -114,8 +117,14 @@ export function ResearchForm({
             onChange={(event) => selectFiles(event.target.files)}
           />
         </div>
-        {attachments.length ? (
+        {attachments.length || uploadedAttachments.length ? (
           <div className="attachment-list" aria-label={t("attachmentList")}>
+            {uploadedAttachments.map((file, index) => (
+              <span className="attachment-chip" key={`${file.path || file.name}-${index}`}>
+                <span>{file.name}</span>
+                <small>{file.size_bytes != null ? formatFileSize(file.size_bytes) : t("attachmentUploaded")}</small>
+              </span>
+            ))}
             {attachments.map((file, index) => (
               <span className="attachment-chip" key={`${file.name}-${file.size}-${file.lastModified}-${index}`}>
                 <span>{file.name}</span>
