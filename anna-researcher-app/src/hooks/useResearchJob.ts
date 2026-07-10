@@ -428,6 +428,8 @@ export function useResearchJob(api: ResearchApi) {
             api,
             job: currentJob,
             section,
+            reportOutline: confirmedSections,
+            priorSectionResults: sectionResults,
             role,
             focuses,
             sources: readyEnabledSources(sources),
@@ -1658,6 +1660,8 @@ async function runSection(input: {
   api: ResearchApi;
   job: ResearchJob;
   section: ReportSection;
+  reportOutline: ReportSection[];
+  priorSectionResults: SectionRunResult[];
   role: ConfirmedResearchRole;
   focuses: string[];
   sources: ResearchSourceView[];
@@ -1666,9 +1670,10 @@ async function runSection(input: {
 }): Promise<{ markdown: string; summary: string; sourceUrls: string[]; citationSources: CitationSource[] }> {
   const allowedSources = input.sources.filter((source) => input.section.allowed_source_ids.includes(source.id));
   if (!allowedSources.length) throw new Error(`Section has no configured allowed source: ${input.section.title}`);
+  const continuityContext = buildReportContinuityContext(input.reportOutline, input.priorSectionResults, input.section);
   const session = await input.api.createAgentSession();
   try {
-    return await runSectionInSession({ ...input, allowedSources, session });
+    return await runSectionInSession({ ...input, allowedSources, continuityContext, session });
   } finally {
     await session.delete().catch(() => undefined);
   }
@@ -1679,15 +1684,18 @@ async function runSectionInSession(
     api: ResearchApi;
     job: ResearchJob;
     section: ReportSection;
+    reportOutline: ReportSection[];
+    priorSectionResults: SectionRunResult[];
     role: ConfirmedResearchRole;
     focuses: string[];
     citationRegistry: CitationSource[];
     onEvent?(event: Parameters<typeof makeLiveRunEvent>[0]): void;
     allowedSources: ResearchSourceView[];
+    continuityContext: string;
     session: AnnaAgentSession;
   },
 ): Promise<{ markdown: string; summary: string; sourceUrls: string[]; citationSources: CitationSource[] }> {
-  const { api, job, section, role, focuses, citationRegistry, onEvent, allowedSources, session } = input;
+  const { api, job, section, role, focuses, citationRegistry, onEvent, allowedSources, continuityContext, session } = input;
   const history: IterationEntry[] = [];
   for (let iteration = 1; iteration <= section.max_iterations; iteration++) {
     await updateJob(api, job, { stage: "section_research", iteration, progress: progressForIteration(iteration, section.max_iterations) });
@@ -1708,6 +1716,7 @@ async function runSectionInSession(
       maxIterations: section.max_iterations,
       enabledSources: allowedSources,
       history,
+      continuityContext,
       agentSession: session,
     });
     if (decision.type !== "call_source") break;
@@ -1755,7 +1764,17 @@ async function runSectionInSession(
   const attachmentSelection = await selectAttachmentContextForSection(api, job, section);
   const attachmentReferences = registerAttachmentCitationReferences(citationRegistry, attachmentSelection.items);
   const citationReferences = [...webReferences, ...attachmentReferences];
-  const writer = await writeSection(session, job.query || "", role, focuses, section, selected.selected_context || "", citationReferences, attachmentSelection.context);
+  const writer = await writeSection(
+    session,
+    job.query || "",
+    role,
+    focuses,
+    section,
+    selected.selected_context || "",
+    citationReferences,
+    attachmentSelection.context,
+    continuityContext,
+  );
   const markdown = remapLocalCitations(writer.markdown, citationReferences);
   const sectionCitationSources = citationReferences.map((reference) => reference.source);
   await api.saveSectionResult({
@@ -1787,9 +1806,10 @@ async function decideNextAction(input: {
   maxIterations: number;
   enabledSources: ResearchSourceView[];
   history: IterationEntry[];
+  continuityContext?: string;
   agentSession?: AnnaAgentSession;
 }): Promise<Decision> {
-  const { api, query, rolePrompt, section, focuses, iteration, maxIterations, enabledSources, history, agentSession } = input;
+  const { api, query, rolePrompt, section, focuses, iteration, maxIterations, enabledSources, history, continuityContext, agentSession } = input;
   const sourcesBlock = enabledSources.map((source) => `- ${source.id} (${source.name})`).join("\n");
   const historyBlock = history.length ? history.map((entry) => `- iteration ${entry.iteration}: ${entry.queries.join(", ")} (${entry.results_count} results)`).join("\n") : "(no prior iterations)";
   const messages: ResearchLlmMessages = [
@@ -1809,7 +1829,7 @@ async function decideNextAction(input: {
       content: {
         type: "text",
         text:
-          `Task:\n${query}\n\nSection: ${section.title}\n${section.outline}\n\nFocuses:\n${focuses.map((focus) => `- ${focus}`).join("\n")}\n\n` +
+          `Task:\n${query}\n\n${continuityContext ? `${continuityContext}\n\n` : ""}Section: ${section.title}\n${section.outline}\n\nFocuses:\n${focuses.map((focus) => `- ${focus}`).join("\n")}\n\n` +
           `Allowed sources:\n${sourcesBlock}\nIteration: ${iteration}/${maxIterations}\nPrior iterations:\n${historyBlock}`,
       },
     },
@@ -1835,6 +1855,7 @@ async function writeSection(
   selectedContext: string,
   citationReferences: CitationReference[],
   attachmentContext: string,
+  continuityContext: string,
 ): Promise<{ markdown: string; summary: string }> {
   const citationGuide = citationReferences.length
     ? citationReferences.map((reference) => citationReferencePromptLine(reference)).join("\n")
@@ -1852,7 +1873,7 @@ async function writeSection(
           "When citing evidence, use ONLY the global citation numbers listed below, such as [3]. Use uploaded-file citation numbers when relying on attachment chunks. Do not invent new citation numbers and do not restart citations from [1] for this section.\n" +
           `Uploaded-file evidence policy: ${ATTACHMENT_EVIDENCE_POLICY}\n\n` +
           `Global citation map for this section:\n${citationGuide}\n\n` +
-          `Task:\n${query}\n\nFocuses:\n${focuses.map((focus) => `- ${focus}`).join("\n")}\n\nSection: ${section.title}\n${section.outline}\n\nWeb context:\n${selectedContext}\n\nAttachment chunk context:\n${attachmentContext || "(none)"}`,
+          `Task:\n${query}\n\n${continuityContext}\n\nFocuses:\n${focuses.map((focus) => `- ${focus}`).join("\n")}\n\nSection: ${section.title}\n${section.outline}\n\nWeb context:\n${selectedContext}\n\nAttachment chunk context:\n${attachmentContext || "(none)"}`,
       },
     },
   ];
@@ -1864,6 +1885,36 @@ async function writeSection(
   const fallback = text.trim();
   if (!fallback) throw new Error(`Anna LLM returned an empty section for ${section.title}.`);
   return { markdown: fallback, summary: deriveSummary(fallback) };
+}
+
+function buildReportContinuityContext(outline: ReportSection[], priorResults: SectionRunResult[], currentSection: ReportSection): string {
+  const currentIndex = Math.max(0, outline.findIndex((section) => section.id === currentSection.id));
+  const outlineBlock = outline
+    .map((section, index) => {
+      const position = index < currentIndex ? "PREVIOUS" : index === currentIndex ? "CURRENT" : "UPCOMING";
+      return `${index + 1}. [${position}] ${section.title}\n   Scope: ${section.outline}`;
+    })
+    .join("\n");
+  const existingReport = priorResults.length
+    ? priorResults.map((result) => result.markdown.trim()).filter(Boolean).join("\n\n")
+    : "(none yet; this is the first report section)";
+
+  return [
+    "Report continuity context:",
+    "",
+    "Complete report outline (respect the boundary between previous, current, and upcoming sections):",
+    outlineBlock,
+    "",
+    "Existing report content written before this section:",
+    existingReport,
+    "",
+    "Continuity rules:",
+    "- Connect this section naturally to the existing report and keep terminology, timeframes, and conclusions consistent.",
+    "- Avoid repeating detailed discussion already present in previous sections; use only a short bridge when needed.",
+    "- Do not take over analysis reserved for upcoming sections.",
+    "- Treat the existing report as continuity and de-duplication context only, not as evidence for new claims.",
+    "- Do not copy citation numbers from the existing report. This section may cite only the current section citation map.",
+  ].join("\n");
 }
 
 async function generateReportFraming(

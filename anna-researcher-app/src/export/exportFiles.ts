@@ -1,4 +1,4 @@
-import type { ResearchResult } from "../types";
+import type { CitationSource, ResearchResult } from "../types";
 
 type FilePicker = (options?: {
   suggestedName?: string;
@@ -13,7 +13,10 @@ export async function exportResearchMarkdownFile(input: {
   if (!picker) throw new Error("showSaveFilePicker is not available in this host.");
 
   const filename = `${safeExportFilename(input.result.research_id)}.md`;
-  const markdown = appendSourcesToMarkdown(input.result.report_markdown || "", input.result.source_urls || [], input.sourcesHeading);
+  const citationSources = input.result.citation_sources?.length
+    ? input.result.citation_sources
+    : (input.result.source_urls || []).map((url) => ({ kind: "url" as const, url }));
+  const markdown = appendSourcesToMarkdown(input.result.report_markdown || "", citationSources, input.sourcesHeading);
   const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
   const handle = await picker({
     suggestedName: filename,
@@ -29,9 +32,30 @@ export function safeExportFilename(researchId?: string) {
   return value.replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-").replace(/^-|-$/g, "").slice(0, 80) || "anna-research-report";
 }
 
-export function appendSourcesToMarkdown(markdown: string, sourceUrls: string[], heading = "Sources") {
-  const cleanedUrls = sourceUrls.map((url) => String(url || "").trim()).filter(Boolean);
-  if (!cleanedUrls.length) return markdown;
-  const references = cleanedUrls.map((url, index) => `[${index + 1}] ${url}`).join("\n");
+export function appendSourcesToMarkdown(markdown: string, citationSources: CitationSource[], heading = "Sources") {
+  const references = citationSources
+    .map((source, index) => formatMarkdownCitationSource(source, index + 1))
+    .filter(Boolean)
+    .join("\n");
+  if (!references) return markdown;
   return `${markdown.trim()}\n\n## ${heading}\n\n${references}\n`;
+}
+
+function formatMarkdownCitationSource(source: CitationSource, number: number): string {
+  if (source.kind === "url") {
+    const url = String(source.url || "").trim();
+    return url ? `[${number}] ${url}` : "";
+  }
+  const fileName = String(source.file_name || "").trim();
+  if (!fileName) return "";
+  const chunkLabel = attachmentChunkLabel(source);
+  return `[${number}] ${fileName}${chunkLabel ? ` · ${chunkLabel}` : ""}`;
+}
+
+function attachmentChunkLabel(source: Extract<CitationSource, { kind: "attachment" }>): string {
+  const chunkId = String(source.chunk_id || "");
+  const match = /:(?:0*)(\d+)$/.exec(chunkId);
+  if (match) return `chunk ${Number(match[1])}`;
+  if (chunkId.endsWith(":image-summary")) return "";
+  return chunkId ? "chunk" : "";
 }

@@ -549,6 +549,14 @@ describe("useResearchJob (iterative loop)", () => {
     expect(agentSessions[0].prompts[0]).toContain("Do not call tools");
     expect(agentSessions[0].prompts[0]).toContain("Prior iterations");
     expect(agentSessions[0].prompts[2]).toContain("Global citation map for this section");
+    expect(agentSessions[0].prompts[0]).toContain("(none yet; this is the first report section)");
+    expect(agentSessions[1].prompts[0]).toContain("Existing report content written before this section");
+    expect(agentSessions[1].prompts[0]).toContain("## Section One");
+    expect(agentSessions[1].prompts[0]).toContain("[PREVIOUS] Section One");
+    expect(agentSessions[1].prompts[0]).toContain("[CURRENT] Section Two");
+    expect(agentSessions[1].prompts[0]).toContain("[UPCOMING] Section Three");
+    expect(agentSessions[1].prompts[1]).toContain("## Section One");
+    expect(agentSessions[1].prompts[1]).toContain("Do not copy citation numbers from the existing report");
     expect(llmCalls).toHaveLength(5);
     expect(JSON.stringify(llmCalls[4])).toContain("Generate report framing only");
   });
@@ -616,6 +624,9 @@ describe("useResearchJob (iterative loop)", () => {
     expect(agentSessions).toHaveLength(1);
     expect(agentSessions[0].deleted).toBe(true);
     expect(agentSessions[0].prompts[0]).toContain("Section: Pending");
+    expect(agentSessions[0].prompts[0]).toContain("## Done");
+    expect(agentSessions[0].prompts[0]).toContain("[PREVIOUS] Done");
+    expect(agentSessions[0].prompts[0]).toContain("[CURRENT] Pending");
   });
 
   it("uses a Chinese conclusion heading for Chinese reports", async () => {

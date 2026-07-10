@@ -1173,13 +1173,29 @@ describe("ReportDisplayPage", () => {
 
     await waitFor(() => expect(showSaveFilePicker).toHaveBeenCalledWith(expect.objectContaining({ suggestedName: "research-123.md" })));
     expect(write).toHaveBeenCalledWith(expect.any(Blob));
-    expect(appendSourcesToMarkdown("# Done", ["https://example.com/a", "https://example.com/b"], "Sources")).toBe(
+    expect(appendSourcesToMarkdown("# Done", [{ kind: "url", url: "https://example.com/a" }, { kind: "url", url: "https://example.com/b" }], "Sources")).toBe(
       "# Done\n\n## Sources\n\n[1] https://example.com/a\n[2] https://example.com/b\n",
     );
     expect(close).toHaveBeenCalled();
     expect(screen.getByText("MD saved.")).toBeTruthy();
 
     delete (window as Window & { showSaveFilePicker?: unknown }).showSaveFilePicker;
+  });
+
+  it("keeps attachment citations in Markdown export reference order", () => {
+    expect(
+      appendSourcesToMarkdown(
+        "# Done\n\nEvidence [1][2][3].",
+        [
+          { kind: "url", url: "https://example.com/a" },
+          { kind: "attachment", file_id: "file-1", file_name: "nvidia.pdf", chunk_id: "file-1:0002" },
+          { kind: "attachment", file_id: "file-2", file_name: "chart.png", chunk_id: "file-2:image-summary" },
+        ],
+        "Sources",
+      ),
+    ).toBe(
+      "# Done\n\nEvidence [1][2][3].\n\n## Sources\n\n[1] https://example.com/a\n[2] nvidia.pdf · chunk 2\n[3] chart.png\n",
+    );
   });
 
 });
