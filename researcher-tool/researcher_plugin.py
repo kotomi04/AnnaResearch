@@ -17,7 +17,7 @@ from researcher_tool.sampling import AnnaSamplingClient, SamplingError
 from researcher_tool.sources.native.executor import NativeResearchSourceExecutor
 
 TOOL_ID = "tool-xhz-researcher-python-e7k8xa3s"
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 APP_METHODS = [
     "app_get_settings",
     "app_update_settings",
