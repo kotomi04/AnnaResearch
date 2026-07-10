@@ -1,4 +1,5 @@
-import type { AnnaAgentApi, AnnaAgentRunFrame, AnnaFilesApi, AttachmentImageAnalysis, AttachmentPrepareInput, ResearchAttachment } from "../types";
+import type { AnnaAgentApi, AnnaFilesApi, AttachmentImageAnalysis, AttachmentPrepareInput, ResearchAttachment } from "../types";
+import { collectAgentText } from "./agentSession";
 
 export interface UploadedResearchFile {
   name: string;
@@ -110,6 +111,7 @@ async function analyzeImageAttachment(input: {
       session.run({
         content: buildImageAnalysisPrompt(input),
       }),
+      "Image analysis returned an empty response.",
     );
     return normalizeImageAnalysis(parseJsonObject(text), text);
   } finally {
@@ -196,28 +198,6 @@ function buildImageAnalysisPrompt(input: { name: string; contentType?: string; d
   ].join("\n");
 }
 
-async function collectAgentText(stream: AsyncIterable<AnnaAgentRunFrame>): Promise<string> {
-  let output = "";
-  for await (const frame of stream) {
-    if (frame.event === "complete" || frame.event === "end") break;
-    if (frame.event === "raw" && typeof frame.text === "string" && frame.text.trim() === "[DONE]") break;
-    if (typeof frame.text === "string") output += frame.text;
-    if (typeof frame.output_text === "string") output += frame.output_text;
-    output += contentToText(frame.content);
-    output += contentToText(frame.message?.content);
-    const choices = Array.isArray(frame.choices) ? frame.choices : [];
-    for (const choice of choices) {
-      const delta = choice?.delta;
-      if (typeof delta?.content === "string") output += delta.content;
-      if (typeof delta?.text === "string") output += delta.text;
-      output += contentToText(choice?.message?.content);
-    }
-  }
-  const trimmed = output.trim();
-  if (!trimmed) throw new Error("Image analysis returned an empty response.");
-  return trimmed;
-}
-
 function parseJsonObject(text: string): Record<string, unknown> {
   const trimmed = text.trim();
   const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
@@ -234,21 +214,6 @@ function parseJsonObject(text: string): Record<string, unknown> {
     }
   }
   throw new Error(`Image analysis did not return a JSON object. Raw response preview: ${previewText(text)}`);
-}
-
-function contentToText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((part) => {
-      if (typeof part === "string") return part;
-      if (!part || typeof part !== "object") return "";
-      const record = part as Record<string, unknown>;
-      if (typeof record.text === "string") return record.text;
-      if (typeof record.content === "string") return record.content;
-      return "";
-    })
-    .join("");
 }
 
 function previewText(text: string): string {

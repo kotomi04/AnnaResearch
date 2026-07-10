@@ -3,6 +3,34 @@ import { AnnaResearchApi } from "../../src/api/researchApi";
 import { TOOL_ID, type AnnaRuntimeApi } from "../../src/types";
 
 describe("AnnaResearchApi", () => {
+  it("creates an auto Agent session through the frontend runtime", async () => {
+    const calls: unknown[] = [];
+    const session = { async *run() {}, async delete() {} };
+    const anna = {
+      tools: { async invoke() {} },
+      llm: { async complete() { return {}; } },
+      agent: {
+        async session(input: unknown) {
+          calls.push(input);
+          return session;
+        },
+      },
+    } as unknown as AnnaRuntimeApi;
+
+    const api = new AnnaResearchApi(anna);
+    await expect(api.createAgentSession()).resolves.toBe(session);
+    expect(calls).toEqual([{ submode: "auto" }]);
+  });
+
+  it("rejects section session creation when the Agent API is unavailable", async () => {
+    const anna = {
+      tools: { async invoke() {} },
+      llm: { async complete() { return {}; } },
+    } as unknown as AnnaRuntimeApi;
+
+    await expect(new AnnaResearchApi(anna).createAgentSession()).rejects.toThrow("Anna Agent API is unavailable for section generation.");
+  });
+
   it("uses explicit app tool methods including app_call_research_source", async () => {
     const calls: unknown[] = [];
     const anna: AnnaRuntimeApi = {
@@ -211,11 +239,15 @@ describe("AnnaResearchApi", () => {
             ],
           },
         },
-        {
-          tool_id: TOOL_ID,
-          method: "app_embed_attachment_chunks",
-          args: { research_id: "r1" },
-        },
+        [
+          {
+            tool_id: TOOL_ID,
+            method: "app_embed_attachment_chunks",
+            args: { research_id: "r1" },
+            timeoutMs: 300000,
+          },
+          { timeoutMs: 300000 },
+        ],
         { tool_id: TOOL_ID, method: "app_get_research_job", args: { research_id: "r1" } },
         { tool_id: TOOL_ID, method: "app_list_research_jobs", args: { limit: 20 } },
         { tool_id: TOOL_ID, method: "app_test_research_source", args: { id: "tavily", definition: { id: "tavily" }, query: "anna" } },
@@ -435,7 +467,7 @@ describe("AnnaResearchApi", () => {
     }
   });
 
-  it("adds an extended invoke timeout only for DuckDuckGo source calls", async () => {
+  it("adds an extended invoke timeout for attachment processing and DuckDuckGo source calls", async () => {
     const calls: unknown[] = [];
     const anna: AnnaRuntimeApi = {
       tools: {
@@ -492,6 +524,8 @@ describe("AnnaResearchApi", () => {
 
     try {
       const api = new AnnaResearchApi(anna);
+      await api.embedAttachmentChunks("r1");
+      await api.summarizeAttachments("r1", { query: "anna", top_k: 6 });
       await api.callResearchSource({ research_id: "r1", iteration: 1, source_id: "duckduckgo", queries: ["anna"] });
       await api.callSectionResearchSource({
         research_id: "r1",
@@ -503,6 +537,24 @@ describe("AnnaResearchApi", () => {
       await api.testResearchSource({ id: "duckduckgo", definition: { id: "duckduckgo" }, query: "anna" });
 
       expect(calls).toEqual([
+        [
+          {
+            tool_id: TOOL_ID,
+            method: "app_embed_attachment_chunks",
+            args: { research_id: "r1" },
+            timeoutMs: 300000,
+          },
+          { timeoutMs: 300000 },
+        ],
+        [
+          {
+            tool_id: TOOL_ID,
+            method: "app_summarize_attachments",
+            args: { research_id: "r1", query: "anna", top_k: 6 },
+            timeoutMs: 300000,
+          },
+          { timeoutMs: 300000 },
+        ],
         [
           {
             tool_id: TOOL_ID,

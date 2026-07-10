@@ -19,6 +19,7 @@ interface ApiOptions {
 function makeApi(options: ApiOptions = {}) {
   const calls: unknown[] = [];
   const llmCalls: Array<{ messages: unknown }> = [];
+  const agentSessions: Array<{ prompts: string[]; deleted: boolean }> = [];
   const configured = options.configured ?? true;
   const tavilySource: ResearchSourceView = {
     id: "tavily",
@@ -33,6 +34,7 @@ function makeApi(options: ApiOptions = {}) {
   const replies = options.llmReplies ?? [];
   const callOverrides = options.callOverrides ?? [];
   let callIndex = 0;
+  let replyIndex = 0;
   const api: ResearchApi = {
     async getSettings() {
       calls.push(["getSettings"]);
@@ -261,12 +263,27 @@ function makeApi(options: ApiOptions = {}) {
     async complete(request) {
       llmCalls.push(request as { messages: unknown });
       expect(request).not.toHaveProperty("maxTokens");
-      const index = llmCalls.length - 1;
-      const reply = replies[index] ?? "";
+      const reply = replies[replyIndex++] ?? "";
       return { content: { type: "text", text: reply } };
     },
+    async createAgentSession() {
+      const call = { prompts: [] as string[], deleted: false };
+      agentSessions.push(call);
+      return {
+        async *run(input) {
+          call.prompts.push(input.content);
+          const reply = replies[replyIndex++] ?? "";
+          if (reply) yield { event: "delta", text: reply };
+          yield { event: "complete" };
+        },
+        async delete() {
+          call.deleted = true;
+          return {};
+        },
+      };
+    },
   };
-  return { api, calls, llmCalls };
+  return { api, calls, llmCalls, agentSessions };
 }
 
 function deferred<T>() {
@@ -476,7 +493,7 @@ describe("useResearchJob (iterative loop)", () => {
   });
 
   it("runs confirmed outline through section source calls, section writer, framing, and final assembly", async () => {
-    const { api, calls } = makeApi({
+    const { api, calls, llmCalls, agentSessions } = makeApi({
       llmReplies: [
         ROLE_REPLY,
         FOCUS_REPLY,
@@ -526,6 +543,79 @@ describe("useResearchJob (iterative loop)", () => {
     expect(calls.some((call) => Array.isArray(call) && call[0] === "saveSectionResult")).toBe(true);
     expect(calls.some((call) => Array.isArray(call) && call[0] === "saveReportFraming")).toBe(true);
     expect(calls.some((call) => Array.isArray(call) && call[0] === "saveAssembledResearchResult")).toBe(true);
+    expect(agentSessions).toHaveLength(4);
+    expect(agentSessions.every((session) => session.deleted)).toBe(true);
+    expect(agentSessions[0].prompts).toHaveLength(3);
+    expect(agentSessions[0].prompts[0]).toContain("Do not call tools");
+    expect(agentSessions[0].prompts[0]).toContain("Prior iterations");
+    expect(agentSessions[0].prompts[2]).toContain("Global citation map for this section");
+    expect(llmCalls).toHaveLength(5);
+    expect(JSON.stringify(llmCalls[4])).toContain("Generate report framing only");
+  });
+
+  it("fails a section on an empty Agent response without falling back to llm.complete", async () => {
+    const { api, calls, llmCalls, agentSessions } = makeApi({
+      llmReplies: [ROLE_REPLY, FOCUS_REPLY, OUTLINE_REPLY, ASSIGN_REPLY, ""],
+    });
+    const { result } = renderHook(() => useResearchJob(api));
+
+    await waitFor(() => expect(result.current.phase).toBe("idle"));
+    await planToOutline(result);
+    await act(async () => {
+      await result.current.confirmOutlineAndRun(result.current.outlineDraft);
+    });
+
+    expect(result.current.phase).toBe("failed");
+    expect(String(result.current.error)).toContain("empty research decision");
+    expect(llmCalls).toHaveLength(4);
+    expect(agentSessions).toHaveLength(1);
+    expect(agentSessions[0].deleted).toBe(true);
+    expect(calls.some((call) => Array.isArray(call) && call[0] === "saveSectionResult")).toBe(false);
+  });
+
+  it("does not create a session for a completed section when resuming", async () => {
+    const sections: ReportSection[] = [
+      { id: "section-1", title: "Done", outline: "Already written.", allowed_source_ids: ["tavily"], max_iterations: 1 },
+      { id: "section-2", title: "Pending", outline: "Still needed.", allowed_source_ids: ["tavily"], max_iterations: 1 },
+    ];
+    const latestJob = {
+      research_id: "resume-1",
+      status: "running" as const,
+      stage: "section_research",
+      progress: 60,
+      query: "anna",
+      confirmed_role: { server: "Analyst", agent_role_prompt: "Use sources." },
+      confirmed_focuses: ["focus one"],
+      confirmed_outline: sections,
+      section_results: {
+        "section-1": {
+          section_id: "section-1",
+          status: "completed",
+          section_markdown: "## Done\n\nSaved text [1]",
+          section_summary: "Saved summary",
+          source_urls: ["https://example.com/done"],
+        },
+      },
+    };
+    const { api, agentSessions } = makeApi({
+      latestJob,
+      llmReplies: [
+        '{"type":"finish"}',
+        '{"section_markdown":"## Pending\\n\\nNew text [1]","section_summary":"New summary"}',
+        FRAMING_REPLY,
+      ],
+    });
+    const { result } = renderHook(() => useResearchJob(api));
+
+    await waitFor(() => expect(result.current.job?.research_id).toBe("resume-1"));
+    await act(async () => {
+      await result.current.resumeResearchJob();
+    });
+
+    expect(result.current.phase).toBe("completed");
+    expect(agentSessions).toHaveLength(1);
+    expect(agentSessions[0].deleted).toBe(true);
+    expect(agentSessions[0].prompts[0]).toContain("Section: Pending");
   });
 
   it("uses a Chinese conclusion heading for Chinese reports", async () => {
@@ -1129,7 +1219,7 @@ describe("useResearchJob (iterative loop)", () => {
       credential_status: "configured",
       credential: "token-cus",
     };
-    const { api, calls, llmCalls } = makeApi({
+    const { api, calls, agentSessions } = makeApi({
       sources: [tavily, custom],
       llmReplies: [
         ROLE_REPLY,
@@ -1159,7 +1249,7 @@ describe("useResearchJob (iterative loop)", () => {
     const callSourceCalls = calls.filter((call) => Array.isArray(call) && call[0] === "callSectionResearchSource");
     expect(callSourceCalls.length).toBeGreaterThanOrEqual(1);
     expect((callSourceCalls[0] as unknown[])[1]).toMatchObject({ source_id: "custom", queries: ["focused query"] });
-    const sourcesList = JSON.stringify(llmCalls[4]);
+    const sourcesList = agentSessions[0].prompts[0];
     expect(sourcesList).toContain("custom");
     expect(sourcesList).not.toContain("tavily (Tavily)");
   });

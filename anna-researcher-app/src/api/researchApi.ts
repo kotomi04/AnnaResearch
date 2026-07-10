@@ -1,6 +1,7 @@
 import {
   TOOL_ID,
   type AttachmentPrepareInput,
+  type AnnaAgentSession,
   type AnnaRuntimeApi,
   type CitationSource,
   type IterationEntry,
@@ -142,6 +143,7 @@ export interface ResearchApi {
   complete(messages: AnnaRuntimeApi["llm"]["complete"] extends (request: infer Req) => unknown ? Req : never): ReturnType<
     AnnaRuntimeApi["llm"]["complete"]
   >;
+  createAgentSession(): Promise<AnnaAgentSession>;
 }
 
 export class AnnaResearchApi implements ResearchApi {
@@ -360,6 +362,11 @@ export class AnnaResearchApi implements ResearchApi {
     return this.anna.llm.complete(request);
   }
 
+  async createAgentSession(): Promise<AnnaAgentSession> {
+    if (!this.anna.agent) throw new Error("Anna Agent API is unavailable for section generation.");
+    return this.anna.agent.session({ submode: "auto" });
+  }
+
   private async call(method: string, args: Record<string, unknown>): Promise<unknown> {
     const timeoutMs = toolTimeoutMs(method, args);
     const request = timeoutMs === undefined ? { tool_id: TOOL_ID, method, args } : { tool_id: TOOL_ID, method, args, timeoutMs };
@@ -376,6 +383,9 @@ export class AnnaResearchApi implements ResearchApi {
 }
 
 function toolTimeoutMs(method: string, args: Record<string, unknown>): number | undefined {
+  if (method === "app_embed_attachment_chunks" || method === "app_summarize_attachments") {
+    return LONG_TOOL_TIMEOUT_MS;
+  }
   if (method === "app_call_research_source" || method === "app_call_section_research_source") {
     return args.source_id === "duckduckgo" ? LONG_TOOL_TIMEOUT_MS : undefined;
   }
@@ -445,6 +455,7 @@ export function createStandaloneApi(): ResearchApi {
     saveResearchResult: fail,
     uploadResearchResult: fail,
     complete: fail as ResearchApi["complete"],
+    createAgentSession: fail,
   };
 }
 

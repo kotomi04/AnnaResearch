@@ -427,6 +427,7 @@ def test_plugin_contract(tmp_path: Path):
         init = plugin.call("initialize", {"protocolVersion": "2.0"})
         assert_true(init["result"]["protocolVersion"] == "2.0", "initialize should negotiate v2")
         assert_true(init["result"].get("client_capabilities") == {"embeddings": {}}, "tool should declare embeddings")
+        assert_true(init["result"].get("capabilities") == {"sampling": {}}, "tool should declare sampling capability")
         describe = plugin.call("describe")
         tools = [tool["name"] for tool in describe["result"]["tools"]]
         assert_true(describe["result"]["name"] == "tool-xhz-researcher-python-e7k8xa3s", "describe should advertise tool")

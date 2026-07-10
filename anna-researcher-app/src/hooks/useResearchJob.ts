@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { collectAgentText } from "../api/agentSession";
 import type { ResearchApi } from "../api/researchApi";
 import type {
+  AnnaAgentSession,
   CitationSource,
   ConfirmedResearchRole,
   IterationEntry,
@@ -1662,9 +1664,30 @@ async function runSection(input: {
   citationRegistry: CitationSource[];
   onEvent?(event: Parameters<typeof makeLiveRunEvent>[0]): void;
 }): Promise<{ markdown: string; summary: string; sourceUrls: string[]; citationSources: CitationSource[] }> {
-  const { api, job, section, role, focuses, sources, citationRegistry, onEvent } = input;
-  const allowedSources = sources.filter((source) => section.allowed_source_ids.includes(source.id));
-  if (!allowedSources.length) throw new Error(`Section has no configured allowed source: ${section.title}`);
+  const allowedSources = input.sources.filter((source) => input.section.allowed_source_ids.includes(source.id));
+  if (!allowedSources.length) throw new Error(`Section has no configured allowed source: ${input.section.title}`);
+  const session = await input.api.createAgentSession();
+  try {
+    return await runSectionInSession({ ...input, allowedSources, session });
+  } finally {
+    await session.delete().catch(() => undefined);
+  }
+}
+
+async function runSectionInSession(
+  input: {
+    api: ResearchApi;
+    job: ResearchJob;
+    section: ReportSection;
+    role: ConfirmedResearchRole;
+    focuses: string[];
+    citationRegistry: CitationSource[];
+    onEvent?(event: Parameters<typeof makeLiveRunEvent>[0]): void;
+    allowedSources: ResearchSourceView[];
+    session: AnnaAgentSession;
+  },
+): Promise<{ markdown: string; summary: string; sourceUrls: string[]; citationSources: CitationSource[] }> {
+  const { api, job, section, role, focuses, citationRegistry, onEvent, allowedSources, session } = input;
   const history: IterationEntry[] = [];
   for (let iteration = 1; iteration <= section.max_iterations; iteration++) {
     await updateJob(api, job, { stage: "section_research", iteration, progress: progressForIteration(iteration, section.max_iterations) });
@@ -1685,6 +1708,7 @@ async function runSection(input: {
       maxIterations: section.max_iterations,
       enabledSources: allowedSources,
       history,
+      agentSession: session,
     });
     if (decision.type !== "call_source") break;
     const sourceId = allowedSources.some((source) => source.id === decision.source_id) ? String(decision.source_id) : allowedSources[0].id;
@@ -1731,7 +1755,7 @@ async function runSection(input: {
   const attachmentSelection = await selectAttachmentContextForSection(api, job, section);
   const attachmentReferences = registerAttachmentCitationReferences(citationRegistry, attachmentSelection.items);
   const citationReferences = [...webReferences, ...attachmentReferences];
-  const writer = await writeSection(api, job.query || "", role, focuses, section, selected.selected_context || "", citationReferences, attachmentSelection.context);
+  const writer = await writeSection(session, job.query || "", role, focuses, section, selected.selected_context || "", citationReferences, attachmentSelection.context);
   const markdown = remapLocalCitations(writer.markdown, citationReferences);
   const sectionCitationSources = citationReferences.map((reference) => reference.source);
   await api.saveSectionResult({
@@ -1763,11 +1787,12 @@ async function decideNextAction(input: {
   maxIterations: number;
   enabledSources: ResearchSourceView[];
   history: IterationEntry[];
+  agentSession?: AnnaAgentSession;
 }): Promise<Decision> {
-  const { api, query, rolePrompt, section, focuses, iteration, maxIterations, enabledSources, history } = input;
+  const { api, query, rolePrompt, section, focuses, iteration, maxIterations, enabledSources, history, agentSession } = input;
   const sourcesBlock = enabledSources.map((source) => `- ${source.id} (${source.name})`).join("\n");
   const historyBlock = history.length ? history.map((entry) => `- iteration ${entry.iteration}: ${entry.queries.join(", ")} (${entry.results_count} results)`).join("\n") : "(no prior iterations)";
-  const text = await completeText(api, [
+  const messages: ResearchLlmMessages = [
     {
       role: "system",
       content: {
@@ -1775,6 +1800,7 @@ async function decideNextAction(input: {
         text:
           rolePrompt +
           "\n\nDecide the next research step for one report section. Reply with strict JSON only. " +
+          "The frontend owns all research source execution. Do not call tools or search directly. " +
           'Return {"type":"call_source","source_id":"<allowed-id>","queries":["..."]} or {"type":"finish"}.',
       },
     },
@@ -1787,7 +1813,10 @@ async function decideNextAction(input: {
           `Allowed sources:\n${sourcesBlock}\nIteration: ${iteration}/${maxIterations}\nPrior iterations:\n${historyBlock}`,
       },
     },
-  ]);
+  ];
+  const text = agentSession
+    ? await runSectionAgent(agentSession, messages, `Anna Agent returned an empty research decision for ${section.title}.`)
+    : await completeText(api, messages);
   const parsed = parseJsonObject(text);
   if (parsed?.type === "call_source") {
     const queries = Array.isArray(parsed.queries) ? parsed.queries.map(String).filter(Boolean) : [];
@@ -1798,7 +1827,7 @@ async function decideNextAction(input: {
 }
 
 async function writeSection(
-  api: ResearchApi,
+  agentSession: AnnaAgentSession,
   query: string,
   role: ConfirmedResearchRole,
   focuses: string[],
@@ -1810,7 +1839,7 @@ async function writeSection(
   const citationGuide = citationReferences.length
     ? citationReferences.map((reference) => citationReferencePromptLine(reference)).join("\n")
     : "No selected web or uploaded-file sources for this section.";
-  const text = await completeText(api, [
+  const messages: ResearchLlmMessages = [
     { role: "system", content: { type: "text", text: role.agent_role_prompt } },
     {
       role: "user",
@@ -1818,6 +1847,7 @@ async function writeSection(
         type: "text",
         text:
           'Write one report section. Return strict JSON only: {"section_markdown":"...","section_summary":"..."}.\n' +
+          "The frontend owns all research source execution. Do not call tools, search, or introduce evidence outside the supplied context.\n" +
           "Use only the provided context. The markdown should include the section heading.\n" +
           "When citing evidence, use ONLY the global citation numbers listed below, such as [3]. Use uploaded-file citation numbers when relying on attachment chunks. Do not invent new citation numbers and do not restart citations from [1] for this section.\n" +
           `Uploaded-file evidence policy: ${ATTACHMENT_EVIDENCE_POLICY}\n\n` +
@@ -1825,7 +1855,8 @@ async function writeSection(
           `Task:\n${query}\n\nFocuses:\n${focuses.map((focus) => `- ${focus}`).join("\n")}\n\nSection: ${section.title}\n${section.outline}\n\nWeb context:\n${selectedContext}\n\nAttachment chunk context:\n${attachmentContext || "(none)"}`,
       },
     },
-  ]);
+  ];
+  const text = await runSectionAgent(agentSession, messages, `Anna Agent returned an empty section for ${section.title}.`);
   const parsed = parseJsonObject(text);
   const markdown = String(parsed?.section_markdown || "").trim();
   const summary = String(parsed?.section_summary || "").trim();
@@ -1971,6 +2002,17 @@ async function completeText(api: ResearchApi, messages: Parameters<ResearchApi["
   const response = await api.complete({ messages });
   const content = response.content;
   return typeof content === "string" ? content : content?.text || "";
+}
+
+type ResearchLlmMessages = Parameters<ResearchApi["complete"]>[0]["messages"];
+
+async function runSectionAgent(session: AnnaAgentSession, messages: ResearchLlmMessages, emptyMessage: string): Promise<string> {
+  const prompt = [
+    "You are working inside a frontend-controlled research section session.",
+    "Do not call tools. Return only the response format requested below.",
+    ...messages.map((message) => `${message.role === "system" ? "Standing role and instructions" : "Current task"}:\n${message.content.text}`),
+  ].join("\n\n");
+  return collectAgentText(session.run({ content: prompt }), emptyMessage);
 }
 
 function parseJsonObject(text: string): Record<string, unknown> | null {

@@ -1,0 +1,48 @@
+import { describe, expect, it } from "vitest";
+import { collectAgentText } from "../../src/api/agentSession";
+import type { AnnaAgentRunFrame } from "../../src/types";
+
+describe("collectAgentText", () => {
+  it("prefers a final response over streamed deltas without duplicating text", async () => {
+    const text = await collectAgentText(
+      frames(
+        { event: "delta", text: "partial " },
+        { event: "token", text: "draft" },
+        { event: "final", text: "final answer" },
+        { event: "complete" },
+      ),
+    );
+
+    expect(text).toBe("final answer");
+  });
+
+  it("supports choice deltas and message content frames", async () => {
+    const deltaText = await collectAgentText(frames({ choices: [{ delta: { content: "choice delta" } }] }, { event: "complete" }));
+    const messageText = await collectAgentText(
+      frames({ event: "message", message: { content: [{ text: "message answer" }] } }, { event: "complete" }),
+    );
+
+    expect(deltaText).toBe("choice delta");
+    expect(messageText).toBe("message answer");
+  });
+
+  it("reads direct message text and does not duplicate alternate delta fields", async () => {
+    const messageText = await collectAgentText(frames({ event: "message", text: "direct message" }, { event: "complete" }));
+    const deltaText = await collectAgentText(
+      frames({ event: "delta", text: "one copy", choices: [{ delta: { content: "one copy" } }] }, { event: "complete" }),
+    );
+
+    expect(messageText).toBe("direct message");
+    expect(deltaText).toBe("one copy");
+  });
+
+  it("ignores tool frames and rejects an empty response", async () => {
+    await expect(collectAgentText(frames({ event: "tool_result", text: "tool payload" }, { event: "complete" }), "empty section")).rejects.toThrow(
+      "empty section",
+    );
+  });
+});
+
+async function* frames(...items: AnnaAgentRunFrame[]): AsyncIterable<AnnaAgentRunFrame> {
+  for (const item of items) yield item;
+}
