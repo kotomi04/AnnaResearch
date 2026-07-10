@@ -431,7 +431,7 @@ def test_plugin_contract(tmp_path: Path):
         describe = plugin.call("describe")
         tools = [tool["name"] for tool in describe["result"]["tools"]]
         assert_true(describe["result"]["name"] == "tool-xhz-researcher-python-e7k8xa3s", "describe should advertise tool")
-        assert_true(describe["result"]["version"] == "0.2.2", "describe should advertise breaking version")
+        assert_true(describe["result"]["version"] == "0.2.3", "describe should advertise breaking version")
         assert_true("research" not in tools, "legacy research method should be absent")
         assert_true("app_search_web" not in tools, "legacy app_search_web must be removed")
         assert_true("app_call_research_source" in tools, "new app_call_research_source must be advertised")
@@ -463,7 +463,7 @@ def test_bundle_contract():
     bundle_js = "\n".join(path.read_text(encoding="utf-8") for path in (APP_ROOT / "bundle").glob("assets/*.js"))
     manifest = json.loads((APP_ROOT / "manifest.json").read_text(encoding="utf-8"))
     assert_true(manifest["required_executas"][0]["tool_id"] == "bundled:researcher", "manifest should reference bundled researcher tool")
-    assert_true(manifest["required_executas"][0]["min_version"] == "0.2.2", "manifest should require tool 0.2.2")
+    assert_true(manifest["required_executas"][0]["min_version"] == "0.2.3", "manifest should require tool 0.2.3")
     assert_true(manifest["ui"]["host_api"]["llm"] == ["complete", "embed"], "manifest should authorize llm.complete and llm.embed")
     assert_true(manifest["ui"]["host_api"]["agent"]["session"]["auto"] is True, "manifest should authorize agent auto sessions")
     assert_true('method:"research"' not in bundle_js and 'method: "research"' not in bundle_js, "bundle should not call legacy research method")

@@ -54,7 +54,7 @@ def test_describe_v2_app_methods_only(tmp_path):
         assert init["result"]["capabilities"] == {"sampling": {}}
         describe = plugin.call("describe")
         assert describe["result"]["name"] == "tool-xhz-researcher-python-e7k8xa3s"
-        assert describe["result"]["version"] == "0.2.2"
+        assert describe["result"]["version"] == "0.2.3"
         assert describe["result"]["host_capabilities"] == ["llm.embed", "llm.sample"]
         tools = [tool["name"] for tool in describe["result"]["tools"]]
         assert "research" not in tools

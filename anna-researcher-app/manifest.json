@@ -7,7 +7,7 @@
   "required_executas": [
     {
       "tool_id": "bundled:researcher",
-      "min_version": "0.2.2",
+      "min_version": "0.2.3",
       "version": "latest"
     }
   ],
@@ -60,7 +60,6 @@
       ],
       "img-src": ["'self'", "data:", "blob:"],
       "font-src": ["'self'", "data:"],
-      "worker-src": ["'self'", "blob:"],
       "style-src": ["'self'"],
       "script-src": ["'self'"]
     },
