@@ -25,6 +25,11 @@ ALLOWED_UPDATE_FIELDS = {
     "active_section_index",
     "attachments",
     "attachment_context",
+    "execution_mode",
+    "agent_evidence_registry",
+    "agent_section_evidence",
+    "agent_fact_ledger",
+    "agent_consistency_audit",
 }
 
 SPLIT_JOB_FIELDS = {
@@ -115,6 +120,11 @@ class JobStore:
             "assembled_result": None,
             "attachments": [],
             "attachment_context": None,
+            "execution_mode": "guided_sections",
+            "agent_evidence_registry": [],
+            "agent_section_evidence": {},
+            "agent_fact_ledger": [],
+            "agent_consistency_audit": "",
         }
         self.save(job)
         return job

@@ -1,6 +1,6 @@
 [project]
 name = "tool-xhz-researcher-python-e7k8xa3s"
-version = "0.2.3"
+version = "0.2.4"
 description = "Anna Researcher standalone Executa tool backend"
 requires-python = ">=3.10"
 authors = [{ name = "Anna Research" }]

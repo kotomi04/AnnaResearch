@@ -1,7 +1,7 @@
 {
   "slug": "anna-researcher-executa",
   "name": "Researcher Executa",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "executa_type": "tool",
   "description": "A Python Executa for the Anna Researcher App.",
   "tool_id": "tool-xhz-researcher-python-e7k8xa3s",

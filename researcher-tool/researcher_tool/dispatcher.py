@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 from typing import Any
 
 from .attachments import prepare_attachments
@@ -187,6 +188,16 @@ class AppDispatcher:
             return {"transfer": self.transfer_server.assembled_result_descriptor(research_id)}
         if method == "app_save_research_result":
             return self._save_result(args)
+        if method == "agent_get_report_state":
+            return self._agent_get_report_state(args)
+        if method == "agent_search_section":
+            return self._agent_search_section(args)
+        if method == "agent_select_section_evidence":
+            return self._agent_select_section_evidence(args)
+        if method == "agent_checkpoint_section":
+            return self._agent_checkpoint_section(args)
+        if method == "agent_finalize_report":
+            return self._agent_finalize_report(args)
         raise ValidationError(f"unknown app method: {method}")
 
     def _token_for(self, source_id: str) -> str:
@@ -542,6 +553,188 @@ class AppDispatcher:
         self.jobs.load(research_id)
         return {"transfer": self.transfer_server.descriptor(research_id)}
 
+    def _agent_get_report_state(self, args: dict[str, Any]) -> dict[str, Any]:
+        job = self.jobs.load(required_string(args, "research_id"))
+        return {
+            "research_id": job.get("research_id"),
+            "query": job.get("query"),
+            "role": job.get("confirmed_role"),
+            "focuses": job.get("confirmed_focuses") or [],
+            "outline": job.get("confirmed_outline") or [],
+            "completed_sections": [
+                {
+                    "section_id": section_id,
+                    "summary": result.get("section_summary") or "",
+                    "citation_sources": result.get("citation_sources") or [],
+                }
+                for section_id, result in (job.get("section_results") or {}).items()
+                if isinstance(result, dict) and result.get("status") == "completed"
+            ],
+            "attachment_summary": (job.get("attachment_context") or {}).get("summary") or "",
+            "attachment_files": _agent_attachment_file_summaries(job),
+            "fact_ledger": job.get("agent_fact_ledger") or [],
+            "citation_registry": job.get("agent_evidence_registry") or [],
+        }
+
+    def _agent_search_section(self, args: dict[str, Any]) -> dict[str, Any]:
+        research_id = required_string(args, "research_id")
+        section_id = required_string(args, "section_id")
+        source_id = required_string(args, "source_id")
+        queries = normalize_queries(args.get("queries"))
+        job = self.jobs.load(research_id)
+        section = _find_section(job, section_id)
+        iteration = int(args.get("iteration") or 1)
+        if not 1 <= iteration <= int(section.get("max_iterations") or 1):
+            raise ValidationError("iteration exceeds section max_iterations")
+        globally_seen = {
+            (str(entry.get("source_id") or ""), normalize_query_for_dedup(str(query)))
+            for entries in (job.get("section_iterations") or {}).values()
+            for entry in (entries or [])
+            for query in (entry.get("queries") or [])
+        }
+        fresh = [query for query in queries if (source_id, normalize_query_for_dedup(query)) not in globally_seen]
+        if fresh:
+            response = self._call_section_source({**args, "queries": fresh, "iteration": iteration})
+        else:
+            response = {"source_call": {"section_id": section_id, "source_id": source_id, "queries": [], "skipped_queries": queries, "results_count": 0, "error": None}}
+        latest = self.jobs.load(research_id)
+        evidence = _agent_search_evidence(latest, source_id=source_id, queries=fresh or queries)
+        return {"source_call": response.get("source_call") or {}, "evidence": evidence, "reused_existing_evidence": not bool(fresh)}
+
+    def _agent_select_section_evidence(self, args: dict[str, Any]) -> dict[str, Any]:
+        research_id = required_string(args, "research_id")
+        section_id = required_string(args, "section_id")
+        job = self.jobs.load(research_id)
+        section = _find_section(job, section_id)
+        all_results = [
+            item
+            for entries in (job.get("section_iterations") or {}).values()
+            for entry in (entries or [])
+            for item in (entry.get("raw_results") or [])
+            if isinstance(item, dict)
+        ]
+        all_queries = sorted({
+            str(query)
+            for entries in (job.get("section_iterations") or {}).values()
+            for entry in (entries or [])
+            for query in (entry.get("queries") or [])
+            if str(query).strip()
+        })
+        query = str(args.get("query") or f"{job.get('query')}\n\nSection: {section.get('title')}\n{section.get('outline')}").strip()
+        selected = self.selector.select(query=query, search_queries=all_queries or [query], search_results=all_results)
+        self.jobs.save_section_selected_context(research_id, section_id, selected)
+        attachment = args.get("_attachment_selection") if isinstance(args.get("_attachment_selection"), dict) else {}
+        registry = list(job.get("agent_evidence_registry") or [])
+        section_numbers: list[int] = []
+        for source in selected.get("selected_sources") or []:
+            url = str(source.get("url") or "").strip()
+            if not url:
+                continue
+            number = _register_agent_source(registry, {"kind": "url", "url": url, "title": source.get("title") or "", "icon": source.get("icon") or "", "content": source.get("content") or ""})
+            section_numbers.append(number)
+        for item in attachment.get("selected_items") or []:
+            source = {
+                "kind": "attachment",
+                "file_id": str(item.get("file_id") or item.get("file_name") or "attachment"),
+                "file_name": str(item.get("file_name") or "Uploaded file"),
+                "path": item.get("path"),
+                "content_type": item.get("content_type"),
+                "chunk_id": item.get("item_id"),
+                "index": item.get("index"),
+                "quote": item.get("quote") or "",
+            }
+            section_numbers.append(_register_agent_source(registry, source))
+        section_numbers = list(dict.fromkeys(section_numbers))
+        section_evidence = dict(job.get("agent_section_evidence") or {})
+        section_evidence[section_id] = {"citation_numbers": section_numbers}
+        self.jobs.update_metadata(research_id, {"agent_evidence_registry": registry, "agent_section_evidence": section_evidence})
+        citation_map = [{"number": number, "source": registry[number - 1]} for number in section_numbers]
+        return {
+            "section_id": section_id,
+            "web_context": str(selected.get("selected_context") or "")[:9000],
+            "attachment_context": str(attachment.get("selected_context") or "")[:9000],
+            "citation_map": citation_map,
+            "instructions": "Use only citation numbers from citation_map. Uploaded attachment analysis is supporting evidence only for claims directly visible in the attachment.",
+        }
+
+    def _agent_checkpoint_section(self, args: dict[str, Any]) -> dict[str, Any]:
+        research_id = required_string(args, "research_id")
+        section_id = required_string(args, "section_id")
+        markdown = required_string(args, "section_markdown")
+        summary = required_string(args, "section_summary")
+        job = self.jobs.load(research_id)
+        outline = job.get("confirmed_outline") or []
+        section_index = next((index for index, section in enumerate(outline) if section.get("id") == section_id), -1)
+        if section_index < 0:
+            raise ValidationError("unknown section_id", data={"section_id": section_id})
+        incomplete_prior = [section.get("id") for section in outline[:section_index] if (job.get("section_results") or {}).get(section.get("id"), {}).get("status") != "completed"]
+        if incomplete_prior:
+            raise ValidationError("sections must be checkpointed in outline order", data={"incomplete_prior_sections": incomplete_prior})
+        registry = job.get("agent_evidence_registry") or []
+        allowed = set((job.get("agent_section_evidence") or {}).get(section_id, {}).get("citation_numbers") or [])
+        cited = {int(value) for value in re.findall(r"\[(\d+)\]", markdown)}
+        invalid = sorted(cited - allowed)
+        if invalid:
+            raise ValidationError("section contains citations outside its evidence map", data={"invalid_citations": invalid, "allowed_citations": sorted(allowed)})
+        if not re.search(r"^##\s+\S", markdown, flags=re.M):
+            raise ValidationError("section_markdown must include a level-two section heading")
+        fact_citations = {
+            int(number)
+            for fact in (args.get("facts") or [])
+            if isinstance(fact, dict)
+            for number in (fact.get("citation_numbers") or [])
+            if str(number).isdigit()
+        }
+        invalid_fact_citations = sorted(fact_citations - allowed)
+        if invalid_fact_citations:
+            raise ValidationError("facts contain citations outside the section evidence map", data={"invalid_citations": invalid_fact_citations})
+        citation_sources = [registry[number - 1] for number in sorted(cited) if 0 < number <= len(registry)]
+        source_urls = [source.get("url") for source in citation_sources if source.get("kind") == "url" and source.get("url")]
+        saved = self.jobs.save_section_result(research_id, section_id, {
+            "section_markdown": markdown,
+            "section_summary": summary,
+            "source_urls": source_urls,
+            "citation_sources": citation_sources,
+            "status": "completed",
+        })
+        facts = _merge_agent_facts(job.get("agent_fact_ledger") or [], args.get("facts"), section_id)
+        progress = min(92, 35 + round((section_index + 1) / max(1, len(outline)) * 55))
+        saved = self.jobs.update_metadata(research_id, {"agent_fact_ledger": facts, "status": "running", "stage": "section_research", "active_section_index": section_index, "progress": progress})
+        return {"section_id": section_id, "status": "completed", "progress": progress, "fact_count": len(facts), "job": status_view(saved)}
+
+    def _agent_finalize_report(self, args: dict[str, Any]) -> dict[str, Any]:
+        research_id = required_string(args, "research_id")
+        title = required_string(args, "title")
+        introduction = required_string(args, "introduction")
+        conclusion = required_string(args, "conclusion")
+        audit = required_string(args, "consistency_audit")
+        job = self.jobs.load(research_id)
+        outline = job.get("confirmed_outline") or []
+        missing = [section.get("id") for section in outline if (job.get("section_results") or {}).get(section.get("id"), {}).get("status") != "completed"]
+        if missing:
+            raise ValidationError("cannot finalize before every section is checkpointed", data={"missing_sections": missing})
+        sections = [(job.get("section_results") or {})[section.get("id")] for section in outline]
+        heading = "结论" if re.search(r"[\u3400-\u9fff]", title + introduction + conclusion) else "Conclusion"
+        report_markdown = "\n\n".join(part.strip() for part in [f"# {title}", introduction, *[str(section.get("section_markdown") or "") for section in sections], f"## {heading}", conclusion] if part.strip())
+        registry = job.get("agent_evidence_registry") or []
+        cited = {int(value) for value in re.findall(r"\[(\d+)\]", report_markdown)}
+        invalid = sorted(number for number in cited if number < 1 or number > len(registry))
+        if invalid:
+            raise ValidationError("final report contains unknown citations", data={"invalid_citations": invalid})
+        citation_sources = [registry[number - 1] for number in sorted(cited) if 0 < number <= len(registry)]
+        source_urls = [source.get("url") for source in citation_sources if source.get("kind") == "url" and source.get("url")]
+        self.jobs.save_report_framing(research_id, {"title": title, "introduction": introduction, "conclusion": conclusion})
+        self.jobs.update_metadata(research_id, {"agent_consistency_audit": audit})
+        completed = self.jobs.save_assembled_result(research_id, {
+            "report_markdown": report_markdown,
+            "source_urls": source_urls,
+            "citation_sources": citation_sources,
+            "status": "completed",
+            "stage": "completed",
+            "progress": 100,
+        })
+        return {"research_id": research_id, "status": "completed", "section_count": len(sections), "citation_count": len(citation_sources), "report_markdown_chars": len(report_markdown), "job": status_view(completed)}
+
     def _source_exists(self, source_id: str) -> bool:
         try:
             self.registry.get_definition(source_id)
@@ -590,3 +783,88 @@ def normalize_queries(value: Any) -> list[str]:
         if text and text not in queries:
             queries.append(text)
     return queries
+
+
+def _agent_attachment_file_summaries(job: dict[str, Any]) -> list[dict[str, Any]]:
+    context = job.get("attachment_context") or {}
+    summaries: list[dict[str, Any]] = []
+    for file in context.get("files") or []:
+        if not isinstance(file, dict) or file.get("status") != "ready":
+            continue
+        analysis = file.get("analysis") if isinstance(file.get("analysis"), dict) else {}
+        summaries.append({
+            "file_id": file.get("id"),
+            "file_name": file.get("name"),
+            "content_type": file.get("content_type"),
+            "summary": analysis.get("summary") or "",
+            "key_points": (analysis.get("key_points") or [])[:5],
+            "relevance_score": analysis.get("relevance_score"),
+        })
+    return summaries
+
+
+def _agent_search_evidence(job: dict[str, Any], *, source_id: str, queries: list[str]) -> list[dict[str, Any]]:
+    normalized_queries = {normalize_query_for_dedup(query) for query in queries}
+    evidence: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for entries in (job.get("section_iterations") or {}).values():
+        for entry in entries or []:
+            if str(entry.get("source_id") or "") != source_id:
+                continue
+            if normalized_queries and not any(normalize_query_for_dedup(str(query)) in normalized_queries for query in entry.get("queries") or []):
+                continue
+            for item in entry.get("raw_results") or []:
+                url = str(item.get("url") or "").strip()
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                evidence.append({
+                    "url": url,
+                    "title": str(item.get("title") or ""),
+                    "content": str(item.get("content") or item.get("raw_content") or "")[:1400],
+                })
+                if len(evidence) >= 6:
+                    return evidence
+    return evidence
+
+
+def _register_agent_source(registry: list[dict[str, Any]], source: dict[str, Any]) -> int:
+    if source.get("kind") == "url":
+        key = ("url", str(source.get("url") or "").strip())
+        index = next((idx for idx, item in enumerate(registry) if (item.get("kind"), str(item.get("url") or "").strip()) == key), -1)
+    else:
+        key = ("attachment", str(source.get("file_id") or ""), str(source.get("chunk_id") or ""))
+        index = next((idx for idx, item in enumerate(registry) if (item.get("kind"), str(item.get("file_id") or ""), str(item.get("chunk_id") or "")) == key), -1)
+    if index < 0:
+        registry.append(source)
+        return len(registry)
+    existing = registry[index]
+    registry[index] = {**existing, **{key: value for key, value in source.items() if value not in (None, "", [])}}
+    return index + 1
+
+
+def _merge_agent_facts(existing: list[Any], incoming: Any, section_id: str) -> list[dict[str, Any]]:
+    facts = [dict(item) for item in existing if isinstance(item, dict) and str(item.get("key") or "").strip()]
+    if not isinstance(incoming, list):
+        return facts
+    for item in incoming:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        value = str(item.get("value") or "").strip()
+        if not key or not value:
+            continue
+        fact = {
+            "key": key,
+            "value": value,
+            "qualifier": str(item.get("qualifier") or "").strip(),
+            "citation_numbers": [int(number) for number in (item.get("citation_numbers") or []) if str(number).isdigit()],
+            "section_id": section_id,
+        }
+        normalized = key.casefold()
+        index = next((idx for idx, current in enumerate(facts) if str(current.get("key") or "").casefold() == normalized), -1)
+        if index < 0:
+            facts.append(fact)
+        else:
+            facts[index] = fact
+    return facts

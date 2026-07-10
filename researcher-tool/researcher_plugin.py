@@ -17,7 +17,7 @@ from researcher_tool.sampling import AnnaSamplingClient, SamplingError
 from researcher_tool.sources.native.executor import NativeResearchSourceExecutor
 
 TOOL_ID = "tool-xhz-researcher-python-e7k8xa3s"
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 APP_METHODS = [
     "app_get_settings",
     "app_update_settings",
@@ -48,7 +48,60 @@ APP_METHODS = [
     "app_save_assembled_research_result",
     "app_save_research_result",
     "app_embed_texts",
+    "agent_get_report_state",
+    "agent_search_section",
+    "agent_select_section_evidence",
+    "agent_checkpoint_section",
+    "agent_finalize_report",
 ]
+
+AGENT_TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {
+    "agent_get_report_state": {
+        "description": "Read the autonomous report state, outline, completed sections, attachment summaries, facts, and citation registry.",
+        "parameters": [{"name": "research_id", "type": "string", "description": "Research job id.", "required": True}],
+    },
+    "agent_search_section": {
+        "description": "Search one allowed source for one report section. Reuses globally searched queries when possible.",
+        "parameters": [
+            {"name": "research_id", "type": "string", "description": "Research job id.", "required": True},
+            {"name": "section_id", "type": "string", "description": "Outline section id.", "required": True},
+            {"name": "source_id", "type": "string", "description": "An allowed source id from the section outline.", "required": True},
+            {"name": "iteration", "type": "integer", "description": "Iteration number within the section limit.", "required": True},
+            {"name": "queries", "type": "array", "description": "Focused search query strings.", "required": True},
+        ],
+        "timeout": 300,
+    },
+    "agent_select_section_evidence": {
+        "description": "Select bounded web and uploaded-file evidence for a section and return its global citation map.",
+        "parameters": [
+            {"name": "research_id", "type": "string", "description": "Research job id.", "required": True},
+            {"name": "section_id", "type": "string", "description": "Outline section id.", "required": True},
+            {"name": "query", "type": "string", "description": "Evidence-selection query for this section.", "required": False},
+            {"name": "top_k", "type": "integer", "description": "Maximum uploaded text chunks to select; use 4 by default.", "required": False},
+        ],
+        "timeout": 300,
+    },
+    "agent_checkpoint_section": {
+        "description": "Validate and persist one completed section in outline order using only its assigned global citations.",
+        "parameters": [
+            {"name": "research_id", "type": "string", "description": "Research job id.", "required": True},
+            {"name": "section_id", "type": "string", "description": "Outline section id.", "required": True},
+            {"name": "section_markdown", "type": "string", "description": "Complete section Markdown including its heading.", "required": True},
+            {"name": "section_summary", "type": "string", "description": "Concise continuity summary.", "required": True},
+            {"name": "facts", "type": "array", "description": "Canonical facts as objects with key, value, qualifier, and citation_numbers.", "required": False},
+        ],
+    },
+    "agent_finalize_report": {
+        "description": "Finalize the report after every section is checkpointed and a global consistency audit is complete.",
+        "parameters": [
+            {"name": "research_id", "type": "string", "description": "Research job id.", "required": True},
+            {"name": "title", "type": "string", "description": "Final report title without Markdown prefix.", "required": True},
+            {"name": "introduction", "type": "string", "description": "Final report introduction.", "required": True},
+            {"name": "conclusion", "type": "string", "description": "Final report conclusion.", "required": True},
+            {"name": "consistency_audit", "type": "string", "description": "Summary of checks for contradictions, repeated analysis, terminology, dates, numbers, and citations.", "required": True},
+        ],
+    },
+}
 
 MANIFEST: dict[str, Any] = {
     "name": TOOL_ID,
@@ -58,11 +111,10 @@ MANIFEST: dict[str, Any] = {
     "author": "Anna Research",
     "host_capabilities": ["llm.embed", "llm.sample"],
     "tools": [
-        {
-            "name": method,
+        {"name": method, **AGENT_TOOL_DEFINITIONS.get(method, {
             "description": f"Anna Researcher app method: {method}.",
             "parameters": [{"name": "payload", "type": "object", "description": "App method arguments.", "required": False}],
-        }
+        })}
         for method in APP_METHODS
     ],
     "runtime": {"type": "uv", "min_version": "0.1.0"},
@@ -146,6 +198,20 @@ def handle_invoke(req_id: Any, params: dict[str, Any]) -> dict[str, Any]:
                 query=str(args.get("query") or ""),
                 top_k=int(args.get("top_k") or 8),
             )
+        elif tool == "agent_select_section_evidence":
+            job = dispatcher.jobs.load(str(args.get("research_id") or ""))
+            section = next((item for item in job.get("confirmed_outline") or [] if str(item.get("id") or "") == str(args.get("section_id") or "")), None)
+            if not section:
+                raise ValidationError("unknown section_id")
+            query = str(args.get("query") or f"{job.get('query')}\n\nSection: {section.get('title')}\n{section.get('outline')}")
+            attachment = select_attachment_context(
+                jobs=dispatcher.jobs,
+                embeddings=embeddings,
+                research_id=str(args.get("research_id") or ""),
+                query=query,
+                top_k=int(args.get("top_k") or 4),
+            ) if job.get("attachment_context") else {"selected_context": "", "selected_items": []}
+            data = dispatcher.dispatch(tool, {**args, "_attachment_selection": attachment})
         else:
             data = dispatcher.dispatch(tool, args)
         return make_response(req_id, result={"success": True, "tool": tool, "data": data})
