@@ -17,6 +17,11 @@ DEFAULT_TOP_K = 8
 MAX_TOP_K = 16
 MAX_CHUNK_CHARS = 1800
 SUMMARY_TIMEOUT_SECONDS = 75.0
+ATTACHMENT_EVIDENCE_POLICY = (
+    "Use this analysis as supporting evidence only when the claim is directly grounded in visible content. "
+    "Do not use it to verify external facts, dates, source credibility, or causal explanations unless those "
+    "are explicitly visible in the attachment content."
+)
 
 
 def summarize_attachment_context(
@@ -34,43 +39,61 @@ def summarize_attachment_context(
     if not isinstance(context, dict):
         raise ValidationError("attachment_context is not prepared")
     chunks = [chunk for chunk in (context.get("chunks") or []) if isinstance(chunk, dict) and str(chunk.get("text") or "").strip()]
-    if not chunks:
-        raise ValidationError("attachment_context does not contain usable chunks")
+    image_files = _relevant_image_files(context)
 
     clean_query = str(query or job.get("query") or "").strip()
     if not clean_query:
         raise ValidationError("query is required")
-    selected = select_top_attachment_chunks(chunks, query=clean_query, embeddings=embeddings, top_k=top_k)
-    if not selected:
-        raise ValidationError("no attachment chunks could be selected")
-
-    messages = [
-        {
-            "role": "user",
-            "content": {
-                "type": "text",
-                "text": _summary_prompt(query=clean_query, grouped_chunks=_group_chunks_by_file(selected)),
-            },
+    selected = select_top_attachment_chunks(chunks, query=clean_query, embeddings=embeddings, top_k=top_k) if chunks else []
+    if not selected and not image_files:
+        context["summary"] = ""
+        context["summary_status"] = "ready"
+        context["summary_mode"] = "no_relevant_attachment_context"
+        context["summary_query"] = clean_query
+        context["summary_top_k"] = 0
+        context["summary_generated_at"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        job = jobs.update_metadata(research_id, {"attachment_context": context})
+        view = compact_job_view(job)
+        view["attachment_context_summary"] = {
+            "chunk_count": len(context.get("chunks") or []),
+            "selected_item_count": 0,
+            "file_count": len(context.get("files") or []),
+            "summary_chars": 0,
+            "summary_status": "ready",
+            "summary_query": clean_query,
         }
-    ]
-    result = sampling.create_message(
-        messages=messages,
-        system_prompt=(
-            "你是研究附件分析助手。基于给定 query 和附件片段，为每个文件写与研究任务相关的摘要。"
-            "不要编造未出现在片段中的事实。只返回严格 JSON。"
-        ),
-        max_tokens=1200,
-        temperature=0.2,
-        metadata={"executa_invoke_id": invoke_id, "tool": "app_summarize_attachments", "research_id": research_id},
-        timeout=SUMMARY_TIMEOUT_SECONDS,
-    )
-    parsed = _parse_summary_json(sampling_text(result))
-    context = _apply_ai_summary(context, parsed=parsed, selected=selected, query=clean_query, top_k=len(selected))
+        return {"job": view}
+
+    if selected:
+        messages = [
+            {
+                "role": "user",
+                "content": {
+                    "type": "text",
+                    "text": _summary_prompt(query=clean_query, grouped_chunks=_group_chunks_by_file(selected)),
+                },
+            }
+        ]
+        result = sampling.create_message(
+            messages=messages,
+            system_prompt=(
+                "你是研究附件分析助手。基于给定 query 和附件片段，为每个文件写与研究任务相关的摘要。"
+                "不要编造未出现在片段中的事实。只返回严格 JSON。"
+            ),
+            max_tokens=1200,
+            temperature=0.2,
+            metadata={"executa_invoke_id": invoke_id, "tool": "app_summarize_attachments", "research_id": research_id},
+            timeout=SUMMARY_TIMEOUT_SECONDS,
+        )
+        parsed = _parse_summary_json(sampling_text(result))
+    else:
+        parsed = {"summary": _fallback_global_summary(image_files), "files": []}
+    context = _apply_attachment_analysis(context, parsed=parsed, selected=selected, query=clean_query, top_k=len(selected))
     job = jobs.update_metadata(research_id, {"attachment_context": context})
     view = compact_job_view(job)
     view["attachment_context_summary"] = {
         "chunk_count": len(context.get("chunks") or []),
-        "selected_chunk_count": len(selected),
+        "selected_item_count": len(selected) + len(image_files),
         "file_count": len(context.get("files") or []),
         "summary_chars": len(str(context.get("summary") or "")),
         "summary_status": context.get("summary_status") or "ready",
@@ -91,28 +114,54 @@ def select_attachment_context(
     context = job.get("attachment_context")
     if not isinstance(context, dict):
         raise ValidationError("attachment_context is not prepared")
-    chunks = [chunk for chunk in (context.get("chunks") or []) if isinstance(chunk, dict) and str(chunk.get("text") or "").strip()]
-    if not chunks:
-        return {"selected_context": "", "selected_chunks": [], "selected_chunk_count": 0}
+    relevant_file_ids = _relevant_file_ids(context)
+    image_files = _relevant_image_files(context)
+    chunks = [
+        chunk
+        for chunk in (context.get("chunks") or [])
+        if isinstance(chunk, dict)
+        and str(chunk.get("text") or "").strip()
+        and str(chunk.get("file_id") or "") in relevant_file_ids
+    ]
+    if not chunks and not image_files:
+        return {"selected_context": "", "selected_items": [], "selected_item_count": 0}
 
     clean_query = str(query or job.get("query") or "").strip()
     if not clean_query:
         raise ValidationError("query is required")
-    selected = select_top_attachment_chunks(chunks, query=clean_query, embeddings=embeddings, top_k=top_k)
+    selected = select_top_attachment_chunks(chunks, query=clean_query, embeddings=embeddings, top_k=top_k) if chunks else []
+    selected_images = _selected_image_summaries(image_files)
     return {
-        "selected_context": _selected_context_text(selected),
-        "selected_chunks": [
+        "selected_context": _selected_context_text(selected, selected_images),
+        "selected_items": [
             {
-                "chunk_id": chunk.get("chunk_id"),
+                "kind": "chunk",
+                "item_id": chunk.get("chunk_id"),
                 "file_id": chunk.get("file_id"),
                 "file_name": chunk.get("file_name"),
+                "path": chunk.get("path"),
+                "content_type": chunk.get("content_type"),
                 "index": chunk.get("index"),
                 "score": chunk.get("score"),
                 "quote": _quote_for_citation(str(chunk.get("text") or "")),
             }
             for chunk in selected
+        ]
+        + [
+            {
+                "kind": "image_analysis",
+                "item_id": image.get("item_id"),
+                "file_id": image.get("file_id"),
+                "file_name": image.get("file_name"),
+                "path": image.get("path"),
+                "content_type": image.get("content_type"),
+                "index": 0,
+                "score": image.get("score"),
+                "quote": "",
+            }
+            for image in selected_images
         ],
-        "selected_chunk_count": len(selected),
+        "selected_item_count": len(selected) + len(selected_images),
     }
 
 
@@ -149,14 +198,18 @@ def select_top_attachment_chunks(
     return selected
 
 
-def _selected_context_text(chunks: list[dict[str, Any]]) -> str:
-    if not chunks:
+def _selected_context_text(chunks: list[dict[str, Any]], images: list[dict[str, Any]] | None = None) -> str:
+    images = images or []
+    if not chunks and not images:
         return ""
-    parts = []
+    parts = [f"Uploaded-file evidence policy: {ATTACHMENT_EVIDENCE_POLICY}"]
     for group in _group_chunks_by_file(chunks):
-        parts.append(f"File: {group.get('file_name')} ({group.get('file_id')})")
+        parts.append(f"File: {group.get('file_name')}")
         for chunk in group.get("chunks") or []:
-            parts.append(f"[{chunk.get('chunk_id')}, score={chunk.get('score')}]\n{chunk.get('text')}")
+            parts.append(f"[Uploaded file excerpt, score={chunk.get('score')}]\n{chunk.get('text')}")
+    for image in images:
+        parts.append(f"Image file: {image.get('file_name')}")
+        parts.append(f"[Image analysis, score={image.get('score')}]\n{image.get('text')}")
     return "\n\n".join(parts)
 
 
@@ -210,7 +263,15 @@ def _summary_prompt(*, query: str, grouped_chunks: list[dict[str, Any]]) -> str:
         f"Research query:\n{query}",
         (
             'Return strict JSON only, in this shape: {"summary":"overall attachment summary",'
-            '"files":[{"file_id":"file-1","summary":"...","key_points":["..."],"relevance":"..."}]}.'
+            '"files":[{"file_id":"file-1","summary":"...","key_points":["..."],'
+            '"relevance":"how this file relates to the research task",'
+            '"relevance_score":"number from 0 to 1"}]}. '
+            "Set relevance_score from 0 to 1, where 0 means unrelated and 1 means directly useful for the research query. "
+            "Use this relevance_score rubric: "
+            "0.0-0.2 = unrelated, do not use for planning or writing; "
+            "0.21-0.5 = weak background relevance; "
+            "0.51-0.75 = relevant supporting context; "
+            "0.76-1.0 = directly relevant evidence for planning or writing."
         ),
         "Attachment chunks grouped by file:",
     ]
@@ -237,7 +298,7 @@ def _parse_summary_json(text: str) -> dict[str, Any]:
     return parsed
 
 
-def _apply_ai_summary(
+def _apply_attachment_analysis(
     context: dict[str, Any],
     *,
     parsed: dict[str, Any],
@@ -264,10 +325,20 @@ def _apply_ai_summary(
         file_id = str(file.get("id") or "")
         summary = summaries_by_file.get(file_id) or {}
         if summary:
-            file["ai_summary"] = str(summary.get("summary") or "").strip()
-            file["ai_key_points"] = [str(point).strip() for point in (summary.get("key_points") or []) if str(point or "").strip()]
-            file["ai_relevance"] = str(summary.get("relevance") or "").strip()
-        file["summary_selected_chunk_ids"] = selected_by_file.get(file_id, [])
+            file["analysis"] = {
+                "type": "text",
+                "source": "summary_llm",
+                "summary": str(summary.get("summary") or "").strip(),
+                "key_points": [str(point).strip() for point in (summary.get("key_points") or []) if str(point or "").strip()],
+                "relevance": str(summary.get("relevance") or "").strip(),
+                "relevance_score": _optional_float(summary.get("relevance_score")),
+                "selected_chunk_ids": selected_by_file.get(file_id, []),
+                "payload": {},
+            }
+        elif file.get("analysis"):
+            analysis = file.get("analysis")
+            if isinstance(analysis, dict):
+                analysis["selected_chunk_ids"] = selected_by_file.get(file_id, analysis.get("selected_chunk_ids") or [])
 
     context["summary"] = str(parsed.get("summary") or "").strip() or _fallback_global_summary(context.get("files") or [])
     context["summary_status"] = "ready"
@@ -281,6 +352,108 @@ def _apply_ai_summary(
 def _fallback_global_summary(files: list[Any]) -> str:
     parts = []
     for file in files:
-        if isinstance(file, dict) and file.get("ai_summary"):
-            parts.append(f"{file.get('name')}: {file.get('ai_summary')}")
+        analysis = file.get("analysis") if isinstance(file, dict) else None
+        if isinstance(analysis, dict) and analysis.get("summary"):
+            parts.append(f"{file.get('name')}: {analysis.get('summary')}")
     return "\n".join(parts)
+
+
+def _relevant_file_ids(context: dict[str, Any]) -> set[str]:
+    files = [file for file in (context.get("files") or []) if isinstance(file, dict) and file.get("status") == "ready"]
+    if not files:
+        return set()
+    relevant = {str(file.get("id") or "") for file in files if _attachment_file_is_relevant(file) and _analysis_type(file) != "image"}
+    return {file_id for file_id in relevant if file_id}
+
+
+def _relevant_image_files(context: dict[str, Any]) -> list[dict[str, Any]]:
+    files = [file for file in (context.get("files") or []) if isinstance(file, dict) and file.get("status") == "ready"]
+    return [
+        file
+        for file in files
+        if _analysis_type(file) == "image"
+        and _attachment_file_is_relevant(file)
+        and isinstance(_analysis_payload(file), dict)
+        and str(_analysis_summary(file)).strip()
+    ]
+
+
+def _selected_image_summaries(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected = []
+    for file in files:
+        file_id = str(file.get("id") or "file-unknown")
+        text = _image_summary_text(file)
+        if not text:
+            continue
+        selected.append(
+            {
+                "item_id": f"{file_id}:image-summary",
+                "file_id": file_id,
+                "file_name": file.get("name") or file_id,
+                "path": file.get("path"),
+                "content_type": file.get("content_type"),
+                "score": _analysis_relevance_score(file) or 0.0,
+                "text": text,
+            }
+        )
+    selected.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    return selected
+
+
+def _image_summary_text(file: dict[str, Any]) -> str:
+    parts = [f"Image analysis JSON for {file.get('name') or file.get('id') or 'image'}:"]
+    payload = _analysis_payload(file)
+    if isinstance(payload, dict):
+        parts.append(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        summary = _analysis_summary(file)
+        if summary:
+            parts.append(summary)
+    relevance = _analysis_relevance(file)
+    if relevance:
+        parts.extend(["Research relevance:", relevance])
+    return "\n".join(parts).strip()
+
+
+def _attachment_file_is_relevant(file: dict[str, Any]) -> bool:
+    score = _analysis_relevance_score(file)
+    if score is not None:
+        return score >= 0.25
+    return False
+
+
+def _analysis(file: dict[str, Any]) -> dict[str, Any]:
+    value = file.get("analysis")
+    return value if isinstance(value, dict) else {}
+
+
+def _analysis_type(file: dict[str, Any]) -> str:
+    return str(_analysis(file).get("type") or "").strip()
+
+
+def _analysis_summary(file: dict[str, Any]) -> str:
+    return str(_analysis(file).get("summary") or "").strip()
+
+
+def _analysis_relevance(file: dict[str, Any]) -> str:
+    return str(_analysis(file).get("relevance") or "").strip()
+
+
+def _analysis_relevance_score(file: dict[str, Any]) -> float | None:
+    return _optional_float(_analysis(file).get("relevance_score"))
+
+
+def _analysis_payload(file: dict[str, Any]) -> Any:
+    return _analysis(file).get("payload")
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return max(0.0, min(1.0, number))

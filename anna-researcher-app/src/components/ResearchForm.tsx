@@ -2,6 +2,22 @@ import { useRef } from "react";
 import type { MessageKey } from "../i18n/messages";
 import type { ResearchAttachment } from "../types";
 
+const SUPPORTED_ATTACHMENT_ACCEPT = [
+  ".txt",
+  ".md",
+  ".markdown",
+  ".csv",
+  ".tsv",
+  ".json",
+  ".pdf",
+  ".docx",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".webp",
+  ".gif",
+].join(",");
+
 interface Props {
   isBusy: boolean;
   canStart: boolean;
@@ -17,7 +33,9 @@ interface Props {
   onBriefNameChange(value: string): void;
   onResearchNeedChange(value: string): void;
   onAttachmentAdd?(files: File[]): void;
+  onAttachmentOpen?(file: File): void;
   onAttachmentRemove?(index: number): void;
+  onUploadedAttachmentOpen?(file: ResearchAttachment): void;
   onShowLastResult(): void;
   onStart(input: { briefName: string; researchNeed: string }): void;
   onValidationError(message: string): void;
@@ -38,7 +56,9 @@ export function ResearchForm({
   onBriefNameChange,
   onResearchNeedChange,
   onAttachmentAdd,
+  onAttachmentOpen,
   onAttachmentRemove,
+  onUploadedAttachmentOpen,
   onShowLastResult,
   onStart,
   onValidationError,
@@ -114,6 +134,7 @@ export function ResearchForm({
             className="visually-hidden"
             type="file"
             multiple
+            accept={SUPPORTED_ATTACHMENT_ACCEPT}
             onChange={(event) => selectFiles(event.target.files)}
           />
         </div>
@@ -121,15 +142,35 @@ export function ResearchForm({
           <div className="attachment-list" aria-label={t("attachmentList")}>
             {uploadedAttachments.map((file, index) => (
               <span className="attachment-chip" key={`${file.path || file.name}-${index}`}>
-                <span>{file.name}</span>
+                <button
+                  type="button"
+                  className="attachment-chip-open"
+                  onClick={() => onUploadedAttachmentOpen?.(file)}
+                  disabled={!onUploadedAttachmentOpen}
+                >
+                  {file.name}
+                </button>
                 <small>{file.size_bytes != null ? formatFileSize(file.size_bytes) : t("attachmentUploaded")}</small>
               </span>
             ))}
             {attachments.map((file, index) => (
               <span className="attachment-chip" key={`${file.name}-${file.size}-${file.lastModified}-${index}`}>
-                <span>{file.name}</span>
+                <button
+                  type="button"
+                  className="attachment-chip-open"
+                  onClick={() => onAttachmentOpen?.(file)}
+                  disabled={!onAttachmentOpen}
+                >
+                  {file.name}
+                </button>
                 <small>{formatFileSize(file.size)}</small>
-                <button type="button" aria-label={t("attachmentRemove")} onClick={() => onAttachmentRemove?.(index)} disabled={isBusy}>
+                <button
+                  type="button"
+                  className="attachment-chip-remove"
+                  aria-label={t("attachmentRemove")}
+                  onClick={() => onAttachmentRemove?.(index)}
+                  disabled={isBusy}
+                >
                   x
                 </button>
               </span>

@@ -10,15 +10,16 @@
     "dev:frontend": "vite --host 127.0.0.1"
   },
   "dependencies": {
+    "pdfjs-dist": "^6.1.200",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "react-markdown": "^10.1.0"
   },
   "devDependencies": {
+    "@testing-library/react": "^16.3.0",
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.6",
     "@types/react-dom": "^19.2.3",
-    "@testing-library/react": "^16.3.0",
     "@vitejs/plugin-react": "^5.0.4",
     "jsdom": "^27.0.0",
     "typescript": "^5.9.3",

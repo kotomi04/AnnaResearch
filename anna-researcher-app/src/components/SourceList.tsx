@@ -6,9 +6,10 @@ interface Props {
   sources?: SearchResult[];
   citationSources?: CitationSource[];
   t(key: MessageKey): string;
+  onAttachmentOpen?(source: Extract<CitationSource, { kind: "attachment" }>): void;
 }
 
-export function SourceList({ urls, sources = [], citationSources, t }: Props) {
+export function SourceList({ urls, sources = [], citationSources, t, onAttachmentOpen }: Props) {
   const references = citationSources?.length ? citationSources : urls.map((url) => ({ kind: "url" as const, url }));
   return (
     <aside className="source-references-panel">
@@ -19,15 +20,19 @@ export function SourceList({ urls, sources = [], citationSources, t }: Props) {
         <ol id="sources-list" className="reference-list">
           {references.map((reference, index) => {
             if (reference.kind === "attachment") {
-              const fallbackInitial = (reference.file_name || "F").trim().charAt(0).toUpperCase() || "F";
+              const label = attachmentChunkLabel(reference);
               return (
-                <li key={`${reference.file_id}-${reference.chunk_id || index}`}>
+                <li key={`${reference.file_id}-${reference.chunk_id || index}`} className="reference-attachment-item">
                   <span className="reference-index" aria-label={`Reference ${index + 1}`}>[{index + 1}]</span>
-                  <span className="reference-site-mark" aria-hidden="true">{fallbackInitial}</span>
-                  <span>
-                    {reference.file_name}
-                    {reference.chunk_id ? ` · ${reference.chunk_id}` : ""}
-                  </span>
+                  {onAttachmentOpen ? (
+                    <button type="button" className="reference-attachment-button" onClick={() => onAttachmentOpen(reference)}>
+                      {reference.file_name}{label ? ` · ${label}` : ""}
+                    </button>
+                  ) : (
+                    <span>
+                      {reference.file_name}{label ? ` · ${label}` : ""}
+                    </span>
+                  )}
                 </li>
               );
             }
@@ -48,6 +53,14 @@ export function SourceList({ urls, sources = [], citationSources, t }: Props) {
       )}
     </aside>
   );
+}
+
+function attachmentChunkLabel(reference: Extract<CitationSource, { kind: "attachment" }>): string {
+  const chunkId = String(reference.chunk_id || "");
+  const match = /:(?:0*)(\d+)$/.exec(chunkId);
+  if (match) return `chunk ${Number(match[1])}`;
+  if (chunkId.endsWith(":image-summary")) return "";
+  return chunkId ? "chunk" : "";
 }
 
 function sourceForUrl(sources: SearchResult[], url: string): SearchResult | null {

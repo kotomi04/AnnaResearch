@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { connectAnnaRuntime } from "./api/annaRuntime";
 import { getResearchFileDownloadDescriptors, uploadResearchFilesToAps } from "./api/apsFiles";
 import { AnnaResearchApi, createStandaloneApi, type ResearchApi } from "./api/researchApi";
@@ -6,6 +6,7 @@ import { DraftGenerationPage } from "./components/DraftGenerationPage";
 import { FocusReviewPage } from "./components/FocusReviewPage";
 import { LanguageToggle } from "./components/LanguageToggle";
 import { OutlineReviewPage } from "./components/OutlineReviewPage";
+import { AttachmentPreviewDialog, type AttachmentPreviewKind } from "./components/AttachmentPreviewDialog";
 import { ReportDisplayPage } from "./components/ReportDisplayPage";
 import { ReportGenerationPage } from "./components/ReportGenerationPage";
 import { ResearchForm } from "./components/ResearchForm";
@@ -22,11 +23,18 @@ import { MAX_RESEARCH_ITERATIONS, useResearchJob } from "./hooks/useResearchJob"
 import type { FocusCandidate, RoleCandidate } from "./hooks/useResearchJob";
 import { localizedError, localizedJobMessage } from "./i18n/status";
 import { useLocale } from "./i18n/useLocale";
-import type { AnnaRuntimeApi, ReportSection } from "./types";
+import type { AnnaRuntimeApi, CitationSource, ReportSection, ResearchAttachment } from "./types";
 import { summarizePlan } from "./workflow/planSummary";
 import { projectGuidedStep, type GuidedStepId } from "./workflow/stepState";
 
 type AppPage = "task-picker" | "workflow" | "library" | "sources" | "source-detail" | "source-new";
+
+interface AttachmentPreviewState {
+  kind: AttachmentPreviewKind;
+  name: string;
+  url: string;
+  objectUrl?: string;
+}
 
 export function App() {
   const { locale, setLocale, t } = useLocale();
@@ -40,6 +48,8 @@ export function App() {
   const [briefNameDraft, setBriefNameDraft] = useState("");
   const [researchNeedDraft, setResearchNeedDraft] = useState("");
   const [pendingAttachments, setPendingAttachments] = useState<File[]>([]);
+  const [attachmentPreview, setAttachmentPreview] = useState<AttachmentPreviewState | null>(null);
+  const attachmentObjectUrlRef = useRef<string | null>(null);
   const [selectedRoleIndex, setSelectedRoleIndex] = useState(0);
   const [selectedFocusIds, setSelectedFocusIds] = useState<string[]>([]);
   const [regenInstruction, setRegenInstruction] = useState("");
@@ -137,6 +147,88 @@ export function App() {
     setResearchNeedDraft(parsed.researchNeed);
   }, [research.job?.research_id, research.job?.query]);
 
+  useEffect(() => () => revokeAttachmentObjectUrl(), []);
+
+  function revokeAttachmentObjectUrl() {
+    if (!attachmentObjectUrlRef.current) return;
+    URL.revokeObjectURL(attachmentObjectUrlRef.current);
+    attachmentObjectUrlRef.current = null;
+  }
+
+  function showAttachmentPreview(nextPreview: AttachmentPreviewState) {
+    revokeAttachmentObjectUrl();
+    if (nextPreview.objectUrl) attachmentObjectUrlRef.current = nextPreview.objectUrl;
+    setAttachmentPreview(nextPreview);
+  }
+
+  function closeAttachmentPreview() {
+    setAttachmentPreview(null);
+    window.setTimeout(() => revokeAttachmentObjectUrl(), 0);
+  }
+
+  function openPendingAttachment(file: File) {
+    setValidationMessage("");
+    const kind = previewKindForFile(file);
+    if (kind === "unsupported") {
+      showAttachmentPreview({ kind, name: file.name || "attachment", url: "" });
+      return;
+    }
+    if (kind) {
+      const objectUrl = URL.createObjectURL(file);
+      showAttachmentPreview({ kind, name: file.name || "attachment", url: objectUrl, objectUrl });
+      return;
+    }
+  }
+
+  async function openUploadedAttachment(attachment: ResearchAttachment) {
+    setValidationMessage("");
+    const kind = previewKindForAttachment(attachment);
+    try {
+      if (kind === "unsupported") {
+        showAttachmentPreview({ kind, name: attachment.name || "attachment", url: "" });
+        return;
+      }
+      if (!annaRuntime?.files) throw new Error("Anna files API is unavailable.");
+      const path = String(attachment.path || "").trim();
+      if (!path) throw new Error("Attachment path is missing.");
+      const response = await annaRuntime.files.download_url({ path });
+      const downloadUrl = String(response.get_url || response.url || "").trim();
+      if (!downloadUrl) throw new Error(`Anna files download_url did not return a URL for ${attachment.name || path}.`);
+      if (kind) {
+        showAttachmentPreview({ kind, name: attachment.name || "attachment", url: downloadUrl });
+        return;
+      }
+    } catch (err) {
+      setValidationMessage(localizedError(err, t));
+    }
+  }
+
+  async function openCitationAttachment(source: Extract<CitationSource, { kind: "attachment" }>) {
+    setValidationMessage("");
+    const attachment = findAttachmentForCitation(source, [
+      ...(research.job?.attachments || []),
+      ...(research.lastCompletedJob?.attachments || []),
+    ]);
+    const name = source.file_name || attachment?.name || "attachment";
+    const contentType = source.content_type || attachment?.content_type;
+    const path = String(source.path || attachment?.path || "").trim();
+    const kind = previewKindForMetadata(name || path, contentType);
+    try {
+      if (kind === "unsupported") {
+        showAttachmentPreview({ kind, name, url: "" });
+        return;
+      }
+      if (!annaRuntime?.files) throw new Error("Anna files API is unavailable.");
+      if (!path) throw new Error("Attachment path is missing.");
+      const response = await annaRuntime.files.download_url({ path });
+      const downloadUrl = String(response.get_url || response.url || "").trim();
+      if (!downloadUrl) throw new Error(`Anna files download_url did not return a URL for ${name || path}.`);
+      showAttachmentPreview({ kind, name, url: downloadUrl });
+    } catch (err) {
+      setValidationMessage(localizedError(err, t));
+    }
+  }
+
   function start(input: { briefName: string; researchNeed: string }) {
     setValidationMessage("");
     setSelectedRoleIndex(0);
@@ -156,6 +248,8 @@ export function App() {
         await api.updateResearchJob(createdJob.research_id, { attachments: uploaded });
         const descriptors = await getResearchFileDownloadDescriptors({
           filesApi: annaRuntime?.files,
+          agentApi: annaRuntime?.agent,
+          researchQuery: createdJob.query,
           attachments: uploaded,
         });
         await api.prepareAttachments(createdJob.research_id, descriptors);
@@ -465,7 +559,9 @@ export function App() {
                   onBriefNameChange={setBriefNameDraft}
                   onResearchNeedChange={setResearchNeedDraft}
                   onAttachmentAdd={(files) => setPendingAttachments((current) => [...current, ...files])}
+                  onAttachmentOpen={openPendingAttachment}
                   onAttachmentRemove={(index) => setPendingAttachments((current) => current.filter((_, idx) => idx !== index))}
+                  onUploadedAttachmentOpen={(file) => void openUploadedAttachment(file)}
                   onShowLastResult={() => setRequestedStep("report")}
                   onStart={start}
                   onValidationError={setValidationMessage}
@@ -541,8 +637,18 @@ export function App() {
                   onApplySemanticRewrite={research.applySemanticRewriteProposal}
                   onDiscardSemanticRewrite={research.discardSemanticRewriteProposal}
                   onManualReportSave={research.saveManualReportMarkdown}
+                  onAttachmentOpen={(source) => void openCitationAttachment(source)}
                 />
               )}
+              {attachmentPreview ? (
+                <AttachmentPreviewDialog
+                  kind={attachmentPreview.kind}
+                  name={attachmentPreview.name}
+                  url={attachmentPreview.url}
+                  t={t}
+                  onClose={closeAttachmentPreview}
+                />
+              ) : null}
             </div>
           )}
         </div>
@@ -589,6 +695,39 @@ export function makeStepLabel(input: { phase: string; iteration?: number; maxIte
 
 export function makeIntroStepLabel(maxIterations?: number): string {
   return `Step 1/${Math.max(1, maxIterations || MAX_RESEARCH_ITERATIONS)}`;
+}
+
+function previewKindForFile(file: File): AttachmentPreviewKind {
+  return previewKindForMetadata(file.name, file.type);
+}
+
+function previewKindForAttachment(attachment: ResearchAttachment): AttachmentPreviewKind {
+  return previewKindForMetadata(attachment.name || attachment.path, attachment.content_type);
+}
+
+function findAttachmentForCitation(source: Extract<CitationSource, { kind: "attachment" }>, attachments: ResearchAttachment[]): ResearchAttachment | null {
+  const path = String(source.path || "").trim();
+  const fileName = String(source.file_name || "").trim();
+  return (
+    attachments.find((attachment) => path && attachment.path === path) ||
+    attachments.find((attachment) => fileName && attachment.name === fileName) ||
+    null
+  );
+}
+
+function previewKindForMetadata(nameValue?: string, contentTypeValue?: string): AttachmentPreviewKind {
+  const name = String(nameValue || "").toLowerCase();
+  const contentType = String(contentTypeValue || "").toLowerCase();
+  if (contentType === "application/pdf" || name.endsWith(".pdf")) return "pdf";
+  if (contentType.startsWith("image/") || /\.(png|jpe?g|webp|gif)$/i.test(name)) return "image";
+  if (
+    contentType.startsWith("text/") ||
+    contentType === "application/json" ||
+    /\.(txt|md|markdown|csv|tsv|json)$/i.test(name)
+  ) {
+    return "text";
+  }
+  return "unsupported";
 }
 
 export function hasCompletedResearchResult(

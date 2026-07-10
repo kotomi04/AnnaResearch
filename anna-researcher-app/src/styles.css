@@ -658,11 +658,30 @@ textarea:focus {
   box-shadow: 0 8px 18px rgba(31, 36, 48, 0.05);
 }
 
-.attachment-chip span {
+.attachment-chip-open {
   min-width: 0;
+  max-width: min(280px, 56vw);
+  height: auto;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: 1.2;
+  text-align: left;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: pointer;
+}
+
+.attachment-chip-open:hover:not(:disabled) {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.attachment-chip-open:disabled {
+  cursor: default;
 }
 
 .attachment-chip small {
@@ -671,7 +690,7 @@ textarea:focus {
   font-size: 11px;
 }
 
-.attachment-chip button {
+.attachment-chip-remove {
   width: 22px;
   height: 22px;
   flex: 0 0 auto;
@@ -907,6 +926,7 @@ textarea:focus {
   line-height: 1;
   vertical-align: baseline;
   cursor: default;
+  user-select: text;
 }
 
 .citation-chip:hover,
@@ -1037,6 +1057,28 @@ textarea:focus {
   font-size: 15px;
   line-height: 1.45;
   overflow-wrap: anywhere;
+}
+
+.citation-card-attachment-button {
+  min-height: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: #111827;
+  font: inherit;
+  font-size: 15px;
+  font-weight: 800;
+  line-height: 1.45;
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.citation-card-attachment-button:hover,
+.citation-card-attachment-button:focus-visible {
+  color: #4f39c4;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .citation-card-snippet {
@@ -1300,10 +1342,32 @@ aside {
   align-items: start;
 }
 
+#sources-list li.reference-attachment-item {
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
 .reference-index {
   color: #4f39c4;
   font-weight: 820;
   white-space: nowrap;
+}
+
+.reference-attachment-button {
+  min-height: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: #5842ca;
+  font: inherit;
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.reference-attachment-button:hover,
+.reference-attachment-button:focus-visible {
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 a {
@@ -1730,6 +1794,129 @@ button.danger {
 .source-test-result-dialog {
   width: min(920px, calc(100vw - 48px));
   max-height: min(760px, calc(100vh - 48px));
+}
+
+.attachment-preview-dialog {
+  width: min(960px, calc(100vw - 32px));
+  height: min(820px, calc(100vh - 32px));
+  display: grid;
+  grid-template-rows: auto auto 1fr;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: #ffffff;
+  box-shadow: 0 26px 80px rgba(18, 23, 34, 0.24);
+}
+
+.attachment-preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.attachment-preview-head span {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 820;
+  text-transform: uppercase;
+}
+
+.attachment-preview-head h2 {
+  max-width: min(640px, 64vw);
+  margin: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 18px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-preview-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--line);
+  background: #f8fafc;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.attachment-preview-toolbar span {
+  flex: 0 0 auto;
+}
+
+.attachment-preview-body {
+  min-height: 0;
+  overflow: auto;
+  padding: 20px;
+  background: #eef1f5;
+}
+
+.attachment-preview-state {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 720;
+}
+
+.attachment-preview-state[data-error="true"] {
+  color: var(--red);
+}
+
+.image-preview-body {
+  display: grid;
+  place-items: center;
+}
+
+.text-preview-body {
+  background: #f8fafc;
+}
+
+.unsupported-preview-body {
+  display: grid;
+  place-items: center;
+  background: #f8fafc;
+}
+
+.attachment-preview-image {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 8px;
+  object-fit: contain;
+  background: #ffffff;
+  box-shadow: 0 18px 48px rgba(18, 23, 34, 0.18);
+}
+
+.attachment-preview-text {
+  min-height: 100%;
+  margin: 0;
+  padding: 16px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.pdf-preview-canvas {
+  display: block;
+  max-width: 100%;
+  margin: 0 auto;
+  background: #ffffff;
+  box-shadow: 0 18px 48px rgba(18, 23, 34, 0.18);
 }
 
 .definition-spec-head {

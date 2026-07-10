@@ -18,6 +18,7 @@ CHUNK_TOKEN_SAFETY_MARGIN = 75
 MIN_CHUNK_TOKENS = 120
 
 TEXT_EXTENSIONS = {".txt", ".md", ".markdown", ".csv", ".tsv", ".json"}
+WORD_EXTENSIONS = {".docx"}
 TEXT_CONTENT_TYPES = {
     "text/plain",
     "text/markdown",
@@ -25,6 +26,11 @@ TEXT_CONTENT_TYPES = {
     "text/tab-separated-values",
     "application/json",
 }
+WORD_CONTENT_TYPES = {
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+IMAGE_CONTENT_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
 
 
 def prepare_attachments(
@@ -62,6 +68,35 @@ def prepare_attachments(
                 raise ValidationError("download_url is required")
             local_path = files_dir / f"{file_id}-{_safe_filename(name or 'attachment')}"
             download_attachment(download_url, local_path)
+            local_path_view = _relative_path(local_path, job_dir)
+            if _is_image_attachment(name=name, path=path, content_type=content_type):
+                if attachment.get("image_analysis_error"):
+                    raise ValidationError(f"image analysis failed: {attachment.get('image_analysis_error')}")
+                image_analysis = _validated_image_analysis(attachment.get("image_analysis"))
+                image_summary = str(image_analysis.get("summary") or "").strip()
+                image_relevance = _image_relevance_text(image_analysis)
+                image_relevance_score = _image_relevance_score(image_analysis)
+                context_files.append(
+                    {
+                        **file_view,
+                        "text_chars": len(image_summary),
+                        "chunk_count": 0,
+                        "status": "ready",
+                        "error": None,
+                        "local_path": local_path_view,
+                        "analysis": {
+                            "type": "image",
+                            "source": "analyze_image",
+                            "summary": image_summary,
+                            "key_points": [],
+                            "relevance": image_relevance,
+                            "relevance_score": image_relevance_score,
+                            "selected_chunk_ids": [],
+                            "payload": image_analysis,
+                        },
+                    }
+                )
+                continue
             text = extract_text(local_path, name=name, content_type=content_type)
             text = _clean_text(text)
             file_chunks = chunk_text(text)
@@ -71,6 +106,8 @@ def prepare_attachments(
                         "chunk_id": f"{file_id}:{chunk_index:04d}",
                         "file_id": file_id,
                         "file_name": file_view["name"],
+                        "path": path,
+                        "content_type": content_type,
                         "index": chunk_index,
                         "text": chunk,
                     }
@@ -82,6 +119,7 @@ def prepare_attachments(
                     "chunk_count": len(file_chunks),
                     "status": "ready",
                     "error": None,
+                    "local_path": local_path_view,
                 }
             )
         except Exception as exc:  # noqa: BLE001
@@ -124,7 +162,65 @@ def extract_text(path: Path, *, name: str, content_type: str = "") -> str:
         return _read_text(path)
     if suffix == ".pdf" or normalized_type == "application/pdf":
         return _extract_pdf_text(path)
+    if suffix in WORD_EXTENSIONS or normalized_type in WORD_CONTENT_TYPES:
+        return _extract_docx_text(path)
     raise ValidationError(f"unsupported attachment type: {content_type or suffix or 'unknown'}")
+
+
+def _is_image_attachment(*, name: str, path: str, content_type: str) -> bool:
+    suffix = Path(name or path).suffix.lower()
+    normalized_type = content_type.split(";")[0].strip().lower()
+    return suffix in IMAGE_EXTENSIONS or normalized_type in IMAGE_CONTENT_TYPES or normalized_type.startswith("image/")
+
+
+def _validated_image_analysis(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValidationError("image_analysis is required for image attachments")
+    summary = str(value.get("summary") or "").strip()
+    if not summary:
+        raise ValidationError("image_analysis.summary is required")
+    return value
+
+
+def _format_structured_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        parts = []
+        for key, item in value.items():
+            text = _format_structured_value(item)
+            if text:
+                parts.append(f"{key}: {text}")
+        return "; ".join(parts)
+    if isinstance(value, list):
+        return "; ".join(text for text in (_format_structured_value(item) for item in value) if text)
+    return str(value).strip()
+
+
+def _image_relevance_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    return _format_structured_value(value.get("research_relevance"))
+
+
+def _image_relevance_score(value: Any) -> float:
+    if not isinstance(value, dict):
+        return 0.0
+    relevance = value.get("research_relevance")
+    if isinstance(relevance, dict):
+        explicit = _optional_float(relevance.get("relevance_score"))
+        if explicit is not None:
+            return explicit
+        text = str(relevance.get("relevance") or "").strip().lower()
+        if any(word in text for word in ("useful", "relevant", "supports", "related", "directly relevant")):
+            return 0.8
+        return 0.0
+    text = str(relevance or "").strip().lower()
+    if any(word in text for word in ("useful", "relevant", "supports", "related")):
+        return 0.8
+    return 0.0
 
 
 def chunk_text(text: str) -> list[str]:
@@ -222,6 +318,41 @@ def _extract_pdf_text(path: Path) -> str:
         for page in doc:
             pages.append(page.get_text("text"))
     return "\n\n".join(pages)
+
+
+def _extract_docx_text(path: Path) -> str:
+    try:
+        from docx import Document  # type: ignore[import-not-found]
+    except Exception as exc:  # noqa: BLE001
+        raise ValidationError("DOCX attachment parsing requires python-docx") from exc
+    try:
+        document = Document(str(path))
+    except Exception as exc:  # noqa: BLE001
+        raise ValidationError(f"failed to open DOCX attachment: {exc}") from exc
+
+    blocks: list[str] = []
+    for paragraph in document.paragraphs:
+        text = paragraph.text.strip()
+        if text:
+            blocks.append(text)
+    for table in document.tables:
+        rows: list[str] = []
+        for row in table.rows:
+            cells = [_docx_cell_text(cell) for cell in row.cells]
+            clean_cells = [cell for cell in cells if cell]
+            if clean_cells:
+                rows.append(" | ".join(clean_cells))
+        if rows:
+            blocks.append("\n".join(rows))
+    text = "\n\n".join(blocks).strip()
+    if not text:
+        raise ValidationError("DOCX attachment did not contain extractable text")
+    return text
+
+
+def _docx_cell_text(cell: Any) -> str:
+    lines = [paragraph.text.strip() for paragraph in cell.paragraphs if paragraph.text.strip()]
+    return " ".join(lines).strip()
 
 
 def _clean_text(text: str) -> str:
@@ -369,6 +500,23 @@ def _optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, number))
+
+
+def _relative_path(path: Path, root: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.as_posix()
 
 
 def _failed_file(index: int, attachment: dict[str, Any], error: str) -> dict[str, Any]:

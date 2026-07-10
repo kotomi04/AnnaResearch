@@ -1497,36 +1497,49 @@ function promptQueryForJob(job: ResearchJob | null | undefined, fallbackQuery = 
   const context = job?.attachment_context;
   if (!context?.summary) return query;
   const fileSummaries = (context.files || [])
-    .filter((file) => file.status === "ready" && (file.ai_summary || file.ai_key_points?.length))
+    .filter((file) => file.status === "ready" && isAttachmentFileRelevant(file) && (file.analysis?.summary || file.analysis?.key_points?.length))
     .slice(0, 8)
     .map((file) => {
-      const points = (file.ai_key_points || []).slice(0, 4).map((point) => `  - ${point}`).join("\n");
-      return [`File: ${file.name}`, file.ai_summary ? `Summary: ${file.ai_summary}` : "", points ? `Key points:\n${points}` : ""].filter(Boolean).join("\n");
+      const analysis = file.analysis;
+      const points = (analysis?.key_points || []).slice(0, 4).map((point) => `  - ${point}`).join("\n");
+      return [`File: ${file.name}`, analysis?.summary ? `Summary: ${analysis.summary}` : "", points ? `Key points:\n${points}` : ""].filter(Boolean).join("\n");
     })
     .join("\n\n");
-  const attachmentBlock = [`Uploaded file summary:\n${context.summary}`, fileSummaries].filter(Boolean).join("\n\n").slice(0, 5000);
+  if (!fileSummaries) return query;
+  const attachmentBlock = [`Relevant uploaded file summary:`, `Uploaded-file evidence policy: ${ATTACHMENT_EVIDENCE_POLICY}`, fileSummaries].filter(Boolean).join("\n\n").slice(0, 5000);
   return [query, attachmentBlock].filter(Boolean).join("\n\n");
 }
 
-interface AttachmentCitationChunk {
-  chunk_id?: string;
+const ATTACHMENT_EVIDENCE_POLICY =
+  "Use this analysis as supporting evidence only when the claim is directly grounded in visible content. Do not use it to verify external facts, dates, source credibility, or causal explanations unless those are explicitly visible in the attachment content.";
+
+function isAttachmentFileRelevant(file: { analysis?: { relevance_score?: number | null } }): boolean {
+  if (typeof file.analysis?.relevance_score === "number") return file.analysis.relevance_score >= 0.25;
+  return false;
+}
+
+interface AttachmentSelectedItem {
+  kind?: string;
+  item_id?: string;
   file_id?: string;
   file_name?: string;
+  path?: string;
+  content_type?: string;
   index?: number;
   quote?: string;
 }
 
-async function selectAttachmentContextForSection(api: ResearchApi, job: ResearchJob, section: ReportSection): Promise<{ context: string; chunks: AttachmentCitationChunk[] }> {
-  if (!job.attachment_context?.summary && !job.attachments?.length) return { context: "", chunks: [] };
+async function selectAttachmentContextForSection(api: ResearchApi, job: ResearchJob, section: ReportSection): Promise<{ context: string; items: AttachmentSelectedItem[] }> {
+  if (!job.attachment_context?.summary && !job.attachments?.length) return { context: "", items: [] };
   try {
     const response = await api.selectAttachmentContext({
       research_id: requiredResearchId(job),
       query: attachmentChunkQueryForSection(section),
       top_k: 4,
     });
-    return { context: response.selected_context || "", chunks: response.selected_chunks || [] };
+    return { context: response.selected_context || "", items: response.selected_items || [] };
   } catch {
-    return { context: "", chunks: [] };
+    return { context: "", items: [] };
   }
 }
 
@@ -1716,7 +1729,7 @@ async function runSection(input: {
   const sourceUrls = selected.source_urls || [];
   const webReferences = registerCitationReferences(citationRegistry, sourceUrls);
   const attachmentSelection = await selectAttachmentContextForSection(api, job, section);
-  const attachmentReferences = registerAttachmentCitationReferences(citationRegistry, attachmentSelection.chunks);
+  const attachmentReferences = registerAttachmentCitationReferences(citationRegistry, attachmentSelection.items);
   const citationReferences = [...webReferences, ...attachmentReferences];
   const writer = await writeSection(api, job.query || "", role, focuses, section, selected.selected_context || "", citationReferences, attachmentSelection.context);
   const markdown = remapLocalCitations(writer.markdown, citationReferences);
@@ -1806,7 +1819,8 @@ async function writeSection(
         text:
           'Write one report section. Return strict JSON only: {"section_markdown":"...","section_summary":"..."}.\n' +
           "Use only the provided context. The markdown should include the section heading.\n" +
-          "When citing evidence, use ONLY the global citation numbers listed below, such as [3]. Use uploaded-file citation numbers when relying on attachment chunks. Do not invent new citation numbers and do not restart citations from [1] for this section.\n\n" +
+          "When citing evidence, use ONLY the global citation numbers listed below, such as [3]. Use uploaded-file citation numbers when relying on attachment chunks. Do not invent new citation numbers and do not restart citations from [1] for this section.\n" +
+          `Uploaded-file evidence policy: ${ATTACHMENT_EVIDENCE_POLICY}\n\n` +
           `Global citation map for this section:\n${citationGuide}\n\n` +
           `Task:\n${query}\n\nFocuses:\n${focuses.map((focus) => `- ${focus}`).join("\n")}\n\nSection: ${section.title}\n${section.outline}\n\nWeb context:\n${selectedContext}\n\nAttachment chunk context:\n${attachmentContext || "(none)"}`,
       },
@@ -1883,7 +1897,9 @@ function registerCitationSources(registry: CitationSource[], sources: CitationSo
         {
           file_id: source.file_id,
           file_name: source.file_name,
-          chunk_id: source.chunk_id,
+          path: source.path,
+          content_type: source.content_type,
+          item_id: source.chunk_id,
           index: source.index,
           quote: source.quote,
         },
@@ -1892,20 +1908,22 @@ function registerCitationSources(registry: CitationSource[], sources: CitationSo
   }
 }
 
-function registerAttachmentCitationReferences(registry: CitationSource[], chunks: AttachmentCitationChunk[]): CitationReference[] {
+function registerAttachmentCitationReferences(registry: CitationSource[], items: AttachmentSelectedItem[]): CitationReference[] {
   const references: CitationReference[] = [];
-  for (const chunk of chunks) {
-    const fileId = String(chunk.file_id || "").trim();
-    const fileName = String(chunk.file_name || fileId || "Uploaded file").trim();
-    const chunkId = String(chunk.chunk_id || "").trim();
-    if (!fileId && !chunkId) continue;
+  for (const item of items) {
+    const fileId = String(item.file_id || "").trim();
+    const fileName = String(item.file_name || fileId || "Uploaded file").trim();
+    const itemId = String(item.item_id || "").trim();
+    if (!fileId && !itemId) continue;
     const source: CitationSource = {
       kind: "attachment",
       file_id: fileId || fileName,
       file_name: fileName,
-      chunk_id: chunkId || undefined,
-      index: Number.isFinite(Number(chunk.index)) ? Number(chunk.index) : undefined,
-      quote: String(chunk.quote || "").trim(),
+      path: String(item.path || "").trim() || undefined,
+      content_type: String(item.content_type || "").trim() || undefined,
+      chunk_id: itemId || undefined,
+      index: Number.isFinite(Number(item.index)) ? Number(item.index) : undefined,
+      quote: String(item.quote || "").trim(),
     };
     let index = registry.findIndex((item) => item.kind === "attachment" && item.file_id === source.file_id && item.chunk_id === source.chunk_id);
     if (index === -1) {
@@ -1920,7 +1938,16 @@ function registerAttachmentCitationReferences(registry: CitationSource[], chunks
 function citationReferencePromptLine(reference: CitationReference): string {
   const source = reference.source;
   if (source.kind === "url") return `[${reference.number}] ${source.url}`;
-  return `[${reference.number}] Uploaded file: ${source.file_name}${source.chunk_id ? `, chunk ${source.chunk_id}` : ""}`;
+  const label = attachmentChunkLabelForPrompt(source);
+  return `[${reference.number}] Uploaded file: ${source.file_name}${label ? ` · ${label}` : ""}`;
+}
+
+function attachmentChunkLabelForPrompt(source: Extract<CitationSource, { kind: "attachment" }>): string {
+  const chunkId = String(source.chunk_id || "");
+  const match = /:(?:0*)(\d+)$/.exec(chunkId);
+  if (match) return `chunk ${Number(match[1])}`;
+  if (chunkId.endsWith(":image-summary")) return "";
+  return chunkId ? "chunk" : "";
 }
 
 function citationSourcesFromUrls(urls: string[]): CitationSource[] {

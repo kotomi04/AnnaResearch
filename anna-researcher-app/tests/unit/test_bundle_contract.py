@@ -12,6 +12,7 @@ def test_manifest_uses_refactored_tool_contract():
     assert manifest["required_executas"][0]["tool_id"] == "bundled:researcher"
     assert manifest["required_executas"][0]["min_version"] == "0.2.2"
     assert manifest["ui"]["host_api"]["llm"] == ["complete", "embed"]
+    assert manifest["ui"]["host_api"]["agent"]["session"]["auto"] is True
     assert manifest["ui"]["views"][0]["default_size"] == {"w": 1040, "h": 760}
     assert manifest["ui"]["views"][0]["max_size"] == {"w": 1080, "h": 960}
 

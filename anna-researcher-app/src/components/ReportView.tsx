@@ -14,6 +14,7 @@ interface Props {
   onApplySemanticRewrite?(proposalId: string): Promise<unknown>;
   onDiscardSemanticRewrite?(proposalId: string): void;
   onManualReportSave?(input: { reportMarkdown: string }): Promise<unknown>;
+  onAttachmentOpen?(source: Extract<CitationSource, { kind: "attachment" }>): void;
 }
 
 interface SemanticRewriteProposal {
@@ -32,6 +33,7 @@ export function ReportView({
   onApplySemanticRewrite,
   onDiscardSemanticRewrite,
   onManualReportSave,
+  onAttachmentOpen,
 }: Props) {
   const markdown = result?.report_markdown || "";
   const sourceUrls = result?.source_urls || [];
@@ -51,6 +53,7 @@ export function ReportView({
   const [manualError, setManualError] = useState("");
   const [citationCard, setCitationCard] = useState<CitationCardState | null>(null);
   const citationHideTimer = useRef<number | null>(null);
+  const selectionDragRef = useRef(false);
   const canRewrite = Boolean(markdown && (onSemanticRewritePreview || onSemanticRewrite));
   const canManualEdit = Boolean(markdown && onManualReportSave);
   const markdownComponents = reportMarkdownComponents({
@@ -98,6 +101,7 @@ export function ReportView({
   }
 
   function showCitationCard(numbers: number[], activeNumber: number, anchor: HTMLElement) {
+    if (selectionDragRef.current) return;
     clearCitationHideTimer();
     const validNumbers = numbers.filter((number) => citationSources[number - 1]);
     const fallbackNumbers = citationSources[activeNumber - 1] ? [activeNumber] : [];
@@ -116,20 +120,41 @@ export function ReportView({
 
   function captureSelection(event: React.MouseEvent) {
     if (!canRewrite) return;
+    const captured = captureSelectionAtPoint(event.clientX, event.clientY);
+    if (captured) event.preventDefault();
+  }
+
+  function captureSelectionAtPoint(clientX: number, clientY: number): boolean {
     const selection = window.getSelection();
-    const text = selection?.toString().trim() || "";
+    const text = expandPartialCitationSelection(selection?.toString() || "").trim();
     const range = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
     const report = reportRef.current;
     if (!text || !range || !report?.contains(range.commonAncestorContainer)) {
       setContextMenu(null);
-      return;
+      return false;
     }
-    event.preventDefault();
     setSelectedText(text);
     setContextMenu({
-      x: Math.min(event.clientX, window.innerWidth - 132),
-      y: Math.min(event.clientY, window.innerHeight - 48),
+      x: Math.min(clientX, window.innerWidth - 132),
+      y: Math.min(clientY, window.innerHeight - 48),
     });
+    return true;
+  }
+
+  function beginReportSelection(event: React.MouseEvent) {
+    if (!canRewrite || event.button !== 0) return;
+    selectionDragRef.current = true;
+    setCitationCard(null);
+    setContextMenu(null);
+  }
+
+  function endReportSelection(event: React.MouseEvent) {
+    if (!canRewrite || event.button !== 0) return;
+    const { clientX, clientY } = event;
+    window.setTimeout(() => {
+      selectionDragRef.current = false;
+      captureSelectionAtPoint(clientX, clientY);
+    }, 0);
   }
 
   function openRewritePanel() {
@@ -260,7 +285,14 @@ export function ReportView({
             disabled={isBusy}
           />
         ) : (
-          <article id="report" ref={reportRef} className={`report ${markdown ? "" : "empty"}`} onContextMenu={captureSelection}>
+          <article
+            id="report"
+            ref={reportRef}
+            className={`report ${markdown ? "" : "empty"}`}
+            onMouseDown={beginReportSelection}
+            onMouseUp={endReportSelection}
+            onContextMenu={captureSelection}
+          >
             {markdown ? <ReactMarkdown components={markdownComponents}>{markdown}</ReactMarkdown> : t("emptyReport")}
           </article>
         )}
@@ -283,6 +315,7 @@ export function ReportView({
                 : current,
             )
           }
+          onAttachmentOpen={onAttachmentOpen}
         />
       ) : null}
       {contextMenu ? (
@@ -367,7 +400,7 @@ export function ReportView({
             ) : null}
           </section>
         ) : null}
-        <SourceList urls={sourceUrls} sources={sourceItems} citationSources={citationSources} t={t} />
+        <SourceList urls={sourceUrls} sources={sourceItems} citationSources={citationSources} t={t} onAttachmentOpen={onAttachmentOpen} />
       </div>
     </section>
   );
@@ -390,6 +423,7 @@ function CitationCard({
   onMouseEnter,
   onMouseLeave,
   onNavigate,
+  onAttachmentOpen,
 }: {
   state: CitationCardState;
   sourceUrls: string[];
@@ -398,12 +432,12 @@ function CitationCard({
   onMouseEnter(): void;
   onMouseLeave(): void;
   onNavigate(direction: -1 | 1): void;
+  onAttachmentOpen?(source: Extract<CitationSource, { kind: "attachment" }>): void;
 }) {
   const number = state.numbers[state.activeIndex] || state.numbers[0];
   const citation = citationSources[number - 1] || (sourceUrls[number - 1] ? { kind: "url" as const, url: sourceUrls[number - 1] } : null);
   if (!citation) return null;
   if (citation.kind === "attachment") {
-    const fallbackInitial = (citation.file_name || "F").trim().charAt(0).toUpperCase() || "F";
     return (
       <aside
         className={`citation-card ${state.placement === "above" ? "above" : "below"}`}
@@ -426,11 +460,16 @@ function CitationCard({
         </div>
         <div className="citation-card-body">
           <span className="citation-card-host">
-            <span className="citation-card-site-mark" aria-hidden="true">{fallbackInitial}</span>
             上传文件
           </span>
-          <strong>{citation.file_name}</strong>
-          {citation.chunk_id ? <span className="citation-card-url">{citation.chunk_id}</span> : null}
+          {onAttachmentOpen ? (
+            <button type="button" className="citation-card-attachment-button" onClick={() => onAttachmentOpen(citation)}>
+              {citation.file_name}
+            </button>
+          ) : (
+            <strong>{citation.file_name}</strong>
+          )}
+          {attachmentChunkLabel(citation) ? <span className="citation-card-host">{attachmentChunkLabel(citation)}</span> : null}
           {citation.quote ? <span className="citation-card-snippet">{citation.quote}</span> : null}
         </div>
       </aside>
@@ -482,17 +521,23 @@ function positionCitationCard(anchor: HTMLElement): Pick<CitationCardState, "x" 
   const rect = anchor.getBoundingClientRect();
   const gap = 8;
   const margin = 12;
-  if (rect.width <= 0 || rect.height <= 0) return null;
-  if (rect.bottom < margin || rect.top > window.innerHeight - margin) return null;
-  if (rect.right < margin || rect.left > window.innerWidth - margin) return null;
   const cardWidth = Math.min(360, Math.max(280, window.innerWidth - 24));
   const cardHeight = Math.min(240, Math.max(160, window.innerHeight - margin * 2));
   const maxX = Math.max(margin, window.innerWidth - cardWidth - margin);
+  const maxY = Math.max(margin, window.innerHeight - cardHeight - margin);
+  if (rect.width <= 0 || rect.height <= 0) {
+    return {
+      x: Math.min(Math.max(margin, rect.left || margin), maxX),
+      y: Math.min(Math.max(margin, (rect.bottom || margin) + gap), maxY),
+      placement: "below",
+    };
+  }
+  if (rect.bottom < margin || rect.top > window.innerHeight - margin) return null;
+  if (rect.right < margin || rect.left > window.innerWidth - margin) return null;
   const centeredX = rect.left + rect.width / 2 - cardWidth / 2;
   const belowFits = rect.bottom + gap + cardHeight <= window.innerHeight - margin;
   const placement = belowFits ? "below" : "above";
   const rawY = placement === "below" ? rect.bottom + gap : rect.top - cardHeight - gap;
-  const maxY = Math.max(margin, window.innerHeight - cardHeight - margin);
   return {
     x: Math.min(Math.max(margin, centeredX), maxX),
     y: Math.min(Math.max(margin, rawY), maxY),
@@ -514,8 +559,8 @@ function reportMarkdownComponents({
   const text = selectedText.trim();
   const wrap = (tag: "p" | "li" | "h1" | "h2" | "h3" | "h4" | "blockquote", children: ReactNode) => {
     const blockText = textContentOf(children);
-    const cited = renderCitationButtons(children, blockText, citationSources, onShowCitation, onHideCitation);
-    const content = text ? highlightReactText(cited, text) : cited;
+    const highlighted = text ? highlightReactText(children, text) : children;
+    const content = renderCitationButtons(highlighted, blockText, citationSources, onShowCitation, onHideCitation);
     const Tag = tag;
     return <Tag>{content}</Tag>;
   };
@@ -546,6 +591,7 @@ function renderCitationButtons(
     ));
   }
   if (isValidElement<{ children?: ReactNode }>(children)) {
+    if (children.type === "mark") return children;
     const props = children.props;
     return cloneElement(children, {
       children: renderCitationButtons(props.children, blockText, citationSources, onShowCitation, onHideCitation, cursor),
@@ -573,18 +619,20 @@ function renderCitationString(
     if (citationSources[number - 1]) {
       const sentenceNumbers = citationNumbersForSentence(blockText, absoluteIndex).filter((candidate) => citationSources[candidate - 1]);
       parts.push(
-        <button
+        <span
           key={`${cursor.current}-${match.index}-${number}`}
-          type="button"
+          role="button"
+          tabIndex={0}
           className="citation-chip"
           onMouseEnter={(event) => onShowCitation(sentenceNumbers.length ? sentenceNumbers : [number], number, event.currentTarget)}
           onMouseLeave={onHideCitation}
           onFocus={(event) => onShowCitation(sentenceNumbers.length ? sentenceNumbers : [number], number, event.currentTarget)}
           onBlur={onHideCitation}
           title={citationTitle(citationSources[number - 1])}
+          aria-label={`[${number}]`}
         >
           [{number}]
-        </button>,
+        </span>,
       );
     } else {
       parts.push(match[0]);
@@ -622,7 +670,17 @@ function uniqueNumbers(numbers: number[]): number[] {
 
 function citationTitle(source: CitationSource | undefined): string {
   if (!source) return "";
-  return source.kind === "url" ? source.url : source.file_name;
+  if (source.kind === "url") return source.url;
+  const label = attachmentChunkLabel(source);
+  return `${source.file_name}${label ? ` · ${label}` : ""}`;
+}
+
+function attachmentChunkLabel(reference: Extract<CitationSource, { kind: "attachment" }>): string {
+  const chunkId = String(reference.chunk_id || "");
+  const match = /:(?:0*)(\d+)$/.exec(chunkId);
+  if (match) return `chunk ${Number(match[1])}`;
+  if (chunkId.endsWith(":image-summary")) return "";
+  return chunkId ? "chunk" : "";
 }
 
 function hostFromUrl(url: string): string {
@@ -665,6 +723,11 @@ function selectedRangeInBlock(plainText: string, selectedText: string): { start:
   if (!plainText.trim() || !selectedText.trim()) return null;
   const directStart = plainText.indexOf(selectedText);
   if (directStart >= 0) return { start: directStart, end: directStart + selectedText.length };
+  const citationExpandedSelection = expandPartialCitationSelection(selectedText);
+  if (citationExpandedSelection !== selectedText) {
+    const expandedStart = plainText.indexOf(citationExpandedSelection);
+    if (expandedStart >= 0) return { start: expandedStart, end: expandedStart + citationExpandedSelection.length };
+  }
   const normalizedBlock = normalizeComparableText(plainText);
   const normalizedSelection = normalizeComparableText(selectedText);
   if (normalizedSelection.includes(normalizedBlock)) return { start: 0, end: plainText.length };
@@ -679,6 +742,15 @@ function selectedRangeInBlock(plainText: string, selectedText: string): { start:
 
 function normalizeComparableText(text: string): string {
   return text.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function expandPartialCitationSelection(text: string): string {
+  const normalized = text.replace(/\u00a0/g, " ");
+  const partialMatch = normalized.match(/^(.*)\[(\d*)$/s);
+  if (!partialMatch) return normalized;
+  const prefix = partialMatch[1] || "";
+  const number = partialMatch[2] || "";
+  return `${prefix}[${number || "1"}]`;
 }
 
 function highlightRange(children: ReactNode, start: number, end: number, cursor: { current: number }): ReactNode {

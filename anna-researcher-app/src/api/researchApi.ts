@@ -59,15 +59,18 @@ interface ContextResponse extends JobResponse {
 
 interface AttachmentContextResponse {
   selected_context?: string;
-  selected_chunks?: Array<{
-    chunk_id?: string;
+  selected_items?: Array<{
+    kind?: "chunk" | "image_analysis" | string;
+    item_id?: string;
     file_id?: string;
     file_name?: string;
+    path?: string;
+    content_type?: string;
     index?: number;
     score?: number;
     quote?: string;
   }>;
-  selected_chunk_count?: number;
+  selected_item_count?: number;
 }
 
 interface ResultResponse extends JobResponse {

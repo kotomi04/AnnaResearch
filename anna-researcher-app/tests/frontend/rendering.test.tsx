@@ -9,7 +9,9 @@ import { ReportDisplayPage } from "../../src/components/ReportDisplayPage";
 import { ReportView } from "../../src/components/ReportView";
 import { ResearchLibraryPage } from "../../src/components/ResearchLibraryPage";
 import { appendSourcesToMarkdown } from "../../src/export/exportFiles";
+import { AttachmentPreviewDialog } from "../../src/components/AttachmentPreviewDialog";
 import { ResearchForm } from "../../src/components/ResearchForm";
+import { SourceList } from "../../src/components/SourceList";
 import {
   ResearchSourceDetailPage,
   ResearchSourceListPage,
@@ -19,7 +21,7 @@ import { ResearchTimeline } from "../../src/components/ResearchTimeline";
 import { TaskPickerPage } from "../../src/components/TaskPickerPage";
 import { createTranslator, localeStorageKey } from "../../src/i18n/messages";
 import { useLocale } from "../../src/i18n/useLocale";
-import type { ResearchSourceView } from "../../src/types";
+import type { ResearchAttachment, ResearchSourceView } from "../../src/types";
 import { summarizePlan } from "../../src/workflow/planSummary";
 
 function LocaleProbe() {
@@ -106,6 +108,11 @@ describe("ResearchForm", () => {
     expect(onStart).toHaveBeenCalledWith({ briefName: "Anna App", researchNeed: "Prepare a customer brief." });
     expect(screen.getByText("Research uses configured sources and user-provided context.")).toBeTruthy();
     expect((screen.getByRole("button", { name: "View Last Result" }) as HTMLButtonElement).disabled).toBe(true);
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    expect(fileInput.accept).toContain(".png");
+    expect(fileInput.accept).toContain(".jpg");
+    expect(fileInput.accept).toContain(".gif");
+    expect(fileInput.accept).not.toContain("image/gif");
   });
 
   it("enables the last-result action only when a completed result is available", () => {
@@ -150,6 +157,113 @@ describe("ResearchForm", () => {
     expect((screen.getByRole("button", { name: "Start Research" }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByText("Configure at least one research source credential to begin.")).toBeTruthy();
     expect(screen.getByText("Enter a research need.")).toBeTruthy();
+  });
+
+  it("opens pending and uploaded attachment chips from the file name", () => {
+    const t = createTranslator("en");
+    const pendingFile = new File(["attachment"], "local-brief.md", { type: "text/markdown" });
+    const uploadedFile: ResearchAttachment = {
+      name: "uploaded-chart.png",
+      path: "research-jobs/job-1/uploads/uploaded-chart.png",
+      content_type: "image/png",
+      size_bytes: 2048,
+    };
+    const onAttachmentOpen = vi.fn();
+    const onUploadedAttachmentOpen = vi.fn();
+    const onAttachmentRemove = vi.fn();
+
+    render(
+      <ControlledResearchForm
+        isBusy={false}
+        canStart={true}
+        attachments={[pendingFile]}
+        uploadedAttachments={[uploadedFile]}
+        t={t}
+        stepLabel="Step 1/5"
+        validationMessage=""
+        canShowLastResult={false}
+        onOpenLibrary={vi.fn()}
+        onShowLastResult={vi.fn()}
+        onStart={vi.fn()}
+        onValidationError={vi.fn()}
+        onAttachmentOpen={onAttachmentOpen}
+        onAttachmentRemove={onAttachmentRemove}
+        onUploadedAttachmentOpen={onUploadedAttachmentOpen}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "local-brief.md" }));
+    fireEvent.click(screen.getByRole("button", { name: "uploaded-chart.png" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove attachment" }));
+
+    expect(onAttachmentOpen).toHaveBeenCalledWith(pendingFile);
+    expect(onUploadedAttachmentOpen).toHaveBeenCalledWith(uploadedFile);
+    expect(onAttachmentRemove).toHaveBeenCalledWith(0);
+  });
+});
+
+describe("AttachmentPreviewDialog", () => {
+  it("renders image and unsupported attachment previews inside the app", () => {
+    const t = createTranslator("en");
+    const onClose = vi.fn();
+    const { rerender } = render(
+      <AttachmentPreviewDialog
+        kind="image"
+        name="chart.png"
+        url="blob:chart"
+        t={t}
+        onClose={onClose}
+      />,
+    );
+
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(screen.getByText("Image attachment preview")).toBeTruthy();
+    expect(screen.getByAltText("chart.png")).toBeTruthy();
+
+    rerender(
+      <AttachmentPreviewDialog
+        kind="unsupported"
+        name="brief.docx"
+        url=""
+        t={t}
+        onClose={onClose}
+      />,
+    );
+
+    expect(screen.getByText("Attachment preview")).toBeTruthy();
+    expect(screen.getByText("Preview is not supported for this file type yet.")).toBeTruthy();
+  });
+});
+
+describe("SourceList", () => {
+  it("shows each attachment chunk as a separate source with a readable chunk label", () => {
+    const t = createTranslator("en");
+    render(
+      <SourceList
+        urls={[]}
+        t={t}
+        citationSources={[
+          {
+            kind: "attachment",
+            file_id: "file-1",
+            file_name: "屏幕截图 2026-07-09 152639.png",
+            chunk_id: "file-1:image-summary",
+          },
+          {
+            kind: "attachment",
+            file_id: "file-1",
+            file_name: "屏幕截图 2026-07-09 152639.png",
+            chunk_id: "file-1:0002",
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("屏幕截图 2026-07-09 152639.png")).toBeTruthy();
+    expect(screen.getByText("屏幕截图 2026-07-09 152639.png · chunk 2")).toBeTruthy();
+    expect(screen.queryByText(/file-1:image-summary/)).toBeNull();
+    expect(screen.queryByText(/file-1:0002/)).toBeNull();
+    expect(document.querySelector(".reference-site-mark")).toBeNull();
   });
 });
 
@@ -760,6 +874,41 @@ describe("ReportView", () => {
     expect(within(nextCard).getByText("E")).toBeTruthy();
   });
 
+  it("keeps body citations and source entries separate for multiple chunks from the same attachment file", () => {
+    const t = createTranslator("en");
+    render(
+      <ReportView
+        result={{
+          report_markdown: "The uploaded report supports this conclusion [1][2].",
+          source_urls: [],
+          citation_sources: [
+            {
+              kind: "attachment",
+              file_id: "file-2",
+              file_name: "nvidia-analysis.pdf",
+              chunk_id: "file-2:0001",
+              quote: "first chunk",
+            },
+            {
+              kind: "attachment",
+              file_id: "file-2",
+              file_name: "nvidia-analysis.pdf",
+              chunk_id: "file-2:0002",
+              quote: "second chunk",
+            },
+          ],
+        }}
+        t={t}
+      />,
+    );
+
+    expect(screen.getByText("nvidia-analysis.pdf · chunk 1")).toBeTruthy();
+    expect(screen.getByText("nvidia-analysis.pdf · chunk 2")).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: "[1]" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "[2]" })).toHaveLength(1);
+    expect(screen.queryByText(/file-2:0002/)).toBeNull();
+  });
+
   it("places citation cards above the marker when there is not enough room below", () => {
     Object.defineProperty(window, "innerWidth", { configurable: true, value: 900 });
     Object.defineProperty(window, "innerHeight", { configurable: true, value: 600 });
@@ -822,6 +971,48 @@ describe("ReportView", () => {
     fireEvent.contextMenu(screen.getByText("Anna"));
 
     expect(Array.from(document.querySelectorAll(".report-rewrite-highlight")).map((node) => node.textContent).join("")).toBe("Anna has a useful product.");
+  });
+
+  it("keeps citation text stable when the selected rewrite range includes citations", () => {
+    const t = createTranslator("en");
+    const markdown =
+      "NVDA traded near 204.12 after a correction from its 52-week high [1]. This volatility matters for the outlook [2].";
+    render(
+      <ReportView
+        result={{
+          report_markdown: markdown,
+          source_urls: ["https://example.com/a", "https://example.com/b"],
+        }}
+        t={t}
+        onSemanticRewritePreview={vi.fn()}
+      />,
+    );
+
+    const report = document.querySelector("#report") as HTMLElement;
+    const walker = document.createTreeWalker(report, NodeFilter.SHOW_TEXT);
+    const textNodes: Text[] = [];
+    let node = walker.nextNode();
+    while (node) {
+      textNodes.push(node as Text);
+      node = walker.nextNode();
+    }
+    const firstNode = textNodes.find((item) => item.data.includes("NVDA traded")) as Text;
+    const citationNode = screen.getByRole("button", { name: "[1]" }).firstChild as Text;
+    expect(firstNode).toBeTruthy();
+    expect(citationNode).toBeTruthy();
+    const range = document.createRange();
+    range.setStart(firstNode, 0);
+    range.setEnd(citationNode, citationNode.data.length);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+
+    fireEvent.contextMenu(screen.getByText(/NVDA traded/));
+
+    const highlightedText = Array.from(document.querySelectorAll(".report-rewrite-highlight")).map((item) => item.textContent).join("");
+    expect(highlightedText).toBe("NVDA traded near 204.12 after a correction from its 52-week high [1]");
+    expect(normalizeWhitespace((document.querySelector("#report p") as HTMLElement).textContent || "")).toBe(
+      "NVDA traded near 204.12 after a correction from its 52-week high [1]. This volatility matters for the outlook [2].",
+    );
   });
 
   it("keeps multi-paragraph report selections highlighted", () => {

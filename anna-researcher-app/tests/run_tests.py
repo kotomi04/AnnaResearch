@@ -18,6 +18,7 @@ from researcher_tool.context_selector import LexicalContextSelector  # noqa: E40
 from researcher_tool.dispatcher import AppDispatcher  # noqa: E402
 from researcher_tool.errors import ConfigurationError, NotFoundError, ValidationError  # noqa: E402
 from researcher_tool.job_store import JobStore  # noqa: E402
+from researcher_tool.attachment_summary import select_attachment_context  # noqa: E402
 from researcher_tool.settings import SettingsStore  # noqa: E402
 from researcher_tool.sources.native import duckduckgo as duckduckgo_native  # noqa: E402
 
@@ -30,6 +31,11 @@ def assert_true(value, message):
 def make_dispatcher(tmp_path: Path) -> AppDispatcher:
     root = tmp_path / ".research"
     return AppDispatcher(settings=SettingsStore(root=root), jobs=JobStore(root=root), selector=LexicalContextSelector(max_sources=4, context_budget=4000))
+
+
+class FakeEmbeddings:
+    def create(self, *, texts, model="anna-managed-v1", timeout=30.0):
+        return {"data": [{"embedding": [1.0, float(index + 1)]} for index, _ in enumerate(texts)], "_meta": {"dimensions": 2}}
 
 
 def test_settings(tmp_path: Path):
@@ -116,6 +122,59 @@ def test_job_shell(tmp_path: Path):
         raise AssertionError("missing explicit id should fail")
     except NotFoundError:
         pass
+
+
+def test_image_attachment_analysis_context(tmp_path: Path):
+    dispatcher = make_dispatcher(tmp_path)
+    job = dispatcher.dispatch("app_create_research_job", {"query": "image evidence"})["job"]
+    result = dispatcher.dispatch(
+        "app_prepare_attachments",
+        {
+            "research_id": job["research_id"],
+            "attachments": [
+                {
+                    "name": "chart.png",
+                    "path": "research-jobs/test/uploads/chart.png",
+                    "content_type": "image/png",
+                    "size_bytes": 1024,
+                    "download_url": "data:image/png;base64,iVBORw0KGgo=",
+                    "image_analysis": {
+                        "summary": "A line chart comparing quarterly revenue.",
+                        "visible_text": "Revenue Q1 Q2",
+                        "key_observations": ["Revenue rises across the chart."],
+                        "chart_or_table": "Line chart",
+                        "research_relevance": {"relevance": "Useful as visual evidence for the report.", "relevance_score": 0.8},
+                        "uncertainties": ["Exact axis values are too small to read."],
+                    },
+                }
+            ],
+        },
+    )
+
+    loaded = dispatcher.jobs.load(job["research_id"])
+    context = loaded["attachment_context"]
+    assert_true(result["job"]["attachment_context_summary"]["chunk_count"] == 0, "image analysis should not become text chunks")
+    assert_true(context["files"][0]["status"] == "ready", "image attachment should be ready when analysis exists")
+    assert_true(context["files"][0]["analysis"]["type"] == "image", "image attachment should keep analysis type")
+    assert_true(context["files"][0]["chunk_count"] == 0, "image attachment should stay at file-summary level")
+    assert_true(context["files"][0]["local_path"].startswith("attachment-files/file-1-"), "image attachment should record local artifact path")
+    assert_true((dispatcher.jobs.job_dir_for(job["research_id"]) / context["files"][0]["local_path"]).exists(), "image attachment should be downloaded locally")
+    assert_true(context["files"][0]["analysis"]["summary"] == "A line chart comparing quarterly revenue.", "image planning summary should be concise")
+    assert_true(context["files"][0]["analysis"]["payload"]["visible_text"] == "Revenue Q1 Q2", "image analysis JSON should be persisted")
+    selected = select_attachment_context(
+        jobs=dispatcher.jobs,
+        embeddings=FakeEmbeddings(),
+        research_id=job["research_id"],
+        query="quarterly revenue trend",
+        top_k=4,
+    )
+    assert_true(selected["selected_item_count"] == 1, "relevant image summary should enter selected context")
+    assert_true(selected["selected_items"][0]["kind"] == "image_analysis", "image should enter selection as an image analysis item")
+    assert_true(selected["selected_items"][0]["quote"] == "", "image citation cards should not show JSON text")
+    assert_true("Image analysis JSON for chart.png" in selected["selected_context"], "image should enter writing context as JSON")
+    assert_true("file-1:image-summary" not in selected["selected_context"], "image virtual chunk id should stay internal")
+    assert_true('"visible_text": "Revenue Q1 Q2"' in selected["selected_context"], "selected image context should include visible text")
+    assert_true("Revenue rises across the chart." in selected["selected_context"], "selected image summary should include observations")
 
 
 def test_call_research_source_context_result(tmp_path: Path):
@@ -401,10 +460,11 @@ def get_json(url: str):
 
 def test_bundle_contract():
     bundle_js = "\n".join(path.read_text(encoding="utf-8") for path in (APP_ROOT / "bundle").glob("assets/*.js"))
-    manifest = (APP_ROOT / "manifest.json").read_text(encoding="utf-8")
-    assert_true("bundled:researcher" in manifest, "manifest should reference bundled researcher tool")
-    assert_true('"min_version":"0.2.2"' in manifest.replace(" ", ""), "manifest should require tool 0.2.2")
-    assert_true('"llm":["complete","embed"]' in manifest.replace(" ", ""), "manifest should authorize llm.complete and llm.embed")
+    manifest = json.loads((APP_ROOT / "manifest.json").read_text(encoding="utf-8"))
+    assert_true(manifest["required_executas"][0]["tool_id"] == "bundled:researcher", "manifest should reference bundled researcher tool")
+    assert_true(manifest["required_executas"][0]["min_version"] == "0.2.2", "manifest should require tool 0.2.2")
+    assert_true(manifest["ui"]["host_api"]["llm"] == ["complete", "embed"], "manifest should authorize llm.complete and llm.embed")
+    assert_true(manifest["ui"]["host_api"]["agent"]["session"]["auto"] is True, "manifest should authorize agent auto sessions")
     assert_true('method:"research"' not in bundle_js and 'method: "research"' not in bundle_js, "bundle should not call legacy research method")
     assert_true('"action":"advance"' not in bundle_js and 'action:"advance"' not in bundle_js, "bundle should not contain legacy advance action")
     assert_true("app_search_web" not in bundle_js, "bundle should not reference legacy app_search_web")
@@ -438,6 +498,7 @@ def main():
     tests = [
         ("settings", test_settings),
         ("job_shell", test_job_shell),
+        ("image_attachment_analysis", test_image_attachment_analysis_context),
         ("call_research_source", test_call_research_source_context_result),
         ("result_transfer_http", test_result_transfer_http),
         ("section_large_payload_transfer", test_section_large_payload_transfer),

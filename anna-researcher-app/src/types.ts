@@ -180,28 +180,54 @@ export interface AttachmentPrepareInput {
   content_type?: string;
   size_bytes?: number;
   download_url: string;
+  image_analysis?: AttachmentImageAnalysis;
+  image_analysis_error?: string;
+}
+
+export interface AttachmentImageAnalysis {
+  image_type?: string;
+  summary: string;
+  detailed_description?: string;
+  visible_text?: unknown;
+  key_observations?: unknown;
+  chart_or_table?: unknown;
+  research_relevance?: unknown;
+  uncertainties?: string[];
+  extraction_limits?: string[];
+  raw_text?: string;
 }
 
 export interface AttachmentContextFile {
   id: string;
   name: string;
   path?: string;
+  local_path?: string;
   content_type?: string;
   size_bytes?: number;
   text_chars?: number;
   chunk_count?: number;
   status: "ready" | "failed";
   error?: string | null;
-  ai_summary?: string;
-  ai_key_points?: string[];
-  ai_relevance?: string;
-  summary_selected_chunk_ids?: string[];
+  analysis?: AttachmentFileAnalysis;
+}
+
+export interface AttachmentFileAnalysis {
+  type: "text" | "image" | string;
+  source: "summary_llm" | "analyze_image" | string;
+  summary?: string;
+  key_points?: string[];
+  relevance?: string;
+  relevance_score?: number | null;
+  selected_chunk_ids?: string[];
+  payload?: unknown;
 }
 
 export interface AttachmentContextChunk {
   chunk_id: string;
   file_id: string;
   file_name: string;
+  path?: string;
+  content_type?: string;
   index: number;
   text: string;
   embedding?: number[];
@@ -247,6 +273,8 @@ export type CitationSource =
       kind: "attachment";
       file_id: string;
       file_name: string;
+      path?: string;
+      content_type?: string;
       chunk_id?: string;
       index?: number;
       quote?: string;
@@ -414,10 +442,42 @@ export interface AnnaFilesApi {
   delete?(request: { path: string }): Promise<unknown>;
 }
 
+export interface AnnaAgentRunFrame {
+  event?: string;
+  text?: string;
+  content?: unknown;
+  output_text?: string;
+  message?: {
+    content?: unknown;
+  };
+  choices?: Array<{
+    delta?: {
+      content?: string;
+      text?: string;
+      task_complete?: { token_usage?: unknown };
+    };
+    message?: {
+      content?: unknown;
+    };
+  }>;
+  [key: string]: unknown;
+}
+
+export interface AnnaAgentSession {
+  appSessionUuid?: string;
+  run(input: { content: string }): AsyncIterable<AnnaAgentRunFrame>;
+  delete(): Promise<unknown>;
+}
+
+export interface AnnaAgentApi {
+  session(input: { submode: "auto" }): Promise<AnnaAgentSession>;
+}
+
 export interface AnnaRuntimeApi {
   tools: AnnaToolsApi;
   llm: AnnaLlmApi;
   files?: AnnaFilesApi;
+  agent?: AnnaAgentApi;
 }
 
 export interface AnnaRuntimeGlobal {

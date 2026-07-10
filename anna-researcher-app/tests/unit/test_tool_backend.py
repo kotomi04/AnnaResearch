@@ -9,6 +9,7 @@ import urllib.request
 
 import pytest
 
+from researcher_tool.attachments import chunk_text, extract_text
 from researcher_tool.context_selector import LexicalContextSelector
 from researcher_tool.attachment_embeddings import embed_attachment_chunks
 from researcher_tool.attachment_summary import select_attachment_context, summarize_attachment_context
@@ -99,6 +100,7 @@ class FakeSampling:
                                 "summary": "nvidia.pdf 讨论了股价压力和近期动作。",
                                 "key_points": ["短期波动来自估值压力", "新产品和供应链仍是核心变量"],
                                 "relevance": "可用于股票走势分析",
+                                "relevance_score": 0.91,
                             }
                         ],
                     },
@@ -251,6 +253,84 @@ def test_prepare_attachments_downloads_and_persists_text_chunks(tmp_path):
     assert "Attachment research brief for Anna." in context["chunks"][0]["text"]
 
 
+def test_prepare_image_attachment_uses_analysis_as_text_chunks(tmp_path):
+    dispatcher = make_dispatcher(tmp_path)
+    job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
+    result = dispatcher.dispatch(
+        "app_prepare_attachments",
+        {
+            "research_id": job["research_id"],
+            "attachments": [
+                {
+                    "name": "chart.png",
+                    "path": "research-jobs/test/uploads/chart.png",
+                    "content_type": "image/png",
+                    "size_bytes": 1024,
+                    "download_url": "data:image/png;base64,iVBORw0KGgo=",
+                    "image_analysis": {
+                        "summary": "A line chart comparing quarterly revenue.",
+                        "visible_text": "Revenue Q1 Q2",
+                        "key_observations": ["Revenue rises across the chart."],
+                        "chart_or_table": "Line chart",
+                        "research_relevance": {"relevance": "Useful as visual evidence for the report.", "relevance_score": 0.8},
+                        "uncertainties": ["Exact axis values are too small to read."],
+                    },
+                }
+            ],
+        },
+    )
+
+    loaded = dispatcher.jobs.load(job["research_id"])
+    context = loaded["attachment_context"]
+    assert result["job"]["attachment_context_summary"]["chunk_count"] == 0
+    assert context["files"][0]["status"] == "ready"
+    assert context["files"][0]["analysis"]["type"] == "image"
+    assert context["files"][0]["chunk_count"] == 0
+    assert context["files"][0]["local_path"].startswith("attachment-files/file-1-")
+    assert (dispatcher.jobs.job_dir_for(job["research_id"]) / context["files"][0]["local_path"]).exists()
+    assert context["files"][0]["analysis"]["summary"] == "A line chart comparing quarterly revenue."
+    assert context["files"][0]["analysis"]["payload"]["visible_text"] == "Revenue Q1 Q2"
+
+    selected = select_attachment_context(
+        jobs=dispatcher.jobs,
+        embeddings=FakeEmbeddings(),
+        research_id=job["research_id"],
+        query="quarterly revenue trend",
+        top_k=4,
+    )
+    assert selected["selected_item_count"] == 1
+    assert selected["selected_items"][0]["kind"] == "image_analysis"
+    assert selected["selected_items"][0]["quote"] == ""
+    assert "Image analysis JSON for chart.png" in selected["selected_context"]
+    assert "file-1:image-summary" not in selected["selected_context"]
+    assert '"visible_text": "Revenue Q1 Q2"' in selected["selected_context"]
+    assert "Revenue rises across the chart." in selected["selected_context"]
+
+
+def test_extract_docx_attachment_text_and_table(tmp_path):
+    from docx import Document
+
+    path = tmp_path / "brief.docx"
+    document = Document()
+    document.add_paragraph("英伟达股票研究附件")
+    document.add_paragraph("数据中心收入增长，但估值压力上升。")
+    table = document.add_table(rows=1, cols=2)
+    table.rows[0].cells[0].text = "指标"
+    table.rows[0].cells[1].text = "变化"
+    document.save(path)
+
+    text = extract_text(
+        path,
+        name="brief.docx",
+        content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+    chunks = chunk_text(text)
+
+    assert "英伟达股票研究附件" in text
+    assert "指标 | 变化" in text
+    assert chunks
+
+
 def test_embed_attachment_chunks_batches_and_persists_vectors(tmp_path):
     dispatcher = make_dispatcher(tmp_path)
     job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
@@ -304,10 +384,16 @@ def test_summarize_attachment_context_selects_top_chunks_and_writes_per_file_sum
     loaded = dispatcher.jobs.load(job["research_id"])["attachment_context"]
     assert loaded["summary_status"] == "ready"
     assert loaded["summary_mode"] == "ai_topk_by_file"
-    assert loaded["files"][0]["ai_summary"] == "nvidia.pdf 讨论了股价压力和近期动作。"
-    assert loaded["files"][0]["summary_selected_chunk_ids"] == ["file-1:0001"]
+    assert loaded["files"][0]["analysis"]["summary"] == "nvidia.pdf 讨论了股价压力和近期动作。"
+    assert loaded["files"][0]["analysis"]["relevance_score"] == 0.91
+    assert loaded["files"][0]["analysis"]["selected_chunk_ids"] == ["file-1:0001"]
     assert "附件显示英伟达" in loaded["summary"]
-    assert "Nvidia stock fell" in sampling.calls[0]["messages"][0]["content"]["text"]
+    prompt = sampling.calls[0]["messages"][0]["content"]["text"]
+    assert "Nvidia stock fell" in prompt
+    assert '"relevance_score":"number from 0 to 1"' in prompt
+    assert "Set relevance_score from 0 to 1" in prompt
+    assert "0.0-0.2 = unrelated" in prompt
+    assert "0.76-1.0 = directly relevant evidence" in prompt
 
 
 def test_select_attachment_context_returns_ranked_chunk_text(tmp_path):
@@ -316,7 +402,7 @@ def test_select_attachment_context_returns_ranked_chunk_text(tmp_path):
     context = {
         "version": 1,
         "prepared_at": "now",
-        "files": [{"id": "file-1", "name": "nvidia.pdf", "status": "ready", "chunk_count": 1}],
+        "files": [{"id": "file-1", "name": "nvidia.pdf", "status": "ready", "chunk_count": 1, "analysis": {"type": "text", "relevance_score": 0.8}}],
         "summary": "AI summary should not be the writing context",
         "chunks": [
             {"chunk_id": "file-1:0001", "file_id": "file-1", "file_name": "nvidia.pdf", "index": 1, "text": "Original filing chunk about Nvidia supply constraints.", "embedding": [1.0, 1.0]},
@@ -332,9 +418,44 @@ def test_select_attachment_context_returns_ranked_chunk_text(tmp_path):
         top_k=1,
     )
 
-    assert selected["selected_chunk_count"] == 1
+    assert selected["selected_item_count"] == 1
+    assert selected["selected_items"][0]["kind"] == "chunk"
+    assert selected["selected_items"][0]["quote"] == "Original filing chunk about Nvidia supply constraints."
+    assert "Use this analysis as supporting evidence only when the claim is directly grounded in visible content." in selected["selected_context"]
     assert "Original filing chunk" in selected["selected_context"]
+    assert "file-1:0001" not in selected["selected_context"]
     assert "AI summary should not" not in selected["selected_context"]
+
+
+def test_select_attachment_context_skips_irrelevant_files(tmp_path):
+    dispatcher = make_dispatcher(tmp_path)
+    job = dispatcher.dispatch("app_create_research_job", {"query": "us gdp forecast"})["job"]
+    context = {
+        "version": 1,
+        "prepared_at": "now",
+        "files": [
+            {"id": "file-1", "name": "macro.pdf", "status": "ready", "chunk_count": 1, "analysis": {"type": "text", "relevance_score": 0.8}},
+            {"id": "file-2", "name": "gpu.pdf", "status": "ready", "chunk_count": 1, "analysis": {"type": "text", "relevance_score": 0.05, "relevance": "无相关性。"}},
+        ],
+        "summary": "attachment summary",
+        "chunks": [
+            {"chunk_id": "file-1:0001", "file_id": "file-1", "file_name": "macro.pdf", "index": 1, "text": "US GDP forecast and labor market data.", "embedding": [1.0, 1.0]},
+            {"chunk_id": "file-2:0001", "file_id": "file-2", "file_name": "gpu.pdf", "index": 1, "text": "GPU supply chain and semiconductor demand.", "embedding": [1.0, 1.0]},
+        ],
+    }
+    dispatcher.jobs.update_metadata(job["research_id"], {"attachment_context": context})
+
+    selected = select_attachment_context(
+        jobs=dispatcher.jobs,
+        embeddings=FakeEmbeddings(),
+        research_id=job["research_id"],
+        query="us gdp forecast",
+        top_k=4,
+    )
+
+    assert selected["selected_item_count"] == 1
+    assert "US GDP forecast" in selected["selected_context"]
+    assert "GPU supply chain" not in selected["selected_context"]
 
 
 def test_get_research_job_falls_back_when_transfer_server_is_blocked(tmp_path):

@@ -113,10 +113,7 @@ def _compact_attachment_context(context: Any) -> dict[str, Any] | None:
                 "name": file.get("name"),
                 "status": file.get("status"),
                 "chunk_count": file.get("chunk_count"),
-                "ai_summary": file.get("ai_summary"),
-                "ai_key_points": file.get("ai_key_points") or [],
-                "ai_relevance": file.get("ai_relevance"),
-                "summary_selected_chunk_ids": file.get("summary_selected_chunk_ids") or [],
+                "analysis": file.get("analysis") if isinstance(file.get("analysis"), dict) else None,
             }
         )
     return {

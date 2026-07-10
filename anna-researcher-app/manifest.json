@@ -41,6 +41,10 @@
       "chat": [],
       "artifact": [],
       "llm": ["complete", "embed"],
+      "agent": {
+        "session": { "auto": true, "fixed": null },
+        "tools": []
+      },
       "files": ["upload_init", "upload_finalize", "download_url", "list", "delete"],
       "fs": [],
       "storage": [],
@@ -56,6 +60,7 @@
       ],
       "img-src": ["'self'", "data:", "blob:"],
       "font-src": ["'self'", "data:"],
+      "worker-src": ["'self'", "blob:"],
       "style-src": ["'self'"],
       "script-src": ["'self'"]
     },

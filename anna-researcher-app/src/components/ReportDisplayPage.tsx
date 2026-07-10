@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { exportResearchMarkdownFile } from "../export/exportFiles";
 import type { MessageKey } from "../i18n/messages";
-import type { ResearchResult } from "../types";
+import type { CitationSource, ResearchResult } from "../types";
 import type { RunEvent, SectionPreview } from "../workflow/runEvents";
 import { ReportView } from "./ReportView";
 
@@ -17,6 +17,7 @@ interface Props {
   onApplySemanticRewrite?(proposalId: string): Promise<unknown>;
   onDiscardSemanticRewrite?(proposalId: string): void;
   onManualReportSave?(input: { reportMarkdown: string }): Promise<unknown>;
+  onAttachmentOpen?(source: Extract<CitationSource, { kind: "attachment" }>): void;
 }
 
 export function ReportDisplayPage({
@@ -31,6 +32,7 @@ export function ReportDisplayPage({
   onApplySemanticRewrite,
   onDiscardSemanticRewrite,
   onManualReportSave,
+  onAttachmentOpen,
 }: Props) {
   const markdown = result?.report_markdown || "";
   const [exportStatus, setExportStatus] = useState("");
@@ -91,6 +93,7 @@ export function ReportDisplayPage({
         onApplySemanticRewrite={onApplySemanticRewrite}
         onDiscardSemanticRewrite={onDiscardSemanticRewrite}
         onManualReportSave={onManualReportSave}
+        onAttachmentOpen={onAttachmentOpen}
       />
       <details className="process-summary">
         <summary>{t("processSummaryTitle")}</summary>
