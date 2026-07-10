@@ -53,6 +53,7 @@ export function App() {
   const [selectedRoleIndex, setSelectedRoleIndex] = useState(0);
   const [selectedFocusIds, setSelectedFocusIds] = useState<string[]>([]);
   const [regenInstruction, setRegenInstruction] = useState("");
+  const [autonomousMode, setAutonomousMode] = useState(false);
   const [requestedStep, setRequestedStep] = useState<GuidedStepId | undefined>("need");
 
   useEffect(() => {
@@ -147,6 +148,10 @@ export function App() {
     setResearchNeedDraft(parsed.researchNeed);
   }, [research.job?.research_id, research.job?.query]);
 
+  useEffect(() => {
+    setAutonomousMode(research.job?.execution_mode === "autonomous_agent");
+  }, [research.job?.execution_mode, research.job?.research_id]);
+
   useEffect(() => () => revokeAttachmentObjectUrl(), []);
 
   function revokeAttachmentObjectUrl() {
@@ -195,7 +200,8 @@ export function App() {
       const downloadUrl = String(response.get_url || response.url || "").trim();
       if (!downloadUrl) throw new Error(`Anna files download_url did not return a URL for ${attachment.name || path}.`);
       if (kind) {
-        showAttachmentPreview({ kind, name: attachment.name || "attachment", url: downloadUrl });
+        const objectUrl = await materializeAttachmentPreviewUrl(downloadUrl);
+        showAttachmentPreview({ kind, name: attachment.name || "attachment", url: objectUrl, objectUrl });
         return;
       }
     } catch (err) {
@@ -223,7 +229,8 @@ export function App() {
       const response = await annaRuntime.files.download_url({ path });
       const downloadUrl = String(response.get_url || response.url || "").trim();
       if (!downloadUrl) throw new Error(`Anna files download_url did not return a URL for ${name || path}.`);
-      showAttachmentPreview({ kind, name, url: downloadUrl });
+      const objectUrl = await materializeAttachmentPreviewUrl(downloadUrl);
+      showAttachmentPreview({ kind, name, url: objectUrl, objectUrl });
     } catch (err) {
       setValidationMessage(localizedError(err, t));
     }
@@ -329,7 +336,7 @@ export function App() {
       void research.resumeResearchJob();
       return;
     }
-    void research.confirmOutlineAndRun(research.outlineDraft);
+    void research.confirmOutlineAndRun(research.outlineDraft, autonomousMode ? "autonomous_agent" : "guided_sections");
   }
 
   function showSources() {
@@ -612,6 +619,8 @@ export function App() {
                   onRegenerate={() => research.regenerateOutline(regenInstruction)}
                   onBack={() => setRequestedStep("focus")}
                   onStartGeneration={startGeneration}
+                  autonomousMode={autonomousMode}
+                  onAutonomousModeChange={setAutonomousMode}
                 />
               ) : step === "generate" ? (
                 <ReportGenerationPage
@@ -674,6 +683,12 @@ export function formatResearchQuery(input: { briefName: string; researchNeed: st
     "Research need:",
     researchNeed,
   ].join("\n");
+}
+
+export async function materializeAttachmentPreviewUrl(downloadUrl: string): Promise<string> {
+  const response = await fetch(downloadUrl);
+  if (!response.ok) throw new Error(`Attachment download failed with HTTP ${response.status}.`);
+  return URL.createObjectURL(await response.blob());
 }
 
 export function parseResearchQuery(query: string): { briefName: string; researchNeed: string } {

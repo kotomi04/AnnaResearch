@@ -14,6 +14,9 @@ interface ApiOptions {
   sources?: ResearchSourceView[];
   latestJob?: Awaited<ReturnType<ResearchApi["getResearchJob"]>>;
   historyJobs?: Awaited<ReturnType<ResearchApi["listResearchJobs"]>>;
+  agentRunFinalJob?: Awaited<ReturnType<ResearchApi["getResearchJob"]>>;
+  agentCreateGrantedTools?: string[];
+  agentGrantedTools?: string[];
 }
 
 function makeApi(options: ApiOptions = {}) {
@@ -35,6 +38,7 @@ function makeApi(options: ApiOptions = {}) {
   const callOverrides = options.callOverrides ?? [];
   let callIndex = 0;
   let replyIndex = 0;
+  let agentRunFinished = false;
   const api: ResearchApi = {
     async getSettings() {
       calls.push(["getSettings"]);
@@ -88,6 +92,7 @@ function makeApi(options: ApiOptions = {}) {
     },
     async getResearchJob(researchId) {
       calls.push(["getResearchJob", researchId]);
+      if (agentRunFinished && options.agentRunFinalJob) return options.agentRunFinalJob;
       if (researchId) {
         return (options.historyJobs || []).find((job) => job.research_id === researchId) ?? options.latestJob ?? null;
       }
@@ -270,10 +275,19 @@ function makeApi(options: ApiOptions = {}) {
       const call = { prompts: [] as string[], deleted: false };
       agentSessions.push(call);
       return {
+        granted_tools: options.agentCreateGrantedTools ?? options.agentGrantedTools ?? ["tool-xhz-researcher-python-e7k8xa3s"],
         async *run(input) {
           call.prompts.push(input.content);
+          const grantedTools = options.agentGrantedTools ?? ["tool-xhz-researcher-python-e7k8xa3s"];
+          yield {
+            event: "run_meta",
+            granted_tools: grantedTools,
+            inherit_host_tools: false,
+            warnings: grantedTools.length ? [] : [{ code: "NO_TOOLS_AVAILABLE" }],
+          };
           const reply = replies[replyIndex++] ?? "";
           if (reply) yield { event: "delta", text: reply };
+          agentRunFinished = true;
           yield { event: "complete" };
         },
         async delete() {
@@ -559,6 +573,88 @@ describe("useResearchJob (iterative loop)", () => {
     expect(agentSessions[1].prompts[1]).toContain("Do not copy citation numbers from the existing report");
     expect(llmCalls).toHaveLength(5);
     expect(JSON.stringify(llmCalls[4])).toContain("Generate report framing only");
+  });
+
+  it("runs the experimental autonomous mode in one tool-enabled session without the guided section loop", async () => {
+    const finalJob = {
+      research_id: "r1",
+      status: "completed" as const,
+      stage: "completed" as const,
+      progress: 100,
+      execution_mode: "autonomous_agent" as const,
+      query: "anna",
+      confirmed_role: { server: "Researcher", agent_role_prompt: "Use sources." },
+      confirmed_focuses: ["focus one"],
+      confirmed_outline: [
+        { id: "section-1", title: "Section One", outline: "Cover one.", allowed_source_ids: ["tavily"], max_iterations: 2 },
+      ],
+      section_results: {
+        "section-1": {
+          section_id: "section-1",
+          status: "completed",
+          section_markdown: "## Section One\n\nAutonomous evidence [1]",
+          section_summary: "Autonomous summary",
+          source_urls: ["https://example.com/autonomous"],
+        },
+      },
+      result: {
+        research_id: "r1",
+        status: "completed",
+        report_markdown: "# Autonomous\n\n## Section One\n\nAutonomous evidence [1]",
+        source_urls: ["https://example.com/autonomous"],
+      },
+    };
+    const { api, calls, llmCalls, agentSessions } = makeApi({
+      agentCreateGrantedTools: [],
+      agentRunFinalJob: finalJob,
+      llmReplies: [
+        ROLE_REPLY,
+        FOCUS_REPLY,
+        OUTLINE_REPLY,
+        ASSIGN_REPLY,
+        '{"status":"completed","research_id":"r1","completed_sections":4,"finalized":true}',
+      ],
+    });
+    const { result } = renderHook(() => useResearchJob(api));
+
+    await waitFor(() => expect(result.current.phase).toBe("idle"));
+    await planToOutline(result);
+    await act(async () => {
+      await result.current.confirmOutlineAndRun(result.current.outlineDraft, "autonomous_agent");
+    });
+
+    expect(result.current.phase).toBe("completed");
+    expect(result.current.result?.report_markdown).toContain("# Autonomous");
+    expect(agentSessions).toHaveLength(1);
+    expect(agentSessions[0].prompts).toHaveLength(1);
+    expect(agentSessions[0].deleted).toBe(true);
+    expect(agentSessions[0].prompts[0]).toContain("agent_finalize_report");
+    expect(agentSessions[0].prompts[0]).toContain("Confirmed outline");
+    expect(agentSessions[0].prompts[0]).toContain("Uploaded-file evidence policy");
+    expect(calls.some((call) => Array.isArray(call) && call[0] === "callSectionResearchSource")).toBe(false);
+    expect(calls.some((call) => Array.isArray(call) && call[0] === "selectSectionContext")).toBe(false);
+    expect(llmCalls).toHaveLength(4);
+  });
+
+  it("uses run metadata instead of the create response to reject a session with no granted tools", async () => {
+    const { api, llmCalls, agentSessions } = makeApi({
+      agentGrantedTools: [],
+      llmReplies: [ROLE_REPLY, FOCUS_REPLY, OUTLINE_REPLY, ASSIGN_REPLY],
+    });
+    const { result } = renderHook(() => useResearchJob(api));
+
+    await waitFor(() => expect(result.current.phase).toBe("idle"));
+    await planToOutline(result);
+    await act(async () => {
+      await result.current.confirmOutlineAndRun(result.current.outlineDraft, "autonomous_agent");
+    });
+
+    expect(result.current.phase).toBe("failed");
+    expect(String(result.current.error)).toContain("Let agent sessions use my tools");
+    expect(agentSessions).toHaveLength(1);
+    expect(agentSessions[0].prompts).toHaveLength(1);
+    expect(agentSessions[0].deleted).toBe(true);
+    expect(llmCalls).toHaveLength(4);
   });
 
   it("fails a section on an empty Agent response without falling back to llm.complete", async () => {

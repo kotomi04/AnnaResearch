@@ -315,6 +315,7 @@ export interface ResearchJob {
   enabled_sources?: string[];
   schema_version?: number;
   workflow?: string;
+  execution_mode?: "guided_sections" | "autonomous_agent";
   confirmed_role?: ConfirmedResearchRole | null;
   confirmed_focuses?: string[];
   confirmed_outline?: ReportSection[];
@@ -465,7 +466,9 @@ export interface AnnaAgentRunFrame {
 
 export interface AnnaAgentSession {
   appSessionUuid?: string;
-  run(input: { content: string }): AsyncIterable<AnnaAgentRunFrame>;
+  grantedTools?: string[];
+  granted_tools?: string[];
+  run(input: { content: string; recursion_limit?: number }): AsyncIterable<AnnaAgentRunFrame>;
   delete(): Promise<unknown>;
 }
 

@@ -1,10 +1,11 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { formatResearchQuery, hasCompletedResearchResult, makeIntroStepLabel, makeStepLabel } from "../../src/App";
+import { formatResearchQuery, hasCompletedResearchResult, makeIntroStepLabel, makeStepLabel, materializeAttachmentPreviewUrl } from "../../src/App";
 import { useState } from "react";
 import { DraftGenerationPage } from "../../src/components/DraftGenerationPage";
 import { FocusReviewPage } from "../../src/components/FocusReviewPage";
 import { RegenerationControl } from "../../src/components/RegenerationControl";
+import { OutlineReviewPage } from "../../src/components/OutlineReviewPage";
 import { ReportDisplayPage } from "../../src/components/ReportDisplayPage";
 import { ReportView } from "../../src/components/ReportView";
 import { ResearchLibraryPage } from "../../src/components/ResearchLibraryPage";
@@ -23,6 +24,18 @@ import { createTranslator, localeStorageKey } from "../../src/i18n/messages";
 import { useLocale } from "../../src/i18n/useLocale";
 import type { ResearchAttachment, ResearchSourceView } from "../../src/types";
 import { summarizePlan } from "../../src/workflow/planSummary";
+
+const pdfJsMocks = vi.hoisted(() => ({
+  getDocument: vi.fn(() => ({
+    destroy: vi.fn(() => Promise.resolve()),
+    promise: new Promise(() => undefined),
+  })),
+}));
+
+vi.mock("pdfjs-dist", () => ({
+  GlobalWorkerOptions: { workerSrc: "" },
+  getDocument: pdfJsMocks.getDocument,
+}));
 
 function LocaleProbe() {
   const { locale, setLocale, t } = useLocale();
@@ -233,6 +246,57 @@ describe("AttachmentPreviewDialog", () => {
     expect(screen.getByText("Attachment preview")).toBeTruthy();
     expect(screen.getByText("Preview is not supported for this file type yet.")).toBeTruthy();
   });
+
+  it("loads PDF bytes in the app frame before handing them to PDF.js", async () => {
+    const t = createTranslator("en");
+    const bytes = new Uint8Array([37, 80, 68, 70]);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      status: 200,
+      arrayBuffer: async () => bytes.buffer,
+    } as Response);
+
+    render(
+      <AttachmentPreviewDialog
+        kind="pdf"
+        name="brief.pdf"
+        url="blob:https://staging.anna.partners/example"
+        t={t}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(pdfJsMocks.getDocument).toHaveBeenCalledTimes(1));
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "blob:https://staging.anna.partners/example",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    const input = pdfJsMocks.getDocument.mock.calls[0]?.[0] as { data?: Uint8Array; url?: string };
+    expect(Array.from(input.data || [])).toEqual(Array.from(bytes));
+    expect(input.url).toBeUndefined();
+
+    fetchSpy.mockRestore();
+  });
+});
+
+describe("attachment preview downloads", () => {
+  it("creates an app-owned object URL for a generated attachment", async () => {
+    const blob = new Blob(["image"], { type: "image/png" });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      status: 200,
+      blob: async () => blob,
+    } as Response);
+    const createObjectUrlSpy = vi.fn(() => "blob:app-owned-preview");
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectUrlSpy });
+
+    await expect(materializeAttachmentPreviewUrl("blob:https://staging.anna.partners/host-owned")).resolves.toBe("blob:app-owned-preview");
+    expect(fetchSpy).toHaveBeenCalledWith("blob:https://staging.anna.partners/host-owned");
+    expect(createObjectUrlSpy).toHaveBeenCalledWith(blob);
+
+    fetchSpy.mockRestore();
+    delete (URL as { createObjectURL?: unknown }).createObjectURL;
+  });
 });
 
 describe("SourceList", () => {
@@ -264,6 +328,21 @@ describe("SourceList", () => {
     expect(screen.queryByText(/file-1:image-summary/)).toBeNull();
     expect(screen.queryByText(/file-1:0002/)).toBeNull();
     expect(document.querySelector(".reference-site-mark")).toBeNull();
+  });
+
+  it("tries each source host's favicon and falls back to its initial on error", () => {
+    const t = createTranslator("en");
+    const { rerender } = render(<SourceList urls={["https://www.linkedin.com/posts/example"]} t={t} />);
+
+    let icon = document.querySelector(".reference-icon") as HTMLImageElement;
+    expect(icon.src).toBe("https://linkedin.com/favicon.ico");
+
+    rerender(<SourceList urls={["https://docs.example.com/article"]} t={t} />);
+    icon = document.querySelector(".reference-icon") as HTMLImageElement;
+    expect(icon.src).toBe("https://docs.example.com/favicon.ico");
+    fireEvent.error(icon);
+    expect(document.querySelector(".reference-icon")).toBeNull();
+    expect(document.querySelector(".reference-site-mark")?.textContent).toBe("D");
   });
 });
 
@@ -300,6 +379,35 @@ describe("FocusReviewPage", () => {
 });
 
 describe("Draft planning UI", () => {
+  it("offers an autonomous single-session generation toggle on the outline page", () => {
+    const t = createTranslator("en");
+    const onAutonomousModeChange = vi.fn();
+    render(
+      <OutlineReviewPage
+        sections={[{ id: "section-1", title: "Market", outline: "Analyze the market.", allowed_source_ids: ["tavily"], max_iterations: 2 }]}
+        sources={[{ id: "tavily", name: "Tavily", kind: "builtin", enabled: true, credential_status: "configured", max_parallel: 1 }]}
+        instruction=""
+        summary={{ roleName: "Analyst", rolePrompt: "Analyze.", focuses: ["market"], sectionCount: 1, totalIterations: 2 }}
+        isBusy={false}
+        autonomousMode={false}
+        t={t}
+        onSectionChange={vi.fn()}
+        onAddSection={vi.fn()}
+        onDeleteSection={vi.fn()}
+        onMoveSection={vi.fn()}
+        onToggleSectionSource={vi.fn()}
+        onInstructionChange={vi.fn()}
+        onRegenerate={vi.fn()}
+        onBack={vi.fn()}
+        onStartGeneration={vi.fn()}
+        onAutonomousModeChange={onAutonomousModeChange}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /Single-session autonomous generation/ }));
+    expect(onAutonomousModeChange).toHaveBeenCalledWith(true);
+  });
+
   it("renders an explicit loading page while waiting for a draft", () => {
     const t = createTranslator("en");
     render(
@@ -871,6 +979,9 @@ describe("ReportView", () => {
     expect(nextCard.getAttribute("aria-label")).toBe("Reference 2");
     expect(within(nextCard).getByText("example.com")).toBeTruthy();
     expect(within(nextCard).getByText("Second source")).toBeTruthy();
+    const fallbackIcon = nextCard.querySelector(".citation-card-icon") as HTMLImageElement;
+    expect(fallbackIcon.src).toBe("https://example.com/favicon.ico");
+    fireEvent.error(fallbackIcon);
     expect(within(nextCard).getByText("E")).toBeTruthy();
   });
 

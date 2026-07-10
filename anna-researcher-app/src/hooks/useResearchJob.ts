@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { collectAgentText } from "../api/agentSession";
 import type { ResearchApi } from "../api/researchApi";
 import type {
+  AnnaAgentRunFrame,
   AnnaAgentSession,
   CitationSource,
   ConfirmedResearchRole,
@@ -391,6 +392,7 @@ export function useResearchJob(api: ResearchApi) {
       setPhase("running");
       try {
         let currentJob = options.resume ? initialJob : await api.saveConfirmedResearchOutline(initialJob.research_id, sections);
+        currentJob = await updateJob(api, currentJob, { execution_mode: "guided_sections" });
         const confirmedSections = currentJob.confirmed_outline?.length ? currentJob.confirmed_outline : sections;
         const role = currentJob.confirmed_role || initialJob.confirmed_role;
         const focuses = currentJob.confirmed_focuses || initialJob.confirmed_focuses || [];
@@ -476,13 +478,101 @@ export function useResearchJob(api: ResearchApi) {
     [api, job, sources],
   );
 
+  const runAutonomousReport = useCallback(
+    async (sections: ReportSection[], options: { resume?: boolean; baseJob?: ResearchJob | null } = {}) => {
+      const initialJob = options.baseJob || job;
+      if (!initialJob?.research_id) throw new Error("Research job is missing research_id.");
+      const runId = runIdRef.current + 1;
+      runIdRef.current = runId;
+      setPhase("running");
+      setError(null);
+      let session: AnnaAgentSession | null = null;
+      try {
+        let currentJob = options.resume ? initialJob : await api.saveConfirmedResearchOutline(initialJob.research_id, sections);
+        currentJob = await updateJob(api, currentJob, {
+          execution_mode: "autonomous_agent",
+          status: "running",
+          stage: "section_research",
+          progress: 35,
+          ...(!options.resume ? {
+            agent_evidence_registry: [],
+            agent_section_evidence: {},
+            agent_fact_ledger: [],
+            agent_consistency_audit: "",
+          } : {}),
+        });
+        const confirmedSections = currentJob.confirmed_outline?.length ? currentJob.confirmed_outline : sections;
+        const role = currentJob.confirmed_role || initialJob.confirmed_role;
+        const focuses = currentJob.confirmed_focuses || initialJob.confirmed_focuses || [];
+        if (!role || !focuses.length || !confirmedSections.length) throw new Error("Research job is not ready for autonomous generation.");
+        setJob(currentJob);
+        setOutlineDraft(confirmedSections);
+        setRunEvents(options.resume ? projectStoredRunEvents(currentJob) : []);
+        setSectionPreviews(options.resume ? projectSectionPreviews(currentJob) : []);
+        appendRunEvent(setRunEvents, {
+          kind: "section_started",
+          sectionId: confirmedSections[0].id,
+          sectionTitle: confirmedSections[0].title,
+          title: "Autonomous report agent started",
+          detail: `${confirmedSections.length} sections · single session`,
+        });
+
+        session = await api.createAgentSession();
+        const prompt = buildAutonomousReportPrompt({
+          job: currentJob,
+          role,
+          focuses,
+          sections: confirmedSections,
+          sources: readyEnabledSources(sources),
+          resume: Boolean(options.resume),
+        });
+        const finalText = await collectAgentText(
+          session.run({ content: prompt, recursion_limit: 32 }),
+          "Autonomous report Agent returned an empty response.",
+          { onFrame: assertAutonomousAgentToolAccess },
+        );
+        const final = parseJsonObject(finalText);
+        if (final?.status !== "completed" || final?.finalized !== true) {
+          throw new Error("Autonomous report Agent did not return a finalized completion result.");
+        }
+        if (runId !== runIdRef.current) return;
+        const refreshed = await api.getResearchJob(initialJob.research_id);
+        if (!refreshed || refreshed.status !== "completed" || !refreshed.result) {
+          throw new Error("Autonomous report Agent finished without finalizing the research job.");
+        }
+        const hydrated = await hydrateCompletedSectionResults(api, refreshed);
+        setJob(hydrated);
+        setResult(refreshed.result);
+        setLastCompletedJob(hydrated);
+        setLastCompletedResult(refreshed.result);
+        setRunEvents(projectStoredRunEvents(hydrated));
+        setSectionPreviews(projectSectionPreviews(hydrated));
+        void refreshHistoryJobs().catch(() => undefined);
+        setPhase("completed");
+      } catch (err) {
+        await api.updateResearchJob(initialJob.research_id, {
+          execution_mode: "autonomous_agent",
+          status: "failed",
+          stage: "failed",
+          error: { message: err instanceof Error ? err.message : String(err) },
+        }).then(setJob).catch(() => undefined);
+        setError(err);
+        setPhase("failed");
+      } finally {
+        await session?.delete().catch(() => undefined);
+      }
+    },
+    [api, job, refreshHistoryJobs, sources],
+  );
+
   const confirmOutlineAndRun = useCallback(
-    async (sections: ReportSection[]) => {
+    async (sections: ReportSection[], executionMode: "guided_sections" | "autonomous_agent" = "guided_sections") => {
       setRunEvents([]);
       setSectionPreviews([]);
-      await runConfirmedSections(sections);
+      if (executionMode === "autonomous_agent") await runAutonomousReport(sections);
+      else await runConfirmedSections(sections);
     },
-    [runConfirmedSections],
+    [runAutonomousReport, runConfirmedSections],
   );
 
   const previewSemanticRewriteSelection = useCallback(
@@ -800,9 +890,13 @@ export function useResearchJob(api: ResearchApi) {
       if (!baseJob) throw new Error("Research job was not found.");
       const hydratedJob = await hydrateCompletedSectionResults(api, baseJob);
       const sections = hydratedJob.confirmed_outline?.length ? hydratedJob.confirmed_outline : outlineDraft;
-      await runConfirmedSections(sections, { resume: true, baseJob: hydratedJob });
+      if (hydratedJob.execution_mode === "autonomous_agent") {
+        await runAutonomousReport(sections, { resume: true, baseJob: hydratedJob });
+      } else {
+        await runConfirmedSections(sections, { resume: true, baseJob: hydratedJob });
+      }
     },
-    [api, job, outlineDraft, runConfirmedSections],
+    [api, job, outlineDraft, runAutonomousReport, runConfirmedSections],
   );
 
   return {
@@ -857,6 +951,76 @@ function hasConfiguredSource(sources: ResearchSourceView[]): boolean {
 
 function readyEnabledSources(sources: ResearchSourceView[]): ResearchSourceView[] {
   return sources.filter((source) => source.enabled && source.credential_status === "configured");
+}
+
+function buildAutonomousReportPrompt(input: {
+  job: ResearchJob;
+  role: ConfirmedResearchRole;
+  focuses: string[];
+  sections: ReportSection[];
+  sources: ResearchSourceView[];
+  resume: boolean;
+}): string {
+  const completed = input.sections
+    .filter((section) => input.job.section_results?.[section.id]?.status === "completed")
+    .map((section) => ({
+      section_id: section.id,
+      summary: input.job.section_results?.[section.id]?.section_summary || "",
+    }));
+  const attachmentFiles = (input.job.attachment_context?.files || [])
+    .filter((file) => file.status === "ready")
+    .map((file) => ({
+      file_id: file.id,
+      file_name: file.name,
+      content_type: file.content_type,
+      summary: file.analysis?.summary || "",
+      relevance_score: file.analysis?.relevance_score,
+    }));
+  return [
+    "You are the autonomous report-generation Agent for Anna Researcher.",
+    "Complete the entire confirmed report in this single run by calling the bundled Anna Researcher tools.",
+    "Use ONLY these tools: agent_get_report_state, agent_search_section, agent_select_section_evidence, agent_checkpoint_section, agent_finalize_report.",
+    "Never call app_* methods, settings methods, credential methods, deletion methods, or unrelated host tools.",
+    "Do not merely explain what should be done. Perform every required tool call and finalize the job.",
+    "",
+    "Required workflow:",
+    "1. Call agent_get_report_state once and inspect completed checkpoints, the global citation registry, attachment summaries, and fact ledger.",
+    "2. Process every incomplete section in the exact outline order.",
+    "3. For each incomplete section, call agent_search_section with one allowed source and up to three focused queries. Respect max_iterations; prefer one strong search call per section.",
+    "4. Call agent_select_section_evidence. Its citation_map is authoritative for that section.",
+    "5. Write the complete section using only returned web_context and attachment_context. Cite only citation_map numbers such as [3].",
+    "6. Call agent_checkpoint_section immediately with section_markdown, section_summary, and a compact canonical facts list.",
+    "7. Keep terminology, dates, units, measurement definitions, and conclusions consistent across sections. Do not repeat analysis reserved for another section.",
+    "8. After all checkpoints, audit the whole report for contradictions, duplicated analysis, unsupported claims, terminology drift, dates, numbers, and citation validity.",
+    "9. Call agent_finalize_report with title, introduction, conclusion, and a concise consistency_audit. This call is mandatory.",
+    "10. Only after finalize succeeds, return exactly one JSON object and no Markdown: {\"status\":\"completed\",\"research_id\":\"...\",\"completed_sections\":0,\"finalized\":true}",
+    "",
+    `Research ID: ${input.job.research_id}`,
+    `Resume existing checkpoints: ${input.resume ? "yes" : "no"}`,
+    `Research task:\n${input.job.query || ""}`,
+    `Standing analyst role:\n${input.role.agent_role_prompt}`,
+    `Focuses:\n${input.focuses.map((focus) => `- ${focus}`).join("\n")}`,
+    `Available configured sources:\n${input.sources.map((source) => `- ${source.id}: ${source.name}`).join("\n")}`,
+    `Confirmed outline:\n${JSON.stringify(input.sections, null, 2)}`,
+    `Existing completed checkpoints:\n${JSON.stringify(completed, null, 2)}`,
+    `Uploaded attachment overview:\n${JSON.stringify(attachmentFiles, null, 2)}`,
+    `Uploaded-file evidence policy: ${ATTACHMENT_EVIDENCE_POLICY}`,
+  ].join("\n\n");
+}
+
+function assertAutonomousAgentToolAccess(frame: AnnaAgentRunFrame): void {
+  if (String(frame.event || "").toLowerCase() !== "run_meta") return;
+  const warnings = Array.isArray(frame.warnings) ? frame.warnings : [];
+  const noToolsWarning = warnings.some(
+    (warning) => warning && typeof warning === "object" && (warning as Record<string, unknown>).code === "NO_TOOLS_AVAILABLE",
+  );
+  const grantedTools = Array.isArray(frame.granted_tools) ? frame.granted_tools : null;
+  const inheritsHostTools = frame.inherit_host_tools === true || grantedTools?.includes("*") === true;
+  if (noToolsWarning || (grantedTools !== null && grantedTools.length === 0 && !inheritsHostTools)) {
+    throw new Error(
+      'Autonomous report Agent run has no researcher tools. Enable "Let agent sessions use my tools" for this app and verify the Researcher Executa is installed.',
+    );
+  }
 }
 
 function roleCandidatesFromJob(job: ResearchJob | null | undefined): RoleCandidate[] {

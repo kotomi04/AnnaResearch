@@ -239,6 +239,77 @@ def test_result_transfer_http(tmp_path: Path):
         assert_true(exc.code == 400, "blank report should return 400")
 
 
+def test_autonomous_agent_tools(tmp_path: Path):
+    os.environ["ANNA_RESEARCHER_FAKE_TAVILY"] = "1"
+    dispatcher = make_dispatcher(tmp_path)
+    job = dispatcher.dispatch("app_create_research_job", {"query": "autonomous anna report"})["job"]
+    research_id = job["research_id"]
+    dispatcher.dispatch("app_save_confirmed_research_role", {
+        "research_id": research_id,
+        "role": {"server": "Analyst", "agent_role_prompt": "Use precise evidence."},
+    })
+    dispatcher.dispatch("app_save_confirmed_research_focuses", {"research_id": research_id, "focuses": ["market"]})
+    dispatcher.dispatch("app_save_confirmed_research_outline", {
+        "research_id": research_id,
+        "sections": [{
+            "id": "section-1",
+            "title": "Market",
+            "outline": "Analyze the market evidence.",
+            "allowed_source_ids": ["tavily"],
+            "max_iterations": 1,
+        }],
+    })
+    dispatcher.dispatch("app_update_research_job", {"research_id": research_id, "updates": {"execution_mode": "autonomous_agent"}})
+
+    state = dispatcher.dispatch("agent_get_report_state", {"research_id": research_id})
+    assert_true(state["outline"][0]["id"] == "section-1", "agent state should expose the confirmed outline")
+    searched = dispatcher.dispatch("agent_search_section", {
+        "research_id": research_id,
+        "section_id": "section-1",
+        "source_id": "tavily",
+        "iteration": 1,
+        "queries": ["anna market evidence"],
+    })
+    assert_true(searched["evidence"], "agent search should return bounded evidence")
+    selected = dispatcher.dispatch("agent_select_section_evidence", {
+        "research_id": research_id,
+        "section_id": "section-1",
+        "_attachment_selection": {"selected_context": "", "selected_items": []},
+    })
+    assert_true(selected["citation_map"], "agent evidence selection should assign global citations")
+    try:
+        dispatcher.dispatch("agent_checkpoint_section", {
+            "research_id": research_id,
+            "section_id": "section-1",
+            "section_markdown": "## Market\n\nInvalid evidence [99].",
+            "section_summary": "Invalid",
+        })
+        raise AssertionError("checkpoint should reject citations outside the section map")
+    except ValidationError:
+        pass
+    checkpoint = dispatcher.dispatch("agent_checkpoint_section", {
+        "research_id": research_id,
+        "section_id": "section-1",
+        "section_markdown": "## Market\n\nSupported autonomous evidence [1].",
+        "section_summary": "Supported summary",
+        "facts": [{"key": "market_signal", "value": "positive", "citation_numbers": [1]}],
+    })
+    assert_true(checkpoint["status"] == "completed", "agent checkpoint should persist a section")
+    finalized = dispatcher.dispatch("agent_finalize_report", {
+        "research_id": research_id,
+        "title": "Autonomous Report",
+        "introduction": "Introduction.",
+        "conclusion": "Conclusion.",
+        "consistency_audit": "Checked terminology, numbers, duplication, and citations.",
+    })
+    assert_true(finalized["status"] == "completed", "agent finalize should complete the job")
+    loaded = dispatcher.jobs.load(research_id)
+    assert_true(loaded["status"] == "completed", "finalized autonomous job should be completed")
+    assert_true("Supported autonomous evidence [1]" in loaded["report_markdown"], "final report should use checkpointed section markdown")
+    assert_true(loaded["execution_mode"] == "autonomous_agent", "autonomous execution mode should persist")
+    assert_true(len(loaded["agent_fact_ledger"]) == 1, "checkpoint facts should persist in the global ledger")
+
+
 def test_section_large_payload_transfer(tmp_path: Path):
     os.environ["ANNA_RESEARCHER_FAKE_TAVILY"] = "1"
     dispatcher = make_dispatcher(tmp_path)
@@ -431,13 +502,17 @@ def test_plugin_contract(tmp_path: Path):
         describe = plugin.call("describe")
         tools = [tool["name"] for tool in describe["result"]["tools"]]
         assert_true(describe["result"]["name"] == "tool-xhz-researcher-python-e7k8xa3s", "describe should advertise tool")
-        assert_true(describe["result"]["version"] == "0.2.3", "describe should advertise breaking version")
+        assert_true(describe["result"]["version"] == "0.2.4", "describe should advertise autonomous tool version")
         assert_true("research" not in tools, "legacy research method should be absent")
         assert_true("app_search_web" not in tools, "legacy app_search_web must be removed")
         assert_true("app_call_research_source" in tools, "new app_call_research_source must be advertised")
         assert_true("app_list_research_sources" in tools, "new app_list_research_sources must be advertised")
         assert_true("app_test_research_source" in tools, "source test method must be advertised")
-        assert_true(all(name.startswith("app_") for name in tools), "all methods should be app methods")
+        assert_true(all(name.startswith(("app_", "agent_")) for name in tools), "all methods should be app or agent methods")
+        assert_true("agent_finalize_report" in tools, "autonomous finalize method must be advertised")
+        agent_search = next(tool for tool in describe["result"]["tools"] if tool["name"] == "agent_search_section")
+        assert_true(any(parameter["name"] == "section_id" and parameter["required"] for parameter in agent_search["parameters"]), "agent tools should advertise precise parameters")
+        assert_true(agent_search["timeout"] == 300, "agent search should allow long source calls")
         health = plugin.call("health")
         assert_true(health["result"]["status"] == "healthy", "health should pass")
         settings = plugin.call("invoke", {"tool": "app_get_settings", "arguments": {}})
@@ -463,9 +538,11 @@ def test_bundle_contract():
     bundle_js = "\n".join(path.read_text(encoding="utf-8") for path in (APP_ROOT / "bundle").glob("assets/*.js"))
     manifest = json.loads((APP_ROOT / "manifest.json").read_text(encoding="utf-8"))
     assert_true(manifest["required_executas"][0]["tool_id"] == "bundled:researcher", "manifest should reference bundled researcher tool")
-    assert_true(manifest["required_executas"][0]["min_version"] == "0.2.3", "manifest should require tool 0.2.3")
+    assert_true(manifest["required_executas"][0]["min_version"] == "0.2.4", "manifest should require autonomous-capable tool 0.2.4")
     assert_true(manifest["ui"]["host_api"]["llm"] == ["complete", "embed"], "manifest should authorize llm.complete and llm.embed")
     assert_true(manifest["ui"]["host_api"]["agent"]["session"]["auto"] is True, "manifest should authorize agent auto sessions")
+    assert_true(manifest["ui"]["host_api"]["agent"]["tools"] == ["tool-xhz-researcher-python-e7k8xa3s"], "manifest should grant the concrete researcher tool to autonomous sessions")
+    assert_true("host.agent" in manifest["permissions"], "manifest should request host.agent permission")
     assert_true('method:"research"' not in bundle_js and 'method: "research"' not in bundle_js, "bundle should not call legacy research method")
     assert_true('"action":"advance"' not in bundle_js and 'action:"advance"' not in bundle_js, "bundle should not contain legacy advance action")
     assert_true("app_search_web" not in bundle_js, "bundle should not reference legacy app_search_web")
@@ -502,6 +579,7 @@ def main():
         ("image_attachment_analysis", test_image_attachment_analysis_context),
         ("call_research_source", test_call_research_source_context_result),
         ("result_transfer_http", test_result_transfer_http),
+        ("autonomous_agent_tools", test_autonomous_agent_tools),
         ("section_large_payload_transfer", test_section_large_payload_transfer),
         ("call_requires_credential", test_call_research_source_requires_credential),
         ("source_test_transfer", test_source_test_transfer),

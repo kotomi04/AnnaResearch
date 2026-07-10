@@ -66,6 +66,7 @@ function PdfPreviewContent({ url, t }: Pick<Props, "url" | "t">) {
 
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
     setStatus("loading");
     setErrorMessage("");
     setDocument(null);
@@ -74,11 +75,17 @@ function PdfPreviewContent({ url, t }: Pick<Props, "url" | "t">) {
 
     let loadingTask: { destroy(): Promise<void>; promise: Promise<PDFDocumentProxy> } | null = null;
     let loadedDocument: PDFDocumentProxy | null = null;
-    void import("pdfjs-dist").then(
-      (pdfjs) => {
+    void Promise.all([
+      import("pdfjs-dist"),
+      fetch(url, { signal: controller.signal }).then(async (response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return new Uint8Array(await response.arrayBuffer());
+      }),
+    ]).then(
+      ([pdfjs, data]) => {
         if (cancelled) return;
         pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
-        loadingTask = pdfjs.getDocument({ url });
+        loadingTask = pdfjs.getDocument({ data });
         return loadingTask.promise.then(
           (nextDocument) => {
             if (cancelled) {
@@ -98,7 +105,7 @@ function PdfPreviewContent({ url, t }: Pick<Props, "url" | "t">) {
         );
       },
       (error) => {
-        if (cancelled) return;
+        if (cancelled || error?.name === "AbortError") return;
         setStatus("error");
         setErrorMessage(error instanceof Error ? error.message : String(error));
       },
@@ -106,6 +113,7 @@ function PdfPreviewContent({ url, t }: Pick<Props, "url" | "t">) {
 
     return () => {
       cancelled = true;
+      controller.abort();
       cancelRenderTask(renderTaskRef.current);
       renderTaskRef.current = null;
       window.setTimeout(() => {

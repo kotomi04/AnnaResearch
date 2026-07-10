@@ -1,13 +1,14 @@
 {
   "schema": 2,
   "permissions": [
+    "host.agent",
     "tools.invoke",
     "ui.svg"
   ],
   "required_executas": [
     {
       "tool_id": "bundled:researcher",
-      "min_version": "0.2.3",
+      "min_version": "0.2.4",
       "version": "latest"
     }
   ],
@@ -43,7 +44,7 @@
       "llm": ["complete", "embed"],
       "agent": {
         "session": { "auto": true, "fixed": null },
-        "tools": []
+        "tools": ["tool-xhz-researcher-python-e7k8xa3s"]
       },
       "files": ["upload_init", "upload_finalize", "download_url", "list", "delete"],
       "fs": [],
@@ -58,7 +59,7 @@
         "http://127.0.0.1:*",
         "http://localhost:*"
       ],
-      "img-src": ["'self'", "data:", "blob:"],
+      "img-src": ["'self'", "data:", "blob:", "https:"],
       "font-src": ["'self'", "data:"],
       "style-src": ["'self'"],
       "script-src": ["'self'"]

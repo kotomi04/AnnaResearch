@@ -3,11 +3,13 @@ import type { AnnaAgentRunFrame } from "../types";
 export async function collectAgentText(
   stream: AsyncIterable<AnnaAgentRunFrame>,
   emptyMessage = "Anna Agent returned an empty response.",
+  options: { onFrame?: (frame: AnnaAgentRunFrame) => void } = {},
 ): Promise<string> {
   let streamedText = "";
   let finalText = "";
 
   for await (const frame of stream) {
+    options.onFrame?.(frame);
     const event = String(frame.event || "").toLowerCase();
     if (event === "raw" && frame.text?.trim() === "[DONE]") break;
     if (event === "tool_call" || event === "tool_result") continue;

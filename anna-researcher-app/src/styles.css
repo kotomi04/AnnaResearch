@@ -2481,6 +2481,33 @@ button.danger {
   gap: 12px;
 }
 
+.outline-generation-mode {
+  padding: 14px 16px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  background: #f8fafc;
+}
+
+.outline-generation-mode .checkbox-row {
+  align-items: flex-start;
+}
+
+.outline-generation-mode span {
+  display: grid;
+  gap: 3px;
+}
+
+.outline-generation-mode strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.outline-generation-mode small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .outline-review-card {
   padding: 15px;
 }

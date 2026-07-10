@@ -4,6 +4,7 @@ import ReactMarkdown from "react-markdown";
 import type { MessageKey } from "../i18n/messages";
 import type { CitationSource, ResearchResult, SearchResult } from "../types";
 import { SourceList } from "./SourceList";
+import { SourceSiteIcon } from "./SourceSiteIcon";
 
 interface Props {
   result: ResearchResult | null;
@@ -480,8 +481,6 @@ function CitationCard({
   const host = hostFromUrl(url);
   const title = source?.title || url;
   const snippet = source?.content ? compactSnippet(source.content) : "";
-  const icon = source?.icon || "";
-  const showIcon = Boolean(icon);
   const fallbackInitial = (host || title || url || "S").trim().charAt(0).toUpperCase() || "S";
 
   return (
@@ -506,7 +505,13 @@ function CitationCard({
       </div>
       <a className="citation-card-body" href={url} target="_blank" rel="noreferrer noopener">
         <span className="citation-card-host">
-          {showIcon ? <img className="citation-card-icon" src={icon} alt="" aria-hidden="true" /> : <span className="citation-card-site-mark" aria-hidden="true">{fallbackInitial}</span>}
+          <SourceSiteIcon
+            host={host}
+            icon={source?.icon}
+            imageClassName="citation-card-icon"
+            fallbackClassName="citation-card-site-mark"
+            fallbackText={fallbackInitial}
+          />
           {host || "Source"}
         </span>
         <strong>{title}</strong>

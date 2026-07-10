@@ -54,7 +54,7 @@ def test_describe_v2_app_methods_only(tmp_path):
         assert init["result"]["capabilities"] == {"sampling": {}}
         describe = plugin.call("describe")
         assert describe["result"]["name"] == "tool-xhz-researcher-python-e7k8xa3s"
-        assert describe["result"]["version"] == "0.2.3"
+        assert describe["result"]["version"] == "0.2.4"
         assert describe["result"]["host_capabilities"] == ["llm.embed", "llm.sample"]
         tools = [tool["name"] for tool in describe["result"]["tools"]]
         assert "research" not in tools
@@ -64,7 +64,9 @@ def test_describe_v2_app_methods_only(tmp_path):
         assert "app_list_research_sources" in tools
         assert "app_test_research_source" in tools
         assert "app_update_research_source_credential" in tools
-        assert all(name.startswith("app_") for name in tools)
+        assert all(name.startswith(("app_", "agent_")) for name in tools)
+        assert "agent_get_report_state" in tools
+        assert "agent_finalize_report" in tools
         health = plugin.call("health")
         assert health["result"]["status"] == "healthy"
     finally:

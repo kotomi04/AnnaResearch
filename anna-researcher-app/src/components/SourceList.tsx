@@ -1,5 +1,6 @@
 import type { MessageKey } from "../i18n/messages";
 import type { CitationSource, SearchResult } from "../types";
+import { SourceSiteIcon } from "./SourceSiteIcon";
 
 interface Props {
   urls: string[];
@@ -42,7 +43,13 @@ export function SourceList({ urls, sources = [], citationSources, t, onAttachmen
             return (
               <li key={reference.url}>
                 <span className="reference-index" aria-label={`Reference ${index + 1}`}>[{index + 1}]</span>
-                {source?.icon ? <img className="reference-icon" src={source.icon} alt="" aria-hidden="true" /> : <span className="reference-site-mark" aria-hidden="true">{fallbackInitial}</span>}
+                <SourceSiteIcon
+                  host={host}
+                  icon={source?.icon}
+                  imageClassName="reference-icon"
+                  fallbackClassName="reference-site-mark"
+                  fallbackText={fallbackInitial}
+                />
                 <a href={reference.url} target="_blank" rel="noreferrer noopener">
                   {source?.title || reference.url}
                 </a>

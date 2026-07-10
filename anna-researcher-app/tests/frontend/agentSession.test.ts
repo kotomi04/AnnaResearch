@@ -41,6 +41,18 @@ describe("collectAgentText", () => {
       "empty section",
     );
   });
+
+  it("exposes every frame to an observer", async () => {
+    const observed: string[] = [];
+    const text = await collectAgentText(
+      frames({ event: "run_meta", granted_tools: ["researcher:*"], text: "ignored" }, { event: "final", text: "done" }),
+      "empty",
+      { onFrame: (frame) => observed.push(String(frame.event)) },
+    );
+
+    expect(text).toBe("done");
+    expect(observed).toEqual(["run_meta", "final"]);
+  });
 });
 
 async function* frames(...items: AnnaAgentRunFrame[]): AsyncIterable<AnnaAgentRunFrame> {
