@@ -31,13 +31,13 @@ describe("AnnaResearchApi", () => {
     await expect(new AnnaResearchApi(anna).createAgentSession()).rejects.toThrow("Anna Agent API is unavailable for section generation.");
   });
 
-  it("uses explicit app tool methods including app_call_research_source", async () => {
+  it("uses the production app tool methods", async () => {
     const calls: unknown[] = [];
     const anna: AnnaRuntimeApi = {
       tools: {
         async invoke(request, options) {
           calls.push(options ? [request, options] : request);
-          if (request.method === "app_get_settings" || request.method === "app_update_settings") {
+          if (request.method === "app_get_settings") {
             return { success: true, data: { settings: { tavily: { configured: true, masked: "***test" } } } };
           }
           if (request.method === "app_list_research_sources") {
@@ -89,24 +89,6 @@ describe("AnnaResearchApi", () => {
           if (request.method === "app_list_research_jobs") {
             return { success: true, data: { jobs: [{ research_id: "r1", status: "running" }] } };
           }
-          if (request.method === "app_call_research_source") {
-            return {
-              success: true,
-              data: {
-                job: { research_id: "r1" },
-                source_call: {
-                  source_id: "tavily",
-                  source_name: "Tavily",
-                  queries: ["anna"],
-                  results_count: 1,
-                  top_titles: ["x"],
-                  duration_ms: 4,
-                  error: null,
-                  calls: [],
-                },
-              },
-            };
-          }
           if (request.method === "app_test_research_source") {
             return {
               success: true,
@@ -115,16 +97,13 @@ describe("AnnaResearchApi", () => {
               },
             };
           }
-          if (request.method === "app_select_context") {
+          if (request.method === "app_select_section_context") {
             return {
               success: true,
-              data: { context_transfer: { method: "GET", url: "http://127.0.0.1:43123/contexts/r1", content_type: "application/json" } },
-            };
-          }
-          if (request.method === "app_save_research_result") {
-            return {
-              success: true,
-              data: { transfer: { method: "POST", url: "http://127.0.0.1:43123/research-results/r1", content_type: "application/json" } },
+              data: {
+                job: { research_id: "r1" },
+                context_transfer: { method: "GET", url: "http://127.0.0.1:43123/section-contexts/r1/section-1", content_type: "application/json" },
+              },
             };
           }
           if (request.method === "app_save_report_framing") {
@@ -148,12 +127,6 @@ describe("AnnaResearchApi", () => {
     const fetchCalls: unknown[] = [];
     globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
       fetchCalls.push([url, init]);
-      if (String(url).includes("/contexts/")) {
-        return new Response(JSON.stringify({ selected_context: "context", selected_sources: [], source_urls: ["https://example.com/context"] }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
       if (String(url).includes("/jobs/")) {
         return new Response(JSON.stringify({ job: { research_id: "r1", status: "running", iterations: [], source_urls: [] } }), {
           status: 200,
@@ -189,7 +162,6 @@ describe("AnnaResearchApi", () => {
     }) as typeof fetch;
     try {
       await api.getSettings();
-      await api.updateSettings({ tavily_api_key: "tvly-test" });
       await api.listResearchSources();
       await api.updateResearchSourceCredential({ id: "tavily", credential: "tvly-test" });
       await api.createResearchJob({ query: "anna" });
@@ -207,18 +179,12 @@ describe("AnnaResearchApi", () => {
       await api.getResearchJob("r1");
       await api.listResearchJobs({ limit: 20 });
       await api.testResearchSource({ id: "tavily", definition: { id: "tavily" }, query: "anna" });
-      await api.callResearchSource({ research_id: "r1", iteration: 1, source_id: "tavily", queries: ["anna"] });
-      await api.selectContext({ research_id: "r1" });
       await api.saveReportFraming({
         research_id: "r1",
         framing: { title: "Report", introduction: "large intro", conclusion: "large conclusion" },
       });
-      const transfer = await api.saveResearchResult({ research_id: "r1" });
-      await api.uploadResearchResult(transfer, { report_markdown: "# Report", source_urls: ["https://example.com"] });
-
       expect(calls).toEqual([
         { tool_id: TOOL_ID, method: "app_get_settings", args: {} },
-        { tool_id: TOOL_ID, method: "app_update_settings", args: { tavily_api_key: "tvly-test" } },
         { tool_id: TOOL_ID, method: "app_list_research_sources", args: {} },
         { tool_id: TOOL_ID, method: "app_update_research_source_credential", args: { id: "tavily", credential: "tvly-test" } },
         { tool_id: TOOL_ID, method: "app_create_research_job", args: { query: "anna" } },
@@ -251,21 +217,13 @@ describe("AnnaResearchApi", () => {
         { tool_id: TOOL_ID, method: "app_get_research_job", args: { research_id: "r1" } },
         { tool_id: TOOL_ID, method: "app_list_research_jobs", args: { limit: 20 } },
         { tool_id: TOOL_ID, method: "app_test_research_source", args: { id: "tavily", definition: { id: "tavily" }, query: "anna" } },
-        {
-          tool_id: TOOL_ID,
-          method: "app_call_research_source",
-          args: { research_id: "r1", iteration: 1, source_id: "tavily", queries: ["anna"] },
-        },
-        { tool_id: TOOL_ID, method: "app_select_context", args: { research_id: "r1" } },
         { tool_id: TOOL_ID, method: "app_save_report_framing", args: { research_id: "r1" } },
-        { tool_id: TOOL_ID, method: "app_save_research_result", args: { research_id: "r1" } },
       ]);
       expect(JSON.stringify(calls)).not.toContain("large intro");
-      expect(fetchCalls).toHaveLength(5);
+      expect(fetchCalls).toHaveLength(3);
       expect(fetchCalls[0]).toEqual(["http://127.0.0.1:43123/jobs/r1", { method: "GET" }]);
       expect(fetchCalls[1]).toEqual(["http://127.0.0.1:43123/source-tests/t1", { method: "GET" }]);
-      expect(fetchCalls[2]).toEqual(["http://127.0.0.1:43123/contexts/r1", { method: "GET" }]);
-      expect(fetchCalls[3]).toEqual([
+      expect(fetchCalls[2]).toEqual([
         "http://127.0.0.1:43123/report-framings/r1",
         {
           method: "POST",
@@ -276,7 +234,6 @@ describe("AnnaResearchApi", () => {
           }),
         },
       ]);
-      expect(JSON.stringify(fetchCalls[4])).toContain("# Report");
     } finally {
       globalThis.fetch = oldFetch;
     }
@@ -509,6 +466,9 @@ describe("AnnaResearchApi", () => {
     globalThis.fetch = (async () =>
       new Response(
         JSON.stringify({
+          selected_context: "",
+          selected_sources: [],
+          source_urls: [],
           test: {
             source_id: "duckduckgo",
             source_name: "DuckDuckGo",
@@ -526,7 +486,7 @@ describe("AnnaResearchApi", () => {
       const api = new AnnaResearchApi(anna);
       await api.embedAttachmentChunks("r1");
       await api.summarizeAttachments("r1", { query: "anna", top_k: 6 });
-      await api.callResearchSource({ research_id: "r1", iteration: 1, source_id: "duckduckgo", queries: ["anna"] });
+      await api.selectSectionContext({ research_id: "r1", section_id: "section-1" });
       await api.callSectionResearchSource({
         research_id: "r1",
         section_id: "section-1",
@@ -558,8 +518,8 @@ describe("AnnaResearchApi", () => {
         [
           {
             tool_id: TOOL_ID,
-            method: "app_call_research_source",
-            args: { research_id: "r1", iteration: 1, source_id: "duckduckgo", queries: ["anna"] },
+            method: "app_select_section_context",
+            args: { research_id: "r1", section_id: "section-1" },
             timeoutMs: 300000,
           },
           { timeoutMs: 300000 },

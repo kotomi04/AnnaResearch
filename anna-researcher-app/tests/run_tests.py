@@ -5,7 +5,8 @@ import os
 import subprocess
 import sys
 import tempfile
-import urllib.error
+import threading
+import time
 import urllib.request
 from pathlib import Path
 
@@ -15,8 +16,11 @@ TOOL_DIR = REPO_ROOT / "researcher-tool"
 sys.path.insert(0, str(TOOL_DIR))
 
 from researcher_tool.context_selector import LexicalContextSelector  # noqa: E402
+from researcher_tool import attachment_embeddings as attachment_embeddings_module  # noqa: E402
 from researcher_tool.dispatcher import AppDispatcher  # noqa: E402
-from researcher_tool.errors import ConfigurationError, NotFoundError, ValidationError  # noqa: E402
+from researcher_tool.attachment_embeddings import embed_attachment_chunks  # noqa: E402
+from researcher_tool.embedding import MAX_PARALLEL_EMBEDDING_BATCHES, AnnaEmbeddingsClient, EmbeddingBatchOutcome, EmbeddingsError  # noqa: E402
+from researcher_tool.errors import NotFoundError, ValidationError  # noqa: E402
 from researcher_tool.job_store import JobStore  # noqa: E402
 from researcher_tool.attachment_summary import select_attachment_context  # noqa: E402
 from researcher_tool.settings import SettingsStore  # noqa: E402
@@ -34,8 +38,18 @@ def make_dispatcher(tmp_path: Path) -> AppDispatcher:
 
 
 class FakeEmbeddings:
+    def __init__(self):
+        self.wave_sizes = []
+
     def create(self, *, texts, model="anna-managed-v1", timeout=30.0):
         return {"data": [{"embedding": [1.0, float(index + 1)]} for index, _ in enumerate(texts)], "_meta": {"dimensions": 2}}
+
+    def create_batches(self, *, batches, model="anna-managed-v1", timeout=30.0):
+        return [self.create(texts=batch, model=model, timeout=timeout) for batch in batches]
+
+    def create_batches_settled(self, *, batches, model="anna-managed-v1", timeout=30.0):
+        self.wave_sizes.append(len(batches))
+        return [EmbeddingBatchOutcome(result=self.create(texts=batch, model=model, timeout=timeout)) for batch in batches]
 
 
 def test_settings(tmp_path: Path):
@@ -43,11 +57,6 @@ def test_settings(tmp_path: Path):
     settings = dispatcher.dispatch("app_get_settings", {})["settings"]
     assert_true(settings["tavily"]["configured"] is False, "settings should start unconfigured")
     assert_true(settings["research_root"] == str(tmp_path / ".research"), "settings should expose actual research root")
-    updated = dispatcher.dispatch("app_update_settings", {"tavily_api_key": "tvly-test-secret"})["settings"]
-    assert_true(updated["tavily"]["configured"] is True, "settings should become configured")
-    assert_true("secret" not in updated["tavily"]["masked"], "settings should mask key")
-    cleared = dispatcher.dispatch("app_update_settings", {"clear_tavily_api_key": True})["settings"]
-    assert_true(cleared["tavily"]["configured"] is False, "settings should clear")
 
 
 def test_job_shell(tmp_path: Path):
@@ -76,11 +85,11 @@ def test_job_shell(tmp_path: Path):
         "job store should not maintain a latest_research_id file",
     )
     loaded_status = dispatcher.dispatch("app_get_research_job", {})["job"]
-    assert_true(loaded_status["schema_version"] == 3, "get job without id should return the most recently updated compact job")
+    assert_true(loaded_status["schema_version"] == 4, "get job without id should return the most recently updated compact job")
     assert_true(all("raw_results" not in it for it in loaded_status["iterations"]), "compact stdio job should not expose raw_results")
     loaded = get_json(loaded_status["job_transfer"]["url"])["job"] if loaded_status.get("job_transfer") else loaded_status
     assert_true(loaded["research_id"] == job["research_id"], "latest job should load")
-    assert_true(loaded["schema_version"] == 3, "loaded job should advertise v3")
+    assert_true(loaded["schema_version"] == 4, "loaded job should advertise v4")
     updated = dispatcher.dispatch(
         "app_update_research_job",
         {
@@ -177,137 +186,121 @@ def test_image_attachment_analysis_context(tmp_path: Path):
     assert_true("Revenue rises across the chart." in selected["selected_context"], "selected image summary should include observations")
 
 
-def test_call_research_source_context_result(tmp_path: Path):
-    os.environ["ANNA_RESEARCHER_FAKE_TAVILY"] = "1"
-    dispatcher = make_dispatcher(tmp_path)
-    job = dispatcher.dispatch("app_create_research_job", {"query": "anna researcher"})["job"]
-    research_id = job["research_id"]
-    call = dispatcher.dispatch(
-        "app_call_research_source",
-        {"research_id": research_id, "iteration": 1, "source_id": "tavily", "queries": ["anna researcher", "anna app research"]},
-    )
-    assert_true(call["source_call"]["results_count"] > 0, "call should return synthetic results")
-    assert_true(all("items" not in c for c in call["source_call"]["calls"]), "items must be stripped from public payload")
-    selected = dispatcher.dispatch("app_select_context", {"research_id": research_id})
-    assert_true("selected_context" not in selected, "context should not return through stdio")
-    context = get_json(selected["context_transfer"]["url"])
-    assert_true(bool(context["selected_context"]), "context should be selected")
-    assert_true("[来源:" in context["selected_context"], "context items must carry source prefix")
-    transfer = dispatcher.dispatch("app_save_research_result", {"research_id": research_id})["transfer"]
-    assert_true(transfer["method"] == "POST", "save should return transfer descriptor")
-    saved = post_json(transfer["url"], {"report_markdown": "# Research Report\n\nDone", "source_urls": context["source_urls"]})
-    assert_true(saved["result"]["report_markdown"].startswith("# Research Report"), "result should persist")
-    assert_true("sources" in saved["result"], "http result should include source metadata for citation cards")
-    immediate = dispatcher.dispatch("app_get_research_job", {"research_id": research_id})["job"]
-    assert_true(immediate["iterations"], "get job stdio response should include compact iterations for fallback")
-    assert_true(all("raw_results" not in it for it in immediate["iterations"]), "get job stdio response should not expose raw_results")
-    assert_true(immediate["source_count"] == len(context["source_urls"]), "get job stdio response should expose source count without inlining all urls")
-    assert_true("source_urls" not in immediate, "get job stdio response should omit source_urls instead of returning an empty list")
-    assert_true("research_log" not in immediate, "get job stdio response should omit research_log instead of returning an empty list")
-    assert_true("report_markdown" not in immediate["result"], "get job stdio response should not inline full result markdown")
-    assert_true(immediate["job_transfer"]["method"] == "GET", "get job should expose job transfer")
-    loaded = get_json(immediate["job_transfer"]["url"])["job"]
-    assert_true("report_markdown" not in loaded["result"], "loaded job should not include full result markdown")
-    assert_true("source_urls" not in loaded, "loaded compact job should omit source_urls")
-    assert_true("research_log" not in loaded, "loaded compact job should omit research_log")
-    assert_true(immediate["result_transfer"]["method"] == "GET", "completed job status should expose result transfer")
-    restored = get_json(immediate["result_transfer"]["url"])
-    assert_true(restored["result"]["report_markdown"].startswith("# Research Report"), "result transfer should restore markdown")
-    assert_true("search_results" not in loaded, "loaded job should be compact")
-    assert_true(loaded["iterations"], "loaded job should expose iterations")
-    assert_true(all("raw_results" not in it for it in loaded["iterations"]), "raw_results must never leave the backend")
+def test_concurrent_attachment_embeddings(tmp_path: Path):
+    original_retry_delay = attachment_embeddings_module.EMBEDDING_RETRY_DELAY_SECONDS
+    attachment_embeddings_module.EMBEDDING_RETRY_DELAY_SECONDS = 0
+    class TrackingEmbeddingsClient(AnnaEmbeddingsClient):
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.first_wave = threading.Barrier(MAX_PARALLEL_EMBEDDING_BATCHES)
+            self.active = 0
+            self.max_active = 0
 
+        def create(self, *, texts, model="anna-managed-v1", timeout=30.0):
+            batch_index = int(texts[0].removeprefix("batch-"))
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                if batch_index < MAX_PARALLEL_EMBEDDING_BATCHES:
+                    self.first_wave.wait(timeout=2)
+                    time.sleep((MAX_PARALLEL_EMBEDDING_BATCHES - batch_index) * 0.002)
+                return {"batch_index": batch_index, "data": [{"embedding": [float(batch_index)]}]}
+            finally:
+                with self.lock:
+                    self.active -= 1
 
-def test_result_transfer_http(tmp_path: Path):
+    client = TrackingEmbeddingsClient()
+    batches = [[f"batch-{index}"] for index in range(MAX_PARALLEL_EMBEDDING_BATCHES + 1)]
+    results = client.create_batches(batches=batches)
+    assert_true(client.max_active == MAX_PARALLEL_EMBEDDING_BATCHES, "embedding batches should cap concurrency at eight")
+    assert_true([result["batch_index"] for result in results] == list(range(len(batches))), "embedding batch results should preserve input order")
+    assert_true(client.create_batches(batches=[]) == [], "empty embedding batches should not start workers")
+
     dispatcher = make_dispatcher(tmp_path)
-    job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
-    immediate = dispatcher.dispatch("app_get_research_job", {"research_id": job["research_id"]})["job"]
-    assert_true(immediate["job_transfer"]["url"].startswith("http://127.0.0.1:"), "job transfer should use local http")
-    assert_true(get_json(immediate["job_transfer"]["url"])["job"]["research_id"] == job["research_id"], "job transfer should return compact job")
-    first = dispatcher.dispatch("app_save_research_result", {"research_id": job["research_id"]})["transfer"]
-    second = dispatcher.dispatch("app_save_research_result", {"research_id": job["research_id"]})["transfer"]
-    assert_true(first["url"] == second["url"], "transfer server should be singleton")
-    options = urllib.request.Request(first["url"], method="OPTIONS")
-    with urllib.request.urlopen(options, timeout=5) as response:
-        assert_true(response.status == 204, "preflight should succeed")
-        assert_true(response.headers["Access-Control-Allow-Origin"] == "*", "cors should allow any origin")
-        assert_true(response.headers["Access-Control-Allow-Private-Network"] == "true", "private network preflight should be allowed")
+    job = dispatcher.dispatch("app_create_research_job", {"query": "embedding concurrency"})["job"]
+    context = {
+        "version": 1,
+        "prepared_at": "now",
+        "files": [],
+        "summary": "",
+        "chunks": [
+            {"chunk_id": f"file-1:{index + 1:04d}", "file_id": "file-1", "file_name": "brief.md", "index": index + 1, "text": f"chunk {index + 1}"}
+            for index in range(3)
+        ],
+    }
+    dispatcher.jobs.update_metadata(job["research_id"], {"attachment_context": context})
+
+    class ShortResultEmbeddings(FakeEmbeddings):
+        def create_batches_settled(self, *, batches, model="anna-managed-v1", timeout=30.0):
+            return [
+                EmbeddingBatchOutcome(result=self.create(texts=batch, model=model, timeout=timeout))
+                if index == 0
+                else EmbeddingBatchOutcome(result={"data": []})
+                for index, batch in enumerate(batches)
+            ]
+
+    transient = ShortResultEmbeddings()
+    embed_attachment_chunks(jobs=dispatcher.jobs, embeddings=transient, research_id=job["research_id"])
+    loaded = dispatcher.jobs.load(job["research_id"])["attachment_context"]
+    assert_true(loaded["embedding_status"] == "ready", "automatic retry should complete transiently failed chunks")
+    assert_true(all(chunk.get("embedding") for chunk in loaded["chunks"]), "automatic retry should preserve prior vectors and fill missing vectors")
+
+    persistent_job = dispatcher.dispatch("app_create_research_job", {"query": "persistent embedding failure"})["job"]
+    persistent_context = {
+        "version": 1,
+        "prepared_at": "now",
+        "files": [],
+        "summary": "",
+        "chunks": [
+            {
+                "chunk_id": f"file-2:{index + 1:04d}",
+                "file_id": "file-2",
+                "file_name": "persistent.md",
+                "index": index + 1,
+                "text": f"chunk {index + 1}",
+            }
+            for index in range(3)
+        ],
+    }
+    dispatcher.jobs.update_metadata(persistent_job["research_id"], {"attachment_context": persistent_context})
+
+    class PersistentFailureEmbeddings(FakeEmbeddings):
+        def create_batches_settled(self, *, batches, model="anna-managed-v1", timeout=30.0):
+            return [
+                EmbeddingBatchOutcome(result={"data": []})
+                if "chunk 3" in batch
+                else EmbeddingBatchOutcome(result=self.create(texts=batch, model=model, timeout=timeout))
+                for batch in batches
+            ]
+
     try:
-        post_json(first["url"], {"report_markdown": " "})
-        raise AssertionError("blank report should fail")
-    except urllib.error.HTTPError as exc:
-        assert_true(exc.code == 400, "blank report should return 400")
-
-
-def test_autonomous_agent_tools(tmp_path: Path):
-    os.environ["ANNA_RESEARCHER_FAKE_TAVILY"] = "1"
-    dispatcher = make_dispatcher(tmp_path)
-    job = dispatcher.dispatch("app_create_research_job", {"query": "autonomous anna report"})["job"]
-    research_id = job["research_id"]
-    dispatcher.dispatch("app_save_confirmed_research_role", {
-        "research_id": research_id,
-        "role": {"server": "Analyst", "agent_role_prompt": "Use precise evidence."},
-    })
-    dispatcher.dispatch("app_save_confirmed_research_focuses", {"research_id": research_id, "focuses": ["market"]})
-    dispatcher.dispatch("app_save_confirmed_research_outline", {
-        "research_id": research_id,
-        "sections": [{
-            "id": "section-1",
-            "title": "Market",
-            "outline": "Analyze the market evidence.",
-            "allowed_source_ids": ["tavily"],
-            "max_iterations": 1,
-        }],
-    })
-    dispatcher.dispatch("app_update_research_job", {"research_id": research_id, "updates": {"execution_mode": "autonomous_agent"}})
-
-    state = dispatcher.dispatch("agent_get_report_state", {"research_id": research_id})
-    assert_true(state["outline"][0]["id"] == "section-1", "agent state should expose the confirmed outline")
-    searched = dispatcher.dispatch("agent_search_section", {
-        "research_id": research_id,
-        "section_id": "section-1",
-        "source_id": "tavily",
-        "iteration": 1,
-        "queries": ["anna market evidence"],
-    })
-    assert_true(searched["evidence"], "agent search should return bounded evidence")
-    selected = dispatcher.dispatch("agent_select_section_evidence", {
-        "research_id": research_id,
-        "section_id": "section-1",
-        "_attachment_selection": {"selected_context": "", "selected_items": []},
-    })
-    assert_true(selected["citation_map"], "agent evidence selection should assign global citations")
-    try:
-        dispatcher.dispatch("agent_checkpoint_section", {
-            "research_id": research_id,
-            "section_id": "section-1",
-            "section_markdown": "## Market\n\nInvalid evidence [99].",
-            "section_summary": "Invalid",
-        })
-        raise AssertionError("checkpoint should reject citations outside the section map")
-    except ValidationError:
+        embed_attachment_chunks(jobs=dispatcher.jobs, embeddings=PersistentFailureEmbeddings(), research_id=persistent_job["research_id"])
+        raise AssertionError("persistent embedding failure should survive automatic retry")
+    except EmbeddingsError:
         pass
-    checkpoint = dispatcher.dispatch("agent_checkpoint_section", {
-        "research_id": research_id,
-        "section_id": "section-1",
-        "section_markdown": "## Market\n\nSupported autonomous evidence [1].",
-        "section_summary": "Supported summary",
-        "facts": [{"key": "market_signal", "value": "positive", "citation_numbers": [1]}],
-    })
-    assert_true(checkpoint["status"] == "completed", "agent checkpoint should persist a section")
-    finalized = dispatcher.dispatch("agent_finalize_report", {
-        "research_id": research_id,
-        "title": "Autonomous Report",
-        "introduction": "Introduction.",
-        "conclusion": "Conclusion.",
-        "consistency_audit": "Checked terminology, numbers, duplication, and citations.",
-    })
-    assert_true(finalized["status"] == "completed", "agent finalize should complete the job")
-    loaded = dispatcher.jobs.load(research_id)
-    assert_true(loaded["status"] == "completed", "finalized autonomous job should be completed")
-    assert_true("Supported autonomous evidence [1]" in loaded["report_markdown"], "final report should use checkpointed section markdown")
-    assert_true(loaded["execution_mode"] == "autonomous_agent", "autonomous execution mode should persist")
-    assert_true(len(loaded["agent_fact_ledger"]) == 1, "checkpoint facts should persist in the global ledger")
+    partial = dispatcher.jobs.load(persistent_job["research_id"])["attachment_context"]
+    assert_true(all(chunk.get("embedding") for chunk in partial["chunks"][:2]), "successful batches should remain checkpointed after retry failure")
+    assert_true(not partial["chunks"][2].get("embedding"), "persistently failed chunk should remain pending")
+    assert_true(partial["embedding_status"] == "partial", "persistent retry failure should remain partial")
+
+    wave_job = dispatcher.dispatch("app_create_research_job", {"query": "embedding waves"})["job"]
+    wave_context = {
+        "version": 1,
+        "prepared_at": "now",
+        "files": [],
+        "summary": "",
+        "chunks": [
+            {"chunk_id": f"file-2:{index + 1:04d}", "file_id": "file-2", "file_name": "long.md", "index": index + 1, "text": f"long chunk {index + 1}"}
+            for index in range(18)
+        ],
+    }
+    dispatcher.jobs.update_metadata(wave_job["research_id"], {"attachment_context": wave_context})
+    wave_embeddings = FakeEmbeddings()
+    embed_attachment_chunks(jobs=dispatcher.jobs, embeddings=wave_embeddings, research_id=wave_job["research_id"])
+    assert_true(wave_embeddings.wave_sizes == [8, 1], "eighteen chunks should checkpoint as eight batches then one batch")
+    attachment_embeddings_module.EMBEDDING_RETRY_DELAY_SECONDS = original_retry_delay
+
 
 
 def test_section_large_payload_transfer(tmp_path: Path):
@@ -387,9 +380,6 @@ def test_section_large_payload_transfer(tmp_path: Path):
     loaded_immediate = dispatcher.dispatch("app_get_research_job", {"research_id": research_id})["job"]
     loaded = get_json(loaded_immediate["job_transfer"]["url"])["job"]
     assert_true("section_markdown" not in loaded["section_results"]["section-1"], "job view should not include section markdown")
-    failed_status = dispatcher.dispatch("app_fail_section", {"research_id": research_id, "section_id": "section-1", "error": {"message": "boom"}})["job"]
-    assert_true(failed_status["status"] == "failed", "section failure should update status")
-    assert_true("section_results" not in failed_status, "section failure stdio response should be status-only")
     assembled_transfer = dispatcher.dispatch("app_save_assembled_research_result", {"research_id": research_id})["transfer"]
     assembled = post_json(
         assembled_transfer["url"],
@@ -400,24 +390,6 @@ def test_section_large_payload_transfer(tmp_path: Path):
     final_job = get_json(final_immediate["job_transfer"]["url"])["job"]
     assert_true("report_markdown" not in final_job["result"], "final job view should not include full report")
     assert_true(final_immediate["result_transfer"]["method"] == "GET", "final job should expose result read transfer")
-
-
-def test_call_research_source_requires_credential(tmp_path: Path):
-    old = os.environ.pop("ANNA_RESEARCHER_FAKE_TAVILY", None)
-    try:
-        dispatcher = make_dispatcher(tmp_path)
-        job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
-        try:
-            dispatcher.dispatch(
-                "app_call_research_source",
-                {"research_id": job["research_id"], "iteration": 1, "source_id": "tavily", "queries": ["anna"]},
-            )
-            raise AssertionError("missing Tavily credential should fail")
-        except ConfigurationError:
-            pass
-    finally:
-        if old is not None:
-            os.environ["ANNA_RESEARCHER_FAKE_TAVILY"] = old
 
 
 def test_source_test_transfer(tmp_path: Path):
@@ -502,17 +474,23 @@ def test_plugin_contract(tmp_path: Path):
         describe = plugin.call("describe")
         tools = [tool["name"] for tool in describe["result"]["tools"]]
         assert_true(describe["result"]["name"] == "tool-xhz-researcher-python-e7k8xa3s", "describe should advertise tool")
-        assert_true(describe["result"]["version"] == "0.2.4", "describe should advertise autonomous tool version")
+        assert_true(describe["result"]["version"] == "0.2.4", "describe should advertise the current tool version")
         assert_true("research" not in tools, "legacy research method should be absent")
         assert_true("app_search_web" not in tools, "legacy app_search_web must be removed")
-        assert_true("app_call_research_source" in tools, "new app_call_research_source must be advertised")
+        assert_true("app_call_section_research_source" in tools, "section source method must be advertised")
         assert_true("app_list_research_sources" in tools, "new app_list_research_sources must be advertised")
         assert_true("app_test_research_source" in tools, "source test method must be advertised")
-        assert_true(all(name.startswith(("app_", "agent_")) for name in tools), "all methods should be app or agent methods")
-        assert_true("agent_finalize_report" in tools, "autonomous finalize method must be advertised")
-        agent_search = next(tool for tool in describe["result"]["tools"] if tool["name"] == "agent_search_section")
-        assert_true(any(parameter["name"] == "section_id" and parameter["required"] for parameter in agent_search["parameters"]), "agent tools should advertise precise parameters")
-        assert_true(agent_search["timeout"] == 300, "agent search should allow long source calls")
+        removed_methods = {
+            "app_update_settings",
+            "app_call_research_source",
+            "app_select_context",
+            "app_fail_section",
+            "app_save_research_result",
+            "app_embed_texts",
+        }
+        assert_true(removed_methods.isdisjoint(tools), "unused app methods must not be advertised")
+        assert_true(all(name.startswith("app_") for name in tools), "all methods should be app methods")
+        assert_true(not any(name.startswith("agent_") for name in tools), "legacy agent methods must be absent")
         health = plugin.call("health")
         assert_true(health["result"]["status"] == "healthy", "health should pass")
         settings = plugin.call("invoke", {"tool": "app_get_settings", "arguments": {}})
@@ -538,10 +516,10 @@ def test_bundle_contract():
     bundle_js = "\n".join(path.read_text(encoding="utf-8") for path in (APP_ROOT / "bundle").glob("assets/*.js"))
     manifest = json.loads((APP_ROOT / "manifest.json").read_text(encoding="utf-8"))
     assert_true(manifest["required_executas"][0]["tool_id"] == "bundled:researcher", "manifest should reference bundled researcher tool")
-    assert_true(manifest["required_executas"][0]["min_version"] == "0.2.4", "manifest should require autonomous-capable tool 0.2.4")
-    assert_true(manifest["ui"]["host_api"]["llm"] == ["complete", "embed"], "manifest should authorize llm.complete and llm.embed")
+    assert_true(manifest["required_executas"][0]["min_version"] == "0.2.4", "manifest should require tool 0.2.4")
+    assert_true(manifest["ui"]["host_api"]["llm"] == ["complete", "embed"], "manifest should authorize completion and Executa-backed embeddings")
     assert_true(manifest["ui"]["host_api"]["agent"]["session"]["auto"] is True, "manifest should authorize agent auto sessions")
-    assert_true(manifest["ui"]["host_api"]["agent"]["tools"] == ["tool-xhz-researcher-python-e7k8xa3s"], "manifest should grant the concrete researcher tool to autonomous sessions")
+    assert_true(manifest["ui"]["host_api"]["agent"]["tools"] == [], "section sessions should not receive researcher tools")
     assert_true("host.agent" in manifest["permissions"], "manifest should request host.agent permission")
     assert_true('method:"research"' not in bundle_js and 'method: "research"' not in bundle_js, "bundle should not call legacy research method")
     assert_true('"action":"advance"' not in bundle_js and 'action:"advance"' not in bundle_js, "bundle should not contain legacy advance action")
@@ -577,11 +555,8 @@ def main():
         ("settings", test_settings),
         ("job_shell", test_job_shell),
         ("image_attachment_analysis", test_image_attachment_analysis_context),
-        ("call_research_source", test_call_research_source_context_result),
-        ("result_transfer_http", test_result_transfer_http),
-        ("autonomous_agent_tools", test_autonomous_agent_tools),
+        ("concurrent_attachment_embeddings", test_concurrent_attachment_embeddings),
         ("section_large_payload_transfer", test_section_large_payload_transfer),
-        ("call_requires_credential", test_call_research_source_requires_credential),
         ("source_test_transfer", test_source_test_transfer),
         ("selector", lambda tmp: test_selector()),
         ("duckduckgo_native", test_duckduckgo_native_search_adapter),

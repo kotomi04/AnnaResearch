@@ -19,7 +19,6 @@ def status_view(job: dict[str, Any]) -> dict[str, Any]:
         "created_at": job.get("created_at"),
         "updated_at": job.get("updated_at"),
         "completed_at": job.get("completed_at"),
-        "execution_mode": job.get("execution_mode") or "guided_sections",
     }
 
 
@@ -64,7 +63,6 @@ def compact_job_view(job: dict[str, Any], *, include_section_markdown: bool = Fa
     data["enabled_sources"] = job.get("enabled_sources") or []
     data["schema_version"] = int(job.get("schema_version") or 1)
     data["workflow"] = job.get("workflow") or ("legacy" if int(job.get("schema_version") or 1) < 2 else "sectioned_research")
-    data["execution_mode"] = job.get("execution_mode") or "guided_sections"
     data["confirmed_role"] = job.get("confirmed_role")
     data["confirmed_focuses"] = job.get("confirmed_focuses") or []
     data["confirmed_outline"] = job.get("confirmed_outline") or []

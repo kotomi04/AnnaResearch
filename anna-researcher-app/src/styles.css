@@ -1115,11 +1115,133 @@ textarea:focus {
   line-height: 1.65;
 }
 
-.report code {
+.report p,
+.report ul,
+.report ol,
+.report blockquote,
+.report pre,
+.report-table-scroll {
+  margin-top: 0;
+  margin-bottom: 16px;
+}
+
+.report ul,
+.report ol {
+  padding-left: 1.6rem;
+}
+
+.report li + li {
+  margin-top: 4px;
+}
+
+.report blockquote {
+  border-left: 4px solid #c9c2f6;
+  padding: 2px 0 2px 16px;
+  color: #667085;
+}
+
+.report blockquote > :last-child {
+  margin-bottom: 0;
+}
+
+.report a {
+  color: #4f39c4;
+  overflow-wrap: anywhere;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.report code:not(pre code) {
   border: 1px solid var(--line);
   border-radius: 6px;
   padding: 1px 5px;
   background: var(--gray-soft);
+}
+
+.report pre {
+  max-width: 100%;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px 16px;
+  background: #f4f5f8;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre;
+}
+
+.report pre code {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+.report hr {
+  height: 1px;
+  border: 0;
+  margin: 24px 0;
+  background: var(--line);
+}
+
+.report-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #ffffff;
+  scrollbar-gutter: stable;
+}
+
+.report-table-scroll:focus-visible {
+  outline: 3px solid rgba(124, 92, 255, 0.2);
+  outline-offset: 2px;
+}
+
+.report table {
+  width: 100%;
+  min-width: max-content;
+  border-collapse: collapse;
+  border-spacing: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.report th,
+.report td {
+  min-width: 120px;
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  padding: 10px 12px;
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.report th {
+  background: #f4f5f8;
+  color: #252b38;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.report tr:last-child td {
+  border-bottom: 0;
+}
+
+.report th:last-child,
+.report td:last-child {
+  border-right: 0;
+}
+
+.report tbody tr:nth-child(even) {
+  background: #fafbfc;
+}
+
+.report input[type="checkbox"] {
+  margin: 0 7px 0 0;
+  accent-color: #6d4aff;
 }
 
 aside {
@@ -2479,33 +2601,6 @@ button.danger {
 .outline-review-list {
   display: grid;
   gap: 12px;
-}
-
-.outline-generation-mode {
-  padding: 14px 16px;
-  border-top: 1px solid var(--line);
-  border-bottom: 1px solid var(--line);
-  background: #f8fafc;
-}
-
-.outline-generation-mode .checkbox-row {
-  align-items: flex-start;
-}
-
-.outline-generation-mode span {
-  display: grid;
-  gap: 3px;
-}
-
-.outline-generation-mode strong {
-  color: var(--text);
-  font-size: 13px;
-}
-
-.outline-generation-mode small {
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.45;
 }
 
 .outline-review-card {

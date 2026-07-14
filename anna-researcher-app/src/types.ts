@@ -315,7 +315,6 @@ export interface ResearchJob {
   enabled_sources?: string[];
   schema_version?: number;
   workflow?: string;
-  execution_mode?: "guided_sections" | "autonomous_agent";
   confirmed_role?: ConfirmedResearchRole | null;
   confirmed_focuses?: string[];
   confirmed_outline?: ReportSection[];
@@ -446,11 +445,14 @@ export interface AnnaFilesApi {
 export interface AnnaAgentRunFrame {
   event?: string;
   text?: string;
+  delta?: unknown;
   content?: unknown;
   output_text?: string;
-  message?: {
+  message?: string | {
     content?: unknown;
   };
+  payload?: unknown;
+  frames?: AnnaAgentRunFrame[];
   choices?: Array<{
     delta?: {
       content?: string;

@@ -1,10 +1,32 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { MAX_RESEARCH_ITERATIONS, useResearchJob } from "../../src/hooks/useResearchJob";
+import { MAX_RESEARCH_ITERATIONS, normalizeSectionCitations, remapSelectedContextCitationLabels, useResearchJob } from "../../src/hooks/useResearchJob";
 import type { ResearchApi } from "../../src/api/researchApi";
 import type { ConfirmedResearchRole, ReportFraming, ReportSection, ResearchSourceView, SourceCallResult } from "../../src/types";
 
 type LlmReply = string;
+
+describe("normalizeSectionCitations", () => {
+  const references = [
+    { number: 12, source: { kind: "url" as const, url: "https://example.com/12" } },
+    { number: 13, source: { kind: "url" as const, url: "https://example.com/13" } },
+  ];
+
+  it("normalizes grouped citations and removes only adjacent duplicate markers", () => {
+    expect(normalizeSectionCitations("Claim [12, 13][13]. Later [12].", references)).toBe("Claim [12][13]. Later [12].");
+  });
+
+  it("rejects citations outside the section global citation map", () => {
+    expect(() => normalizeSectionCitations("Unsupported [11].", references)).toThrow("outside its current section citation map: 11");
+  });
+
+  it("replaces only local source header numbers with global citation numbers", () => {
+    const context = "[来源: Tavily] [1] First\nURL: https://example.com/12\nContent: Keep body marker [2].\n\n[来源: Tavily] [2] Second";
+    expect(remapSelectedContextCitationLabels(context, references)).toBe(
+      "[来源: Tavily] [12] First\nURL: https://example.com/12\nContent: Keep body marker [2].\n\n[来源: Tavily] [13] Second",
+    );
+  });
+});
 
 interface ApiOptions {
   configured?: boolean;
@@ -14,9 +36,6 @@ interface ApiOptions {
   sources?: ResearchSourceView[];
   latestJob?: Awaited<ReturnType<ResearchApi["getResearchJob"]>>;
   historyJobs?: Awaited<ReturnType<ResearchApi["listResearchJobs"]>>;
-  agentRunFinalJob?: Awaited<ReturnType<ResearchApi["getResearchJob"]>>;
-  agentCreateGrantedTools?: string[];
-  agentGrantedTools?: string[];
 }
 
 function makeApi(options: ApiOptions = {}) {
@@ -38,15 +57,10 @@ function makeApi(options: ApiOptions = {}) {
   const callOverrides = options.callOverrides ?? [];
   let callIndex = 0;
   let replyIndex = 0;
-  let agentRunFinished = false;
   const api: ResearchApi = {
     async getSettings() {
       calls.push(["getSettings"]);
       return { tavily: { configured, masked: configured ? "***test" : "" } };
-    },
-    async updateSettings(input) {
-      calls.push(["updateSettings", input]);
-      return { tavily: { configured: !input.clear_tavily_api_key, masked: input.clear_tavily_api_key ? "" : "***test" } };
     },
     async listResearchSources() {
       calls.push(["listResearchSources"]);
@@ -92,7 +106,6 @@ function makeApi(options: ApiOptions = {}) {
     },
     async getResearchJob(researchId) {
       calls.push(["getResearchJob", researchId]);
-      if (agentRunFinished && options.agentRunFinalJob) return options.agentRunFinalJob;
       if (researchId) {
         return (options.historyJobs || []).find((job) => job.research_id === researchId) ?? options.latestJob ?? null;
       }
@@ -109,39 +122,6 @@ function makeApi(options: ApiOptions = {}) {
     async updateResearchJob(researchId, updates) {
       calls.push(["updateResearchJob", researchId, updates]);
       return { research_id: researchId, status: "running", ...(updates as object) };
-    },
-    async callResearchSource(input) {
-      calls.push(["callResearchSource", input]);
-      const override = callOverrides[callIndex] ?? {};
-      callIndex++;
-      return {
-        job: {
-          research_id: input.research_id,
-          status: "running",
-          stage: "search_next_query",
-          progress: 50 + input.iteration * 5,
-          iteration: input.iteration,
-          iterations: [],
-        },
-        source_call: {
-          source_id: input.source_id,
-          source_name: "Tavily",
-          queries: input.queries,
-          results_count: override.results_count ?? input.queries.length,
-          top_titles: override.top_titles ?? input.queries.map((q) => `Title for ${q}`),
-          duration_ms: 5,
-          error: override.error ?? null,
-          calls: override.calls ?? input.queries.map((q) => ({
-            source_id: input.source_id,
-            source_name: "Tavily",
-            query: q,
-            results_count: 1,
-            top_titles: [`Title for ${q}`],
-            duration_ms: 5,
-            error: null,
-          })),
-        },
-      };
     },
     async saveConfirmedResearchRole(researchId: string, role: ConfirmedResearchRole) {
       calls.push(["saveConfirmedResearchRole", researchId, role]);
@@ -221,10 +201,6 @@ function makeApi(options: ApiOptions = {}) {
       const sectionResult = options.latestJob?.section_results?.[sectionId];
       return sectionResult ?? null;
     },
-    async failSection(input) {
-      calls.push(["failSection", input]);
-      return { research_id: input.research_id, status: "failed", stage: "failed", error: { message: "failed" } };
-    },
     async saveReportFraming(input: { research_id: string; framing: ReportFraming }) {
       calls.push(["saveReportFraming", input]);
       return { research_id: input.research_id, status: "running", stage: "assemble_report", progress: 96, report_framing: input.framing };
@@ -239,32 +215,6 @@ function makeApi(options: ApiOptions = {}) {
         result: { report_markdown: input.report_markdown, source_urls: input.source_urls },
       };
     },
-    async selectContext(input) {
-      calls.push(["selectContext", input]);
-      return {
-        job: { research_id: input.research_id, status: "running", stage: "select_context", progress: 88 },
-        selected_context: "FULL CONTEXT",
-        selected_sources: [],
-        source_urls: ["https://example.com"],
-      };
-    },
-    async saveResearchResult(input) {
-      calls.push(["saveResearchResult", input]);
-      return { method: "POST", url: "http://127.0.0.1:43123/research-results/" + input.research_id, content_type: "application/json" };
-    },
-    async uploadResearchResult(transfer, input) {
-      calls.push(["uploadResearchResult", transfer, input]);
-      return {
-        job: {
-          research_id: "r1",
-          status: "completed",
-          stage: "completed",
-          progress: 100,
-          result: { report_markdown: input.report_markdown, source_urls: input.source_urls },
-        },
-        result: { report_markdown: input.report_markdown, source_urls: input.source_urls },
-      };
-    },
     async complete(request) {
       llmCalls.push(request as { messages: unknown });
       expect(request).not.toHaveProperty("maxTokens");
@@ -272,22 +222,18 @@ function makeApi(options: ApiOptions = {}) {
       return { content: { type: "text", text: reply } };
     },
     async createAgentSession() {
-      const call = { prompts: [] as string[], deleted: false };
+      const call = {
+        prompts: [] as string[],
+        runInputs: [] as Array<{ content: string; recursion_limit?: number }>,
+        deleted: false,
+      };
       agentSessions.push(call);
       return {
-        granted_tools: options.agentCreateGrantedTools ?? options.agentGrantedTools ?? ["tool-xhz-researcher-python-e7k8xa3s"],
         async *run(input) {
           call.prompts.push(input.content);
-          const grantedTools = options.agentGrantedTools ?? ["tool-xhz-researcher-python-e7k8xa3s"];
-          yield {
-            event: "run_meta",
-            granted_tools: grantedTools,
-            inherit_host_tools: false,
-            warnings: grantedTools.length ? [] : [{ code: "NO_TOOLS_AVAILABLE" }],
-          };
+          call.runInputs.push(input);
           const reply = replies[replyIndex++] ?? "";
           if (reply) yield { event: "delta", text: reply };
-          agentRunFinished = true;
           yield { event: "complete" };
         },
         async delete() {
@@ -517,11 +463,11 @@ describe("useResearchJob (iterative loop)", () => {
         '{"type":"finish"}',
         SECTION_REPLY,
         '{"type":"finish"}',
-        SECTION_REPLY.replace("Section One", "Section Two"),
+        SECTION_REPLY.replace("Section One", "Section Two").replace("[1]", "[2]"),
         '{"type":"finish"}',
-        SECTION_REPLY.replace("Section One", "Section Three"),
+        SECTION_REPLY.replace("Section One", "Section Three").replace("[1]", "[3]"),
         '{"type":"finish"}',
-        SECTION_REPLY.replace("Section One", "Section Four"),
+        SECTION_REPLY.replace("Section One", "Section Four").replace("[1]", "[4]"),
         FRAMING_REPLY,
       ],
     });
@@ -561,58 +507,48 @@ describe("useResearchJob (iterative loop)", () => {
     expect(agentSessions.every((session) => session.deleted)).toBe(true);
     expect(agentSessions[0].prompts).toHaveLength(3);
     expect(agentSessions[0].prompts[0]).toContain("Do not call tools");
-    expect(agentSessions[0].prompts[0]).toContain("Prior iterations");
+    expect(agentSessions[0].prompts[0]).toContain("Task:\nanna");
+    expect(agentSessions[0].prompts[0]).toContain("Complete report outline");
+    expect(agentSessions[0].prompts[1]).toContain("Latest external research update");
+    expect(agentSessions[0].prompts[1]).toContain("anna query");
+    expect(agentSessions[0].prompts[1]).not.toContain("Complete report outline");
+    expect(agentSessions[0].prompts[1]).not.toContain("Task:\nanna");
     expect(agentSessions[0].prompts[2]).toContain("Global citation map for this section");
+    expect(agentSessions[0].prompts[2]).toContain("Web context:\nFULL CONTEXT section-1");
+    expect(agentSessions[0].prompts[2]).not.toContain("Complete report outline");
+    expect(agentSessions[0].prompts[2]).not.toContain("Task:\nanna");
     expect(agentSessions[0].prompts[0]).toContain("(none yet; this is the first report section)");
     expect(agentSessions[1].prompts[0]).toContain("Existing report content written before this section");
     expect(agentSessions[1].prompts[0]).toContain("## Section One");
+    expect(agentSessions[1].prompts[0]).toContain("Uses FULL CONTEXT");
+    expect(agentSessions[1].prompts[0]).not.toContain("Uses FULL CONTEXT [1]");
     expect(agentSessions[1].prompts[0]).toContain("[PREVIOUS] Section One");
     expect(agentSessions[1].prompts[0]).toContain("[CURRENT] Section Two");
     expect(agentSessions[1].prompts[0]).toContain("[UPCOMING] Section Three");
-    expect(agentSessions[1].prompts[1]).toContain("## Section One");
-    expect(agentSessions[1].prompts[1]).toContain("Do not copy citation numbers from the existing report");
+    expect(agentSessions[1].prompts[1]).not.toContain("## Section One");
+    expect(agentSessions[1].prompts[1]).not.toContain("Do not copy citation numbers from the existing report");
+    expect(agentSessions[1].prompts[1]).toContain("Global citation map for this section");
     expect(llmCalls).toHaveLength(5);
     expect(JSON.stringify(llmCalls[4])).toContain("Generate report framing only");
   });
 
-  it("runs the experimental autonomous mode in one tool-enabled session without the guided section loop", async () => {
-    const finalJob = {
-      research_id: "r1",
-      status: "completed" as const,
-      stage: "completed" as const,
-      progress: 100,
-      execution_mode: "autonomous_agent" as const,
-      query: "anna",
-      confirmed_role: { server: "Researcher", agent_role_prompt: "Use sources." },
-      confirmed_focuses: ["focus one"],
-      confirmed_outline: [
-        { id: "section-1", title: "Section One", outline: "Cover one.", allowed_source_ids: ["tavily"], max_iterations: 2 },
-      ],
-      section_results: {
-        "section-1": {
-          section_id: "section-1",
-          status: "completed",
-          section_markdown: "## Section One\n\nAutonomous evidence [1]",
-          section_summary: "Autonomous summary",
-          source_urls: ["https://example.com/autonomous"],
-        },
-      },
-      result: {
-        research_id: "r1",
-        status: "completed",
-        report_markdown: "# Autonomous\n\n## Section One\n\nAutonomous evidence [1]",
-        source_urls: ["https://example.com/autonomous"],
-      },
-    };
-    const { api, calls, llmCalls, agentSessions } = makeApi({
-      agentCreateGrantedTools: [],
-      agentRunFinalJob: finalJob,
+  it("preserves Agent query priority while deduplicating and limiting searches to three", async () => {
+    const { api, calls, agentSessions } = makeApi({
       llmReplies: [
         ROLE_REPLY,
         FOCUS_REPLY,
         OUTLINE_REPLY,
         ASSIGN_REPLY,
-        '{"status":"completed","research_id":"r1","completed_sections":4,"finalized":true}',
+        '{"type":"call_source","source_id":"tavily","queries":["zeta priority"," alpha second ","zeta priority","beta third","gamma fourth"]}',
+        '{"type":"finish"}',
+        SECTION_REPLY,
+        '{"type":"finish"}',
+        SECTION_REPLY.replace("Section One", "Section Two").replace("[1]", "[2]"),
+        '{"type":"finish"}',
+        SECTION_REPLY.replace("Section One", "Section Three").replace("[1]", "[3]"),
+        '{"type":"finish"}',
+        SECTION_REPLY.replace("Section One", "Section Four").replace("[1]", "[4]"),
+        FRAMING_REPLY,
       ],
     });
     const { result } = renderHook(() => useResearchJob(api));
@@ -620,41 +556,16 @@ describe("useResearchJob (iterative loop)", () => {
     await waitFor(() => expect(result.current.phase).toBe("idle"));
     await planToOutline(result);
     await act(async () => {
-      await result.current.confirmOutlineAndRun(result.current.outlineDraft, "autonomous_agent");
+      await result.current.confirmOutlineAndRun(result.current.outlineDraft);
     });
 
     expect(result.current.phase).toBe("completed");
-    expect(result.current.result?.report_markdown).toContain("# Autonomous");
-    expect(agentSessions).toHaveLength(1);
-    expect(agentSessions[0].prompts).toHaveLength(1);
-    expect(agentSessions[0].deleted).toBe(true);
-    expect(agentSessions[0].prompts[0]).toContain("agent_finalize_report");
-    expect(agentSessions[0].prompts[0]).toContain("Confirmed outline");
-    expect(agentSessions[0].prompts[0]).toContain("Uploaded-file evidence policy");
-    expect(calls.some((call) => Array.isArray(call) && call[0] === "callSectionResearchSource")).toBe(false);
-    expect(calls.some((call) => Array.isArray(call) && call[0] === "selectSectionContext")).toBe(false);
-    expect(llmCalls).toHaveLength(4);
-  });
-
-  it("uses run metadata instead of the create response to reject a session with no granted tools", async () => {
-    const { api, llmCalls, agentSessions } = makeApi({
-      agentGrantedTools: [],
-      llmReplies: [ROLE_REPLY, FOCUS_REPLY, OUTLINE_REPLY, ASSIGN_REPLY],
-    });
-    const { result } = renderHook(() => useResearchJob(api));
-
-    await waitFor(() => expect(result.current.phase).toBe("idle"));
-    await planToOutline(result);
-    await act(async () => {
-      await result.current.confirmOutlineAndRun(result.current.outlineDraft, "autonomous_agent");
-    });
-
-    expect(result.current.phase).toBe("failed");
-    expect(String(result.current.error)).toContain("Let agent sessions use my tools");
-    expect(agentSessions).toHaveLength(1);
-    expect(agentSessions[0].prompts).toHaveLength(1);
-    expect(agentSessions[0].deleted).toBe(true);
-    expect(llmCalls).toHaveLength(4);
+    const sectionOneCalls = calls
+      .filter((call) => Array.isArray(call) && call[0] === "callSectionResearchSource")
+      .map((call) => (call as unknown[])[1] as { section_id: string; queries: string[] })
+      .filter((input) => input.section_id === "section-1");
+    expect(sectionOneCalls.map((input) => input.queries[0])).toEqual(["zeta priority", "alpha second", "beta third"]);
+    expect(agentSessions[0].prompts[0]).toContain("Return at most 3 search queries, ordered from highest to lowest priority");
   });
 
   it("fails a section on an empty Agent response without falling back to llm.complete", async () => {
@@ -705,7 +616,7 @@ describe("useResearchJob (iterative loop)", () => {
       latestJob,
       llmReplies: [
         '{"type":"finish"}',
-        '{"section_markdown":"## Pending\\n\\nNew text [1]","section_summary":"New summary"}',
+        '{"section_markdown":"## Pending\\n\\nNew text [2]","section_summary":"New summary"}',
         FRAMING_REPLY,
       ],
     });
@@ -719,10 +630,11 @@ describe("useResearchJob (iterative loop)", () => {
     expect(result.current.phase).toBe("completed");
     expect(agentSessions).toHaveLength(1);
     expect(agentSessions[0].deleted).toBe(true);
-    expect(agentSessions[0].prompts[0]).toContain("Section: Pending");
     expect(agentSessions[0].prompts[0]).toContain("## Done");
     expect(agentSessions[0].prompts[0]).toContain("[PREVIOUS] Done");
     expect(agentSessions[0].prompts[0]).toContain("[CURRENT] Pending");
+    expect(agentSessions[0].prompts[1]).not.toContain("## Done");
+    expect(agentSessions[0].prompts[1]).toContain("Global citation map for this section");
   });
 
   it("uses a Chinese conclusion heading for Chinese reports", async () => {
@@ -1431,7 +1343,21 @@ describe("useResearchJob (iterative loop)", () => {
 
   it("falls back to using the section title when the first section decision returns invalid JSON", async () => {
     const { api, calls } = makeApi({
-      llmReplies: [ROLE_REPLY, FOCUS_REPLY, OUTLINE_REPLY, ASSIGN_REPLY, "not json", SECTION_REPLY, '{"type":"finish"}', SECTION_REPLY, '{"type":"finish"}', SECTION_REPLY, '{"type":"finish"}', SECTION_REPLY, FRAMING_REPLY],
+      llmReplies: [
+        ROLE_REPLY,
+        FOCUS_REPLY,
+        OUTLINE_REPLY,
+        ASSIGN_REPLY,
+        "not json",
+        SECTION_REPLY,
+        '{"type":"finish"}',
+        SECTION_REPLY.replace("[1]", "[2]"),
+        '{"type":"finish"}',
+        SECTION_REPLY.replace("[1]", "[3]"),
+        '{"type":"finish"}',
+        SECTION_REPLY.replace("[1]", "[4]"),
+        FRAMING_REPLY,
+      ],
     });
     const { result } = renderHook(() => useResearchJob(api));
 

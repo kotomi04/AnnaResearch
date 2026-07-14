@@ -81,7 +81,7 @@ def fetch_many(
         if browser_fallback and _is_html_url(url) and _should_use_browser_fallback(page, min_chars=browser_fallback_min_chars):
             fallback_candidates.append((url, page))
             continue
-        resolved = _finalize_static_page(url, page, min_chars=browser_fallback_min_chars)
+        resolved = _finalize_static_page(url, page, min_chars=browser_fallback_min_chars) if _is_html_url(url) else page
         cache[key] = resolved
         pages_by_key[key] = resolved
 

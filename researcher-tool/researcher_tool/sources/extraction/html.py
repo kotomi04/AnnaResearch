@@ -6,14 +6,14 @@ import urllib.request
 import gzip
 import zlib
 from dataclasses import dataclass
-from math import log
 from pathlib import Path
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
+from ...lexical_ranking import BM25Okapi, tokenize
 from .models import ExtractedPage
-from .utils import is_http_url, normalize_whitespace, truncate_text
+from .utils import is_http_url, normalize_whitespace
 
 EXCLUDED_TAGS = {
     "script",
@@ -62,7 +62,7 @@ BLOCK_TAGS = {
 }
 INLINE_TAGS = {"a", "abbr", "b", "code", "em", "i", "mark", "small", "span", "strong", "time"}
 EMPTY_KEEP_TAGS = {"br", "hr", "img"}
-MIN_WORD_THRESHOLD = 3
+MIN_WORD_THRESHOLD = 2
 
 
 @dataclass(frozen=True)
@@ -77,61 +77,6 @@ class MarkdownGenerationResult:
     raw_markdown: str
     fit_markdown: str
     references_markdown: str = ""
-
-
-class BM25Okapi:
-    """Small in-repo BM25Okapi implementation matching rank_bm25's scoring shape."""
-
-    def __init__(self, corpus: list[list[str]], *, k1: float = 1.5, b: float = 0.75, epsilon: float = 0.25):
-        self.corpus = corpus
-        self.k1 = k1
-        self.b = b
-        self.epsilon = epsilon
-        self.corpus_size = len(corpus)
-        self.doc_len = [len(document) for document in corpus]
-        self.avgdl = sum(self.doc_len) / self.corpus_size if self.corpus_size else 0.0
-        self.doc_freqs: list[dict[str, int]] = []
-        self.idf: dict[str, float] = {}
-        self.average_idf = 0.0
-        self._initialize()
-
-    def _initialize(self) -> None:
-        nd: dict[str, int] = {}
-        for document in self.corpus:
-            frequencies: dict[str, int] = {}
-            for token in document:
-                frequencies[token] = frequencies.get(token, 0) + 1
-            self.doc_freqs.append(frequencies)
-            for token in frequencies:
-                nd[token] = nd.get(token, 0) + 1
-
-        idf_sum = 0.0
-        negative_tokens: list[str] = []
-        for token, freq in nd.items():
-            idf = log(self.corpus_size - freq + 0.5) - log(freq + 0.5)
-            self.idf[token] = idf
-            idf_sum += idf
-            if idf < 0:
-                negative_tokens.append(token)
-
-        self.average_idf = idf_sum / len(self.idf) if self.idf else 0.0
-        eps = self.epsilon * self.average_idf
-        for token in negative_tokens:
-            self.idf[token] = eps
-
-    def get_scores(self, query: list[str]) -> list[float]:
-        scores: list[float] = []
-        for index, frequencies in enumerate(self.doc_freqs):
-            doc_len = self.doc_len[index]
-            score = 0.0
-            for token in query:
-                q_freq = frequencies.get(token, 0)
-                if not q_freq:
-                    continue
-                denominator = q_freq + self.k1 * (1 - self.b + self.b * doc_len / max(1e-9, self.avgdl))
-                score += self.idf.get(token, 0.0) * (q_freq * (self.k1 + 1)) / denominator
-            scores.append(score)
-        return scores
 
 
 class HtmlExtractionError(RuntimeError):
@@ -185,11 +130,11 @@ def extract_html_content(
     icon = _extract_icon_url(soup, base_url=base_url)
     cleaned = clean_html_for_markdown(soup, excluded_tags=excluded_tags, excluded_selector=excluded_selector)
     prune_content_tree(cleaned)
-    markdown = generate_markdown(cleaned, query=query, base_url=base_url)
+    markdown = generate_markdown(cleaned, base_url=base_url)
     content = markdown.fit_markdown
     if markdown.references_markdown:
         content = f"{content}\n\n{markdown.references_markdown}".strip()
-    return title, truncate_text(content, max_chars_per_page), icon
+    return title, content, icon
 
 
 def _load_html(source: str, *, timeout: float, user_agent: str) -> bytes:
@@ -271,7 +216,7 @@ def _is_low_value_leaf(tag: Tag) -> bool:
     text = normalize_whitespace(tag.get_text(" ", strip=True))
     if not text:
         return True
-    tokens = _tokenize(text)
+    tokens = tokenize(text)
     if len(tokens) < MIN_WORD_THRESHOLD and tag.name not in {"th", "td"}:
         return True
 
@@ -351,10 +296,12 @@ def _extract_icon_url(soup: BeautifulSoup, *, base_url: str = "") -> str:
 
 def generate_markdown(root: Tag | BeautifulSoup, *, query: str = "", base_url: str = "") -> MarkdownGenerationResult:
     raw_markdown = html_to_markdown(root, base_url=base_url)
-    fit_raw_markdown = filter_markdown_for_query(raw_markdown, query=query)
-    fit_markdown, references = convert_links_to_citations(fit_raw_markdown, base_url=base_url)
-    raw_markdown_with_citations, _ = convert_links_to_citations(raw_markdown, base_url=base_url)
-    return MarkdownGenerationResult(raw_markdown=raw_markdown_with_citations, fit_markdown=fit_markdown, references_markdown=references)
+    markdown_with_citations, references = convert_links_to_citations(raw_markdown, base_url=base_url)
+    return MarkdownGenerationResult(
+        raw_markdown=markdown_with_citations,
+        fit_markdown=markdown_with_citations,
+        references_markdown=references,
+    )
 
 
 def html_to_markdown(root: Tag | BeautifulSoup, *, base_url: str = "") -> str:
@@ -525,8 +472,8 @@ def filter_markdown_for_query(markdown: str, *, query: str = "") -> str:
     if len(blocks) <= 2:
         return clean_markdown
 
-    bm25 = BM25Okapi([_tokenize(block.text) for block in blocks])
-    scores = bm25.get_scores(_tokenize(clean_query))
+    bm25 = BM25Okapi([tokenize(block.text) for block in blocks])
+    scores = bm25.get_scores(tokenize(clean_query))
     if not any(score > 0 for score in scores):
         return clean_markdown
 
@@ -553,22 +500,3 @@ def _split_markdown_blocks(markdown: str) -> list[MarkdownBlock]:
             continue
         blocks.append(MarkdownBlock(index=len(blocks), text=text, is_heading=text.startswith("#")))
     return blocks
-
-
-def _tokenize(text: str) -> list[str]:
-    tokens: list[str] = []
-    for match in re.finditer(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+", str(text or "")):
-        value = match.group(0).casefold()
-        if re.fullmatch(r"[\u4e00-\u9fff]+", value):
-            tokens.extend(_cjk_tokens(value))
-        else:
-            tokens.append(value)
-    return tokens
-
-
-def _cjk_tokens(text: str) -> list[str]:
-    if len(text) <= 2:
-        return [text]
-    tokens = [text[index : index + 2] for index in range(len(text) - 1)]
-    tokens.extend(text[index : index + 3] for index in range(len(text) - 2))
-    return tokens

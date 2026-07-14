@@ -4,17 +4,22 @@ import io
 import json
 import os
 import asyncio
+import threading
+import time
 import urllib.error
 import urllib.request
 
 import pytest
 
 from researcher_tool.attachments import chunk_text, extract_text
+from researcher_tool import attachment_embeddings as attachment_embeddings_module
 from researcher_tool.context_selector import LexicalContextSelector
+from researcher_tool.hybrid_context_selector import HybridContextSelector, split_text_ranges
 from researcher_tool.attachment_embeddings import embed_attachment_chunks
 from researcher_tool.attachment_summary import select_attachment_context, summarize_attachment_context
 from researcher_tool.dispatcher import AppDispatcher
-from researcher_tool.errors import ConfigurationError, NotFoundError, ValidationError
+from researcher_tool.embedding import MAX_PARALLEL_EMBEDDING_BATCHES, AnnaEmbeddingsClient, EmbeddingBatchOutcome, EmbeddingsError
+from researcher_tool.errors import NotFoundError, ValidationError
 from researcher_tool.job_store import JobStore, normalize_query_for_dedup
 from researcher_tool.settings import SettingsStore, mask_secret
 from researcher_tool.sources import (
@@ -32,12 +37,14 @@ from researcher_tool.sources.executor import resolve_path
 from researcher_tool.sources.extraction import arxiv as arxiv_extraction
 from researcher_tool.sources.extraction import browser_fallback
 from researcher_tool.sources.extraction import fetcher as extraction_fetcher
+from researcher_tool.sources.extraction import pdf as pdf_extraction
 from researcher_tool.sources.extraction.html import extract_html
 from researcher_tool.sources.extraction.models import ExtractedPage
 from researcher_tool.sources.extraction.pdf import extract_pdf
 from researcher_tool.sources.native import duckduckgo as duckduckgo_native
 from researcher_tool.sources.native.executor import NativeResearchSourceExecutor
 from researcher_tool.views import compact_job_view
+from researcher_tool.web_documents import WebDocumentStore
 
 
 def make_dispatcher(tmp_path):
@@ -73,6 +80,7 @@ class FailingTransferServer:
 class FakeEmbeddings:
     def __init__(self):
         self.calls = []
+        self.batch_calls = []
 
     def create(self, *, texts, model="anna-managed-v1", timeout=30.0):
         self.calls.append(list(texts))
@@ -80,6 +88,14 @@ class FakeEmbeddings:
             "data": [{"embedding": [1.0, float(index + 1)]} for index, _ in enumerate(texts)],
             "_meta": {"dimensions": 2},
         }
+
+    def create_batches(self, *, batches, model="anna-managed-v1", timeout=30.0):
+        self.batch_calls.append([list(batch) for batch in batches])
+        return [self.create(texts=batch, model=model, timeout=timeout) for batch in batches]
+
+    def create_batches_settled(self, *, batches, model="anna-managed-v1", timeout=30.0):
+        self.batch_calls.append([list(batch) for batch in batches])
+        return [EmbeddingBatchOutcome(result=self.create(texts=batch, model=model, timeout=timeout)) for batch in batches]
 
 
 class FakeSampling:
@@ -122,15 +138,11 @@ def test_mask_secret_uses_front_zero_back_four():
     assert mask_secret("") == ""
 
 
-def test_settings_mask_and_clear(tmp_path):
+def test_settings_view(tmp_path):
     dispatcher = make_dispatcher(tmp_path)
-    assert dispatcher.dispatch("app_get_settings", {})["settings"]["tavily"]["configured"] is False
-    view = dispatcher.dispatch("app_update_settings", {"tavily_api_key": "tvly-test-secret"})["settings"]
-    assert view["tavily"]["configured"] is True
-    assert "secret" not in view["tavily"]["masked"]
-    assert dispatcher.dispatch(
-        "app_update_settings", {"clear_tavily_api_key": True}
-    )["settings"]["tavily"]["configured"] is False
+    view = dispatcher.dispatch("app_get_settings", {})["settings"]
+    assert view["tavily"]["configured"] is False
+    assert view["research_root"] == str(tmp_path / ".research")
 
 
 def test_legacy_tavily_key_migration_is_idempotent(tmp_path):
@@ -341,7 +353,7 @@ def test_embed_attachment_chunks_batches_and_persists_vectors(tmp_path):
         "summary": "",
         "chunks": [
             {"chunk_id": f"file-1:{index + 1:04d}", "file_id": "file-1", "file_name": "brief.md", "index": index + 1, "text": f"chunk {index + 1}"}
-            for index in range(7)
+            for index in range(18)
         ],
     }
     dispatcher.jobs.update_metadata(job["research_id"], {"attachment_context": context})
@@ -350,8 +362,153 @@ def test_embed_attachment_chunks_batches_and_persists_vectors(tmp_path):
     embed_attachment_chunks(jobs=dispatcher.jobs, embeddings=fake, research_id=job["research_id"])
 
     loaded = dispatcher.jobs.load(job["research_id"])["attachment_context"]
-    assert [len(call) for call in fake.calls] == [2, 2, 2, 1]
+    assert [len(wave) for wave in fake.batch_calls] == [8, 1]
+    assert [len(call) for call in fake.calls] == [2] * 9
     assert loaded["embedding_status"] == "ready"
+    assert all(chunk.get("embedding") for chunk in loaded["chunks"])
+
+
+def test_embedding_client_runs_at_most_eight_batches_and_preserves_order():
+    class TrackingEmbeddingsClient(AnnaEmbeddingsClient):
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.first_wave = threading.Barrier(MAX_PARALLEL_EMBEDDING_BATCHES)
+            self.active = 0
+            self.max_active = 0
+            self.calls = []
+
+        def create(self, *, texts, model="anna-managed-v1", timeout=30.0):
+            batch_index = int(texts[0].removeprefix("batch-"))
+            with self.lock:
+                self.calls.append(batch_index)
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                if batch_index < MAX_PARALLEL_EMBEDDING_BATCHES:
+                    self.first_wave.wait(timeout=2)
+                    time.sleep((MAX_PARALLEL_EMBEDDING_BATCHES - batch_index) * 0.002)
+                return {"batch_index": batch_index, "data": [{"embedding": [float(batch_index)]}]}
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    client = TrackingEmbeddingsClient()
+    batches = [[f"batch-{index}"] for index in range(MAX_PARALLEL_EMBEDDING_BATCHES + 1)]
+
+    results = client.create_batches(batches=batches)
+
+    assert client.max_active == MAX_PARALLEL_EMBEDDING_BATCHES
+    assert [result["batch_index"] for result in results] == list(range(MAX_PARALLEL_EMBEDDING_BATCHES + 1))
+    assert sorted(client.calls) == list(range(MAX_PARALLEL_EMBEDDING_BATCHES + 1))
+    assert client.create_batches(batches=[]) == []
+
+
+def test_embed_attachment_chunks_checkpoints_successes_and_retries_failures(tmp_path, monkeypatch):
+    monkeypatch.setattr(attachment_embeddings_module, "EMBEDDING_RETRY_DELAY_SECONDS", 0)
+
+    class ShortResultEmbeddings(FakeEmbeddings):
+        def __init__(self):
+            super().__init__()
+            self.rounds = 0
+
+        def create_batches_settled(self, *, batches, model="anna-managed-v1", timeout=30.0):
+            self.rounds += 1
+            return [
+                EmbeddingBatchOutcome(result={
+                    "data": [{"embedding": [1.0, float(index + 1)]} for index, _ in enumerate(batch)],
+                    "_meta": {"dimensions": 2},
+                })
+                if batch_index == 0
+                else EmbeddingBatchOutcome(result={"data": [], "_meta": {"dimensions": 2}})
+                for batch_index, batch in enumerate(batches)
+            ]
+
+    dispatcher = make_dispatcher(tmp_path)
+    job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
+    context = {
+        "version": 1,
+        "prepared_at": "now",
+        "files": [],
+        "summary": "",
+        "chunks": [
+            {"chunk_id": f"file-1:{index + 1:04d}", "file_id": "file-1", "file_name": "brief.md", "index": index + 1, "text": f"chunk {index + 1}"}
+            for index in range(3)
+        ],
+    }
+    dispatcher.jobs.update_metadata(job["research_id"], {"attachment_context": context})
+
+    transient = ShortResultEmbeddings()
+    embed_attachment_chunks(jobs=dispatcher.jobs, embeddings=transient, research_id=job["research_id"])
+
+    loaded = dispatcher.jobs.load(job["research_id"])["attachment_context"]
+    assert transient.rounds == 2
+    assert loaded["embedding_status"] == "ready"
+    assert all(chunk.get("embedding") for chunk in loaded["chunks"])
+
+    persistent_job = dispatcher.dispatch("app_create_research_job", {"query": "persistent embedding failure"})["job"]
+    persistent_context = {
+        "version": 1,
+        "prepared_at": "now",
+        "files": [],
+        "summary": "",
+        "chunks": [
+            {
+                "chunk_id": f"file-2:{index + 1:04d}",
+                "file_id": "file-2",
+                "file_name": "persistent.md",
+                "index": index + 1,
+                "text": f"chunk {index + 1}",
+            }
+            for index in range(3)
+        ],
+    }
+    dispatcher.jobs.update_metadata(persistent_job["research_id"], {"attachment_context": persistent_context})
+
+    class PersistentFailureEmbeddings(FakeEmbeddings):
+        def create_batches_settled(self, *, batches, model="anna-managed-v1", timeout=30.0):
+            return [
+                EmbeddingBatchOutcome(result={"data": []})
+                if "chunk 3" in batch
+                else EmbeddingBatchOutcome(result=self.create(texts=batch, model=model, timeout=timeout))
+                for batch in batches
+            ]
+
+    with pytest.raises(EmbeddingsError, match="still failed after automatic retry"):
+        embed_attachment_chunks(jobs=dispatcher.jobs, embeddings=PersistentFailureEmbeddings(), research_id=persistent_job["research_id"])
+    partial = dispatcher.jobs.load(persistent_job["research_id"])["attachment_context"]
+    assert all(chunk.get("embedding") for chunk in partial["chunks"][:2])
+    assert not partial["chunks"][2].get("embedding")
+    assert partial["embedding_status"] == "partial"
+
+
+def test_embed_attachment_chunks_skips_existing_vectors(tmp_path):
+    dispatcher = make_dispatcher(tmp_path)
+    job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
+    context = {
+        "version": 1,
+        "prepared_at": "now",
+        "files": [],
+        "summary": "",
+        "chunks": [
+            {
+                "chunk_id": f"file-1:{index + 1:04d}",
+                "file_id": "file-1",
+                "file_name": "brief.md",
+                "index": index + 1,
+                "text": f"chunk {index + 1}",
+                **({"embedding": [9.0, 9.0]} if index == 0 else {}),
+            }
+            for index in range(4)
+        ],
+    }
+    dispatcher.jobs.update_metadata(job["research_id"], {"attachment_context": context})
+    fake = FakeEmbeddings()
+
+    embed_attachment_chunks(jobs=dispatcher.jobs, embeddings=fake, research_id=job["research_id"])
+
+    loaded = dispatcher.jobs.load(job["research_id"])["attachment_context"]
+    assert fake.calls == [["chunk 2", "chunk 3"], ["chunk 4"]]
+    assert loaded["chunks"][0]["embedding"] == [9.0, 9.0]
     assert all(chunk.get("embedding") for chunk in loaded["chunks"])
 
 
@@ -479,7 +636,7 @@ def test_compact_job_view_exposes_v3_fields(tmp_path):
     job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
     immediate = dispatcher.dispatch("app_get_research_job", {"research_id": job["research_id"]})["job"]
     loaded = get_json(immediate["job_transfer"]["url"])["job"] if immediate.get("job_transfer") else immediate
-    assert loaded["schema_version"] == 3
+    assert loaded["schema_version"] == 4
     assert loaded["iterations"] == []
     assert loaded["research_log"] == []
     assert loaded["iteration"] == 0
@@ -660,9 +817,8 @@ def test_native_research_source_executor_extracts_by_default():
     )
     definition = _native_definition()
     definition["native"]["max_urls"] = 2
-    definition["native"]["max_chars_per_page"] = 9000
     definition["native"]["max_pdf_pages"] = 4
-    definition["native"]["browser_fallback"] = True
+    definition["native"].pop("browser_fallback", None)
     definition["native"]["browser_fallback_min_chars"] = 250
     definition["native"]["browser_timeout"] = 12
 
@@ -678,7 +834,6 @@ def test_native_research_source_executor_extracts_by_default():
                 "query": "anna",
                 "max_urls": 2,
                 "timeout": 20.0,
-                "max_chars_per_page": 9000,
                 "max_pdf_pages": 4,
                 "browser_fallback": True,
                 "browser_fallback_min_chars": 250,
@@ -749,6 +904,36 @@ def test_pdf_extraction_reads_local_pdf(tmp_path):
     assert "Anna PDF extraction smoke test" in result.raw_content
 
 
+def test_pdf_extraction_does_not_truncate_pages_at_legacy_character_limit(monkeypatch):
+    page_text = "complete pdf text " * 700
+
+    class FakePage:
+        def get_text(self, mode):
+            assert mode == "text"
+            return page_text
+
+    class FakeDocument:
+        metadata = {"title": "Full PDF"}
+
+        def __len__(self):
+            return 1
+
+        def load_page(self, index):
+            assert index == 0
+            return FakePage()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("fitz.open", lambda path: FakeDocument())
+
+    title, content = pdf_extraction._extract_pdf_file("full.pdf", max_pages=None, max_chars_per_page=8000)
+
+    assert title == "Full PDF"
+    assert len(content) > 8000
+    assert content == page_text.strip()
+
+
 def test_arxiv_extraction_reads_paper_metadata(monkeypatch):
     def fake_load(query, *, max_results):
         assert query == "2401.12345"
@@ -815,7 +1000,7 @@ def test_html_extraction_reads_local_html_and_removes_noise(tmp_path):
     assert "Footer should disappear" not in result.raw_content
 
 
-def test_html_extraction_prunes_and_filters_markdown_by_query(tmp_path):
+def test_html_extraction_prunes_but_does_not_filter_or_truncate_by_query(tmp_path):
     html_path = tmp_path / "filtered.html"
     html_path.write_text(
         """
@@ -850,8 +1035,20 @@ def test_html_extraction_prunes_and_filters_markdown_by_query(tmp_path):
     assert "# Anthropic financing" in result.raw_content
     assert "strategic cloud partners" in result.raw_content
     assert "enterprise accounts" in result.raw_content
-    assert "Banana bread" not in result.raw_content
+    assert "Banana bread" in result.raw_content
     assert "Home" not in result.raw_content
+
+
+def test_html_extraction_preserves_content_beyond_configured_legacy_limit(tmp_path):
+    html_path = tmp_path / "long.html"
+    body = "complete extraction marker " * 500
+    html_path.write_text(f"<html><body><main><p>{body}</p></main></body></html>", encoding="utf-8")
+
+    result = extract_html(str(html_path), max_chars_per_page=8000, query="unrelated query")
+
+    assert result.status == "success"
+    assert len(result.raw_content) > 8000
+    assert result.raw_content.endswith("marker")
 
 
 def test_fetch_url_uses_browser_fallback_for_short_static_content(monkeypatch):
@@ -894,10 +1091,22 @@ def test_browser_fallback_prefers_fit_markdown_then_raw_markdown():
             return "object fallback should not be used"
 
     assert browser_fallback._markdown_text(Markdown()) == "# Full page markdown\n\nUseful body."
-
     Markdown.fit_markdown = "\n# Filtered markdown\n"
-    assert browser_fallback._markdown_text(Markdown()) == "# Filtered markdown"
+    assert browser_fallback._markdown_text(Markdown()) == "# Full page markdown\n\nUseful body."
 
+
+def test_browser_fallback_does_not_truncate_complete_markdown(monkeypatch):
+    markdown = "complete browser markdown " * 500
+
+    async def fake_extract(url, *, query, timeout):
+        return "Full browser page", "", markdown
+
+    monkeypatch.setattr(browser_fallback, "_extract_with_crawl4ai", fake_extract)
+
+    result = browser_fallback.extract_with_browser_fallback("https://example.com/full", max_chars_per_page=100)
+
+    assert result.status == "success"
+    assert result.raw_content == markdown.strip()
 
 def test_browser_fallback_uses_cleaned_html_when_markdown_is_empty():
     class Crawler:
@@ -1045,7 +1254,7 @@ def test_extraction_fetcher_routes_by_url_type(monkeypatch):
     assert calls[1] == ("arxiv", "https://arxiv.org/pdf/2401.12345")
     assert calls[2][0:2] == ("pdf", "https://example.com/report.pdf")
     assert calls[2][2]["max_chars_per_page"] == 111
-    assert calls[2][2]["max_pdf_pages"] == 2
+    assert calls[2][2]["max_pages"] == 2
     assert calls[3][0:2] == ("html", "https://example.com/page")
 
 
@@ -1492,150 +1701,6 @@ def test_source_call_error_falls_back_to_bad_definition_for_unknown_codes():
     assert error.code == "bad_definition"
 
 
-# ---------------------------------------------------------------------------
-# Dispatcher: app_call_research_source end-to-end
-# ---------------------------------------------------------------------------
-
-
-def test_call_research_source_rejects_missing_credential(tmp_path, monkeypatch):
-    monkeypatch.delenv("ANNA_RESEARCHER_FAKE_TAVILY", raising=False)
-    dispatcher = make_dispatcher(tmp_path)
-    job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
-    with pytest.raises(ConfigurationError):
-        dispatcher.dispatch(
-            "app_call_research_source",
-            {"research_id": job["research_id"], "iteration": 1, "source_id": "tavily", "queries": ["anna"]},
-        )
-
-
-def test_call_research_source_uses_fake_token_and_records_iteration(tmp_path, monkeypatch):
-    monkeypatch.setenv("ANNA_RESEARCHER_FAKE_TAVILY", "1")
-    dispatcher = make_dispatcher(tmp_path)
-
-    def fake_http(request, timeout=None):
-        return FakeResponse(
-            json.dumps(
-                {
-                    "results": [
-                        {"url": "https://e.com/a", "title": "A", "content": "alpha"},
-                        {"url": "https://e.com/b", "title": "B", "content": "beta"},
-                    ]
-                }
-            ).encode("utf-8")
-        )
-
-    dispatcher.executor = ResearchSourceExecutor(
-        token_provider=dispatcher._token_for, http_open=fake_http, sleep=lambda _: None
-    )
-
-    job = dispatcher.dispatch("app_create_research_job", {"query": "anna researcher"})["job"]
-    response = dispatcher.dispatch(
-        "app_call_research_source",
-        {"research_id": job["research_id"], "iteration": 1, "source_id": "tavily", "queries": ["anna", "researcher"]},
-    )
-    call = response["source_call"]
-    assert call["source_id"] == "tavily"
-    assert call["results_count"] == 4
-    assert call["error"] is None
-    assert all("items" not in entry for entry in call["calls"])
-    immediate = dispatcher.dispatch("app_get_research_job", {"research_id": job["research_id"]})["job"]
-    loaded = get_json(immediate["job_transfer"]["url"])["job"]
-    assert loaded["iterations"][0]["queries"] == ["anna", "researcher"]
-    assert all("raw_results" not in iteration for iteration in loaded["iterations"])
-    assert loaded["search_queries"] == ["anna", "researcher"]
-    assert loaded["source_urls"] == ["https://e.com/a", "https://e.com/b"]
-
-
-def test_call_research_source_uses_native_duckduckgo_without_credential(tmp_path, monkeypatch):
-    monkeypatch.delenv("ANNA_RESEARCHER_FAKE_TAVILY", raising=False)
-    dispatcher = make_dispatcher(tmp_path)
-    dispatcher.native_executor = NativeResearchSourceExecutor(
-        adapters={
-            "ddgs": lambda query: [
-                {"query": query, "url": "https://duck.example/a", "title": "Duck result", "content": "duck snippet"},
-            ]
-        },
-        extractor=lambda items, **kwargs: [
-            {**item, "icon": "https://duck.example/icon.png", "raw_content": "Duck full content"}
-            for item in items
-        ],
-    )
-
-    job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
-    response = dispatcher.dispatch(
-        "app_call_research_source",
-        {"research_id": job["research_id"], "iteration": 1, "source_id": "duckduckgo", "queries": ["anna"]},
-    )
-
-    call = response["source_call"]
-    assert call["source_id"] == "duckduckgo"
-    assert call["results_count"] == 1
-    assert call["error"] is None
-    loaded = dispatcher.jobs.load(job["research_id"])
-    item = loaded["iterations"][0]["raw_results"][0]
-    assert item["source_id"] == "duckduckgo"
-    assert item["content"] == "duck snippet"
-    assert item["icon"] == "https://duck.example/icon.png"
-    assert item["url_body"] == "Duck full content"
-    assert "raw_content" not in item
-    assert loaded["source_urls"] == ["https://duck.example/a"]
-
-
-def test_call_research_source_skips_duplicate_query(tmp_path, monkeypatch):
-    monkeypatch.setenv("ANNA_RESEARCHER_FAKE_TAVILY", "1")
-    dispatcher = make_dispatcher(tmp_path)
-
-    def fake_http(request, timeout=None):
-        return FakeResponse(
-            json.dumps({"results": [{"url": "https://e.com/a", "title": "A", "content": "x"}]}).encode("utf-8")
-        )
-
-    dispatcher.executor = ResearchSourceExecutor(
-        token_provider=dispatcher._token_for, http_open=fake_http, sleep=lambda _: None
-    )
-    job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
-    dispatcher.dispatch(
-        "app_call_research_source",
-        {"research_id": job["research_id"], "iteration": 1, "source_id": "tavily", "queries": ["anna"]},
-    )
-    response = dispatcher.dispatch(
-        "app_call_research_source",
-        {"research_id": job["research_id"], "iteration": 2, "source_id": "tavily", "queries": ["Anna"]},
-    )
-    assert response["source_call"]["queries"] == []
-    assert response["source_call"]["skipped_queries"] == ["Anna"]
-    assert response["source_call"]["results_count"] == 0
-    assert response["source_call"]["error"] is None
-
-
-def test_call_research_source_runs_new_queries_when_some_are_duplicate(tmp_path, monkeypatch):
-    monkeypatch.setenv("ANNA_RESEARCHER_FAKE_TAVILY", "1")
-    dispatcher = make_dispatcher(tmp_path)
-    seen = []
-
-    def fake_http(request, timeout=None):
-        seen.append(str(request.full_url))
-        return FakeResponse(
-            json.dumps({"results": [{"url": f"https://e.com/{len(seen)}", "title": "A", "content": "x"}]}).encode("utf-8")
-        )
-
-    dispatcher.executor = ResearchSourceExecutor(
-        token_provider=dispatcher._token_for, http_open=fake_http, sleep=lambda _: None
-    )
-    job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
-    dispatcher.dispatch(
-        "app_call_research_source",
-        {"research_id": job["research_id"], "iteration": 1, "source_id": "tavily", "queries": ["anna"]},
-    )
-    response = dispatcher.dispatch(
-        "app_call_research_source",
-        {"research_id": job["research_id"], "iteration": 2, "source_id": "tavily", "queries": ["Anna", "researcher"]},
-    )
-    assert response["source_call"]["queries"] == ["researcher"]
-    assert response["source_call"]["skipped_queries"] == ["Anna"]
-    assert response["source_call"]["results_count"] == 1
-
-
 def test_call_section_research_source_uses_native_duckduckgo(tmp_path):
     dispatcher = make_dispatcher(tmp_path)
     dispatcher.native_executor = NativeResearchSourceExecutor(
@@ -1644,7 +1709,10 @@ def test_call_section_research_source_uses_native_duckduckgo(tmp_path):
                 {"query": query, "url": "https://duck.example/section", "title": "Section result", "content": "section snippet"},
             ]
         },
-        extractor=lambda items, **kwargs: items,
+        extractor=lambda items, **kwargs: [
+            {**item, "icon": "https://duck.example/icon.png", "raw_content": "Section full extracted document"}
+            for item in items
+        ],
     )
     job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
     dispatcher.dispatch(
@@ -1687,6 +1755,13 @@ def test_call_section_research_source_uses_native_duckduckgo(tmp_path):
     assert item["source_name"] == "DuckDuckGo"
     assert item["url"] == "https://duck.example/section"
     assert item["content"] == "section snippet"
+    assert item["icon"] == "https://duck.example/icon.png"
+    assert item["document_id"]
+    assert "url_body" not in item
+    assert "raw_content" not in item
+    document = dispatcher.web_documents.get(job["research_id"], item["document_id"])
+    assert document and document["content"] == "Section full extracted document"
+    assert document["content_type"] == "unknown"
     assert loaded["source_urls"] == []
     assert loaded["source_count"] == 0
 
@@ -1939,3 +2014,102 @@ def test_selector_skips_failed_and_short_extractions():
     assert selected["source_urls"] == ["https://example.com/good"]
     assert "failed" not in selected["selected_context"]
     assert "short" not in selected["selected_context"]
+
+
+class KeywordEmbeddings:
+    def __init__(self, *, fail=False):
+        self.fail = fail
+        self.batch_counts = []
+
+    def create_batches(self, *, batches, model="anna-managed-v1", timeout=30.0):
+        if self.fail:
+            raise EmbeddingsError(-32505, "forced embedding failure")
+        self.batch_counts.append(len(batches))
+        return [
+            {
+                "data": [
+                    {
+                        "embedding": [
+                            float(str(text).casefold().count("alpha")),
+                            float(str(text).casefold().count("beta")),
+                            1.0,
+                        ]
+                    }
+                    for text in batch
+                ],
+                "_meta": {"dimensions": 3},
+            }
+            for batch in batches
+        ]
+
+
+def test_hybrid_selector_chunks_rrf_groups_and_does_not_persist_vectors(tmp_path):
+    jobs = JobStore(root=tmp_path / ".research")
+    job = jobs.create(query="alpha beta")
+    documents = WebDocumentStore(jobs)
+    alpha_text = ("alpha evidence and supporting detail. " * 300).strip()
+    beta_text = ("beta evidence and supporting detail. " * 300).strip()
+    alpha_id = documents.put_page(job["research_id"], ExtractedPage(url="https://example.com/alpha", title="Alpha", raw_content=alpha_text, content_type="html"))
+    beta_id = documents.put_page(job["research_id"], ExtractedPage(url="https://example.org/beta", title="Beta", raw_content=beta_text, content_type="html"))
+    embeddings = KeywordEmbeddings()
+    selector = HybridContextSelector(embeddings=embeddings, documents=documents)
+
+    selected = selector.select(
+        research_id=job["research_id"],
+        query="alpha beta",
+        search_queries=["alpha evidence", "beta evidence"],
+        search_results=[
+            {"document_id": alpha_id, "url": "https://example.com/alpha", "title": "Alpha", "source_id": "duckduckgo", "source_name": "DuckDuckGo", "query": "alpha evidence"},
+            {"document_id": beta_id, "url": "https://example.org/beta", "title": "Beta", "source_id": "duckduckgo", "source_name": "DuckDuckGo", "query": "beta evidence"},
+            {"url": "https://tavily.example/alpha", "title": "Tavily alpha", "source_id": "tavily", "source_name": "Tavily", "query": "alpha evidence", "content": "alpha summary evidence"},
+        ],
+    )
+
+    assert sum(len(source["selected_chunks"]) for source in selected["selected_sources"]) <= 12
+    assert all(len(source["selected_chunks"]) <= 4 for source in selected["selected_sources"])
+    assert "[Chunk" in selected["selected_context"]
+    assert any(source["source_id"] == "tavily" for source in selected["selected_sources"])
+    assert all("rrf_score" in chunk for source in selected["selected_sources"] for chunk in source["selected_chunks"])
+    assert max(embeddings.batch_counts) <= 8
+    assert 8 in embeddings.batch_counts
+    assert len(embeddings.batch_counts) >= 3
+    persisted = "".join(path.read_text(encoding="utf-8") for path in (jobs.job_dir_for(job["research_id"]) / "web_documents").glob("*.json"))
+    assert "embedding" not in persisted
+
+
+def test_web_document_store_deduplicates_fragment_urls(tmp_path):
+    jobs = JobStore(root=tmp_path / ".research")
+    job = jobs.create(query="dedupe")
+    documents = WebDocumentStore(jobs)
+
+    first = documents.put_page(job["research_id"], ExtractedPage(url="https://example.com/a#one", raw_content="first full body"))
+    second = documents.put_page(job["research_id"], ExtractedPage(url="https://example.com/a#two", raw_content="second full body"))
+
+    assert first == second
+    files = list((jobs.job_dir_for(job["research_id"]) / "web_documents").glob("*.json"))
+    assert len(files) == 2  # one document plus index.json
+    assert documents.get(job["research_id"], first)["content"] == "second full body"
+
+
+def test_recursive_chunk_ranges_use_1000_size_and_100_overlap():
+    ranges = split_text_ranges("alpha sentence. " * 300)
+
+    assert len(ranges) > 2
+    assert all(end - start <= 1000 for start, end in ranges)
+    assert all(current[0] == previous[1] - 100 for previous, current in zip(ranges, ranges[1:]))
+
+
+def test_hybrid_selector_fails_without_bm25_fallback_on_embedding_error(tmp_path):
+    jobs = JobStore(root=tmp_path / ".research")
+    job = jobs.create(query="alpha")
+    documents = WebDocumentStore(jobs)
+    document_id = documents.put_page(job["research_id"], ExtractedPage(url="https://example.com/a", raw_content="alpha evidence " * 100))
+    selector = HybridContextSelector(embeddings=KeywordEmbeddings(fail=True), documents=documents)
+
+    with pytest.raises(EmbeddingsError):
+        selector.select(
+            research_id=job["research_id"],
+            query="alpha",
+            search_queries=["alpha"],
+            search_results=[{"document_id": document_id, "url": "https://example.com/a", "content": "alpha", "source_id": "duckduckgo"}],
+        )

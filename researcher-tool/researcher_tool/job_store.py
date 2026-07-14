@@ -25,11 +25,6 @@ ALLOWED_UPDATE_FIELDS = {
     "active_section_index",
     "attachments",
     "attachment_context",
-    "execution_mode",
-    "agent_evidence_registry",
-    "agent_section_evidence",
-    "agent_fact_ledger",
-    "agent_consistency_audit",
 }
 
 SPLIT_JOB_FIELDS = {
@@ -83,7 +78,7 @@ class JobStore:
         now = utc_now()
         research_id = f"research_{uuid.uuid4().hex[:12]}"
         job = {
-            "schema_version": 3,
+            "schema_version": 4,
             "research_id": research_id,
             "query": clean_query,
             "query_domains": normalize_domains(query_domains),
@@ -120,11 +115,6 @@ class JobStore:
             "assembled_result": None,
             "attachments": [],
             "attachment_context": None,
-            "execution_mode": "guided_sections",
-            "agent_evidence_registry": [],
-            "agent_section_evidence": {},
-            "agent_fact_ledger": [],
-            "agent_consistency_audit": "",
         }
         self.save(job)
         return job
@@ -446,7 +436,7 @@ class JobStore:
             raise StoreError("job is missing research_id")
         job.pop("source_previews", None)
         job["updated_at"] = utc_now()
-        job["schema_version"] = 3
+        job["schema_version"] = 4
         path = self.path_for(research_id)
         job_dir = path.parent
         job_dir.mkdir(parents=True, exist_ok=True)

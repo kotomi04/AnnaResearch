@@ -379,35 +379,6 @@ describe("FocusReviewPage", () => {
 });
 
 describe("Draft planning UI", () => {
-  it("offers an autonomous single-session generation toggle on the outline page", () => {
-    const t = createTranslator("en");
-    const onAutonomousModeChange = vi.fn();
-    render(
-      <OutlineReviewPage
-        sections={[{ id: "section-1", title: "Market", outline: "Analyze the market.", allowed_source_ids: ["tavily"], max_iterations: 2 }]}
-        sources={[{ id: "tavily", name: "Tavily", kind: "builtin", enabled: true, credential_status: "configured", max_parallel: 1 }]}
-        instruction=""
-        summary={{ roleName: "Analyst", rolePrompt: "Analyze.", focuses: ["market"], sectionCount: 1, totalIterations: 2 }}
-        isBusy={false}
-        autonomousMode={false}
-        t={t}
-        onSectionChange={vi.fn()}
-        onAddSection={vi.fn()}
-        onDeleteSection={vi.fn()}
-        onMoveSection={vi.fn()}
-        onToggleSectionSource={vi.fn()}
-        onInstructionChange={vi.fn()}
-        onRegenerate={vi.fn()}
-        onBack={vi.fn()}
-        onStartGeneration={vi.fn()}
-        onAutonomousModeChange={onAutonomousModeChange}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole("checkbox", { name: /Single-session autonomous generation/ }));
-    expect(onAutonomousModeChange).toHaveBeenCalledWith(true);
-  });
-
   it("renders an explicit loading page while waiting for a draft", () => {
     const t = createTranslator("en");
     render(
@@ -939,6 +910,35 @@ describe("ReportView", () => {
     expect(screen.getByText("[2]")).toBeTruthy();
   });
 
+  it("renders GFM tables, task lists, strikethrough, and fenced code as a preview", () => {
+    const t = createTranslator("en");
+    const markdown = [
+      "| Name | Score |",
+      "| :--- | ---: |",
+      "| Alpha | 10 |",
+      "| Beta | 8 |",
+      "",
+      "- [x] reviewed",
+      "- [ ] pending",
+      "",
+      "~~obsolete~~",
+      "",
+      "```ts",
+      "const score = 10;",
+      "```",
+    ].join("\n");
+
+    render(<ReportView result={{ report_markdown: markdown, source_urls: [] }} t={t} />);
+
+    const table = screen.getByRole("table");
+    expect(table.closest(".report-table-scroll")).toBeTruthy();
+    expect(screen.getByRole("columnheader", { name: "Name" })).toBeTruthy();
+    expect(screen.getByRole("cell", { name: "Beta" })).toBeTruthy();
+    expect(screen.getAllByRole("checkbox")).toHaveLength(2);
+    expect(document.querySelector("del")?.textContent).toBe("obsolete");
+    expect(document.querySelector("pre code")?.textContent).toContain("const score = 10;");
+  });
+
   it("previews a citation card on hover and switches between references from the same sentence", () => {
     const t = createTranslator("en");
     render(
@@ -950,7 +950,7 @@ describe("ReportView", () => {
             {
               url: "https://weekly.chinacdc.cn/en/article/pdf/preview/1",
               title: "China CDC weekly",
-              content: "A concise evidence snippet from the selected source context.",
+              content: "[Chunk 1]\nA concise evidence snippet from the selected source context.",
               icon: "https://weekly.chinacdc.cn/icon.png",
             },
             {
@@ -971,6 +971,7 @@ describe("ReportView", () => {
     expect(within(card).getByText("weekly.chinacdc.cn")).toBeTruthy();
     expect(within(card).getByText("China CDC weekly")).toBeTruthy();
     expect(within(card).getByText("A concise evidence snippet from the selected source context.")).toBeTruthy();
+    expect(within(card).queryByText(/\[Chunk 1\]/)).toBeNull();
     const icon = card.querySelector(".citation-card-icon") as HTMLImageElement;
     expect(icon.getAttribute("src")).toBe("https://weekly.chinacdc.cn/icon.png");
 
@@ -1018,6 +1019,13 @@ describe("ReportView", () => {
     expect(screen.getAllByRole("button", { name: "[1]" })).toHaveLength(1);
     expect(screen.getAllByRole("button", { name: "[2]" })).toHaveLength(1);
     expect(screen.queryByText(/file-2:0002/)).toBeNull();
+
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "[1]" }));
+    const card = document.querySelector(".citation-card") as HTMLElement;
+    expect(within(card).getByText("nvidia-analysis.pdf")).toBeTruthy();
+    expect(within(card).getByText("first chunk")).toBeTruthy();
+    expect(within(card).queryByText("chunk 1")).toBeNull();
+    expect(screen.getByRole("button", { name: "[1]" }).getAttribute("title")).toBe("nvidia-analysis.pdf");
   });
 
   it("places citation cards above the marker when there is not enough room below", () => {

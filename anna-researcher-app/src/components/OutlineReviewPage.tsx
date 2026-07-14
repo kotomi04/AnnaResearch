@@ -20,8 +20,6 @@ interface Props {
   onRegenerate(): void;
   onBack(): void;
   onStartGeneration(): void;
-  autonomousMode: boolean;
-  onAutonomousModeChange(value: boolean): void;
 }
 
 export function OutlineReviewPage(props: Props) {
@@ -113,20 +111,6 @@ export function OutlineReviewPage(props: Props) {
             </details>
           </article>
         ))}
-      </div>
-      <div className="outline-generation-mode">
-        <label className="checkbox-row">
-          <input
-            type="checkbox"
-            checked={props.autonomousMode}
-            disabled={props.isBusy}
-            onChange={(event) => props.onAutonomousModeChange(event.target.checked)}
-          />
-          <span>
-            <strong>{props.t("autonomousModeLabel")}</strong>
-            <small>{props.t("autonomousModeDescription")}</small>
-          </span>
-        </label>
       </div>
       <footer className="guided-footer">
         <button type="button" className="secondary" onClick={props.onBack}>{props.t("backButton")}</button>

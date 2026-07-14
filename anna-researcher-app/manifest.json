@@ -44,7 +44,7 @@
       "llm": ["complete", "embed"],
       "agent": {
         "session": { "auto": true, "fixed": null },
-        "tools": ["tool-xhz-researcher-python-e7k8xa3s"]
+        "tools": []
       },
       "files": ["upload_init", "upload_finalize", "download_url", "list", "delete"],
       "fs": [],

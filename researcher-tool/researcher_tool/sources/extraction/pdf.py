@@ -68,7 +68,7 @@ def _extract_pdf_file(path: str, *, max_pages: int | None, max_chars_per_page: i
             text = str(doc.load_page(page_index).get_text("text") or "").strip()
             if not text:
                 continue
-            chunks.append(_truncate(text, max_chars_per_page))
+            chunks.append(text)
         return title, "\n\n".join(chunks).strip()
     finally:
         doc.close()
@@ -91,8 +91,3 @@ def _download_pdf(source_url: str, *, timeout: float, user_agent: str) -> str:
 def _is_url(value: str) -> bool:
     parsed = urllib.parse.urlparse(value)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
-
-
-def _truncate(value: str, max_chars: int) -> str:
-    limit = max(1, int(max_chars or 1))
-    return value if len(value) <= limit else value[:limit]

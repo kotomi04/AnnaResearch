@@ -84,7 +84,6 @@ interface TransferResponse {
 
 export interface ResearchApi {
   getSettings(): Promise<ToolSettings>;
-  updateSettings(input: { tavily_api_key?: string; clear_tavily_api_key?: boolean }): Promise<ToolSettings>;
   listResearchSources(): Promise<ResearchSourceView[]>;
   updateResearchSourceCredential(input: { id: string; credential?: string; clear?: boolean }): Promise<ResearchSourceView>;
   setResearchSourceEnabled(input: { id: string; enabled: boolean }): Promise<ResearchSourceView>;
@@ -99,12 +98,6 @@ export interface ResearchApi {
   selectAttachmentContext(input: { research_id: string; query: string; top_k?: number }): Promise<AttachmentContextResponse>;
   getResearchJob(researchId?: string): Promise<ResearchJob | null>;
   listResearchJobs(input?: { limit?: number }): Promise<ResearchJob[]>;
-  callResearchSource(input: {
-    research_id: string;
-    iteration: number;
-    source_id: string;
-    queries: string[];
-  }): Promise<CallSourceResponse>;
   saveConfirmedResearchRole(researchId: string, role: ConfirmedResearchRole): Promise<ResearchJob>;
   saveConfirmedResearchFocuses(researchId: string, focuses: string[]): Promise<ResearchJob>;
   saveConfirmedResearchOutline(researchId: string, sections: ReportSection[]): Promise<ResearchJob>;
@@ -127,19 +120,8 @@ export interface ResearchApi {
     error?: unknown;
   }): Promise<ResearchJob>;
   getSectionResult(researchId: string, sectionId: string): Promise<SectionResult | null>;
-  failSection(input: { research_id: string; section_id: string; error: unknown }): Promise<ResearchJob>;
   saveReportFraming(input: { research_id: string; framing: ReportFraming }): Promise<ResearchJob>;
   saveAssembledResearchResult(input: { research_id: string; report_markdown: string; source_urls?: string[]; citation_sources?: CitationSource[] }): Promise<ResearchJob>;
-  selectContext(input: {
-    research_id: string;
-    search_queries?: string[];
-    search_results?: SearchResult[];
-  }): Promise<ContextResponse>;
-  saveResearchResult(input: { research_id: string }): Promise<ResultTransferDescriptor>;
-  uploadResearchResult(
-    transfer: ResultTransferDescriptor,
-    input: { report_markdown: string; source_urls?: string[]; citation_sources?: CitationSource[] },
-  ): Promise<ResultResponse>;
   complete(messages: AnnaRuntimeApi["llm"]["complete"] extends (request: infer Req) => unknown ? Req : never): ReturnType<
     AnnaRuntimeApi["llm"]["complete"]
   >;
@@ -151,12 +133,6 @@ export class AnnaResearchApi implements ResearchApi {
 
   async getSettings(): Promise<ToolSettings> {
     const response = (await this.call("app_get_settings", {})) as SettingsResponse;
-    if (!response.settings) throw new Error("Settings response did not include settings.");
-    return response.settings;
-  }
-
-  async updateSettings(input: { tavily_api_key?: string; clear_tavily_api_key?: boolean }): Promise<ToolSettings> {
-    const response = (await this.call("app_update_settings", input)) as SettingsResponse;
     if (!response.settings) throw new Error("Settings response did not include settings.");
     return response.settings;
   }
@@ -253,15 +229,6 @@ export class AnnaResearchApi implements ResearchApi {
     return response.jobs ?? [];
   }
 
-  async callResearchSource(input: {
-    research_id: string;
-    iteration: number;
-    source_id: string;
-    queries: string[];
-  }): Promise<CallSourceResponse> {
-    return (await this.call("app_call_research_source", input)) as CallSourceResponse;
-  }
-
   async saveConfirmedResearchRole(researchId: string, role: ConfirmedResearchRole): Promise<ResearchJob> {
     return requireJob(await this.call("app_save_confirmed_research_role", { research_id: researchId, role }));
   }
@@ -319,10 +286,6 @@ export class AnnaResearchApi implements ResearchApi {
     return data.section_result ?? null;
   }
 
-  async failSection(input: { research_id: string; section_id: string; error: unknown }): Promise<ResearchJob> {
-    return requireJob(await this.call("app_fail_section", input));
-  }
-
   async saveReportFraming(input: { research_id: string; framing: ReportFraming }): Promise<ResearchJob> {
     const response = (await this.call("app_save_report_framing", { research_id: input.research_id })) as TransferResponse;
     if (!response.transfer?.url) throw new Error("Report framing save response did not include a transfer URL.");
@@ -335,27 +298,6 @@ export class AnnaResearchApi implements ResearchApi {
     const data = await fetchTransfer<ResultResponse>(response.transfer, input);
     const job = requireJob(data);
     return { ...job, result: data.result ?? job.result };
-  }
-
-  async selectContext(input: {
-    research_id: string;
-    search_queries?: string[];
-    search_results?: SearchResult[];
-  }): Promise<ContextResponse> {
-    const response = (await this.call("app_select_context", input)) as ContextResponse;
-    if (!response.context_transfer?.url) return response;
-    const context = await fetchTransfer<ContextResponse>(response.context_transfer);
-    return { ...response, ...context, job: response.job };
-  }
-
-  async saveResearchResult(input: { research_id: string }): Promise<ResultTransferDescriptor> {
-    const response = (await this.call("app_save_research_result", input)) as TransferResponse;
-    if (!response.transfer?.url) throw new Error("Save response did not include a result transfer URL.");
-    return response.transfer;
-  }
-
-  async uploadResearchResult(transfer: ResultTransferDescriptor, input: { report_markdown: string; source_urls?: string[]; citation_sources?: CitationSource[] }): Promise<ResultResponse> {
-    return fetchTransfer<ResultResponse>(transfer, input);
   }
 
   complete(request: Parameters<AnnaRuntimeApi["llm"]["complete"]>[0]) {
@@ -383,10 +325,14 @@ export class AnnaResearchApi implements ResearchApi {
 }
 
 function toolTimeoutMs(method: string, args: Record<string, unknown>): number | undefined {
-  if (method === "app_embed_attachment_chunks" || method === "app_summarize_attachments") {
+  if (
+    method === "app_embed_attachment_chunks" ||
+    method === "app_summarize_attachments" ||
+    method === "app_select_section_context"
+  ) {
     return LONG_TOOL_TIMEOUT_MS;
   }
-  if (method === "app_call_research_source" || method === "app_call_section_research_source") {
+  if (method === "app_call_section_research_source") {
     return args.source_id === "duckduckgo" ? LONG_TOOL_TIMEOUT_MS : undefined;
   }
   if (method === "app_test_research_source") {
@@ -425,7 +371,6 @@ export function createStandaloneApi(): ResearchApi {
   };
   return {
     getSettings: fail,
-    updateSettings: fail,
     listResearchSources: fail,
     updateResearchSourceCredential: fail,
     setResearchSourceEnabled: fail,
@@ -440,7 +385,6 @@ export function createStandaloneApi(): ResearchApi {
     selectAttachmentContext: fail,
     getResearchJob: fail,
     listResearchJobs: fail,
-    callResearchSource: fail,
     saveConfirmedResearchRole: fail,
     saveConfirmedResearchFocuses: fail,
     saveConfirmedResearchOutline: fail,
@@ -448,12 +392,8 @@ export function createStandaloneApi(): ResearchApi {
     selectSectionContext: fail,
     saveSectionResult: fail,
     getSectionResult: fail,
-    failSection: fail,
     saveReportFraming: fail,
     saveAssembledResearchResult: fail,
-    selectContext: fail,
-    saveResearchResult: fail,
-    uploadResearchResult: fail,
     complete: fail as ResearchApi["complete"],
     createAgentSession: fail,
   };

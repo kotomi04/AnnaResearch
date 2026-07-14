@@ -7,38 +7,102 @@ export async function collectAgentText(
 ): Promise<string> {
   let streamedText = "";
   let finalText = "";
+  let frameCount = 0;
+  const observedEvents = new Set<string>();
 
-  for await (const frame of stream) {
-    options.onFrame?.(frame);
-    const event = String(frame.event || "").toLowerCase();
-    if (event === "raw" && frame.text?.trim() === "[DONE]") break;
-    if (event === "tool_call" || event === "tool_result") continue;
+  outer: for await (const receivedFrame of stream) {
+    options.onFrame?.(receivedFrame);
+    for (const frame of expandFrames(receivedFrame)) {
+      frameCount += 1;
+      const event = frameEvent(frame);
+      observedEvents.add(event || "unknown");
+      if (event === "error") {
+        throw new Error(frameErrorMessage(frame) || "Anna Agent stream returned an error.");
+      }
+      if (event === "raw" && extractFrameText(frame).trim() === "[DONE]") break outer;
+      if (event === "tool_call" || event === "tool_result") continue;
 
-    const choiceDeltas = (frame.choices || [])
-      .map((choice) => [choice?.delta?.content, choice?.delta?.text].filter(isText).join(""))
-      .join("");
-    const isFinalEvent = event === "message" || event === "final" || event === "complete";
-    const finalCandidate = [
-      isFinalEvent ? frame.text : "",
-      isFinalEvent ? frame.output_text : "",
-      isFinalEvent ? contentToText(frame.content) : "",
-      isFinalEvent ? contentToText(frame.message?.content) : "",
-      ...(frame.choices || []).map((choice) => contentToText(choice?.message?.content)),
-    ]
-      .filter(isText)
-      .join("");
-
-    if (finalCandidate.trim()) finalText = finalCandidate;
-    if (!finalCandidate.trim() && event !== "message" && event !== "final" && event !== "complete" && event !== "end") {
-      const directDelta = [frame.text, frame.output_text, contentToText(frame.content)].filter(isText).join("");
-      streamedText += directDelta || choiceDeltas;
+      const isFinalEvent = event === "message" || event === "final" || event === "complete";
+      const candidate = extractFrameText(frame);
+      if (isFinalEvent && candidate.trim()) {
+        finalText = candidate;
+      } else if (candidate && event !== "message" && event !== "final" && event !== "complete" && event !== "end") {
+        streamedText += candidate;
+      }
+      if (event === "complete" || event === "end") break outer;
     }
-    if (event === "complete" || event === "end") break;
   }
 
   const text = (finalText || streamedText).trim();
-  if (!text) throw new Error(emptyMessage);
+  if (!text) {
+    const diagnostic = frameCount === 0
+      ? "received no stream frames"
+      : `received ${frameCount} frame(s): ${Array.from(observedEvents).join(", ")}`;
+    throw new Error(`${emptyMessage} (${diagnostic}).`);
+  }
   return text;
+}
+
+function expandFrames(frame: AnnaAgentRunFrame): AnnaAgentRunFrame[] {
+  if (!Array.isArray(frame.frames)) return [frame];
+  return frame.frames.flatMap(expandFrames);
+}
+
+function frameEvent(frame: AnnaAgentRunFrame): string {
+  const direct = String(frame.event || "").toLowerCase();
+  if (direct) return direct;
+  const payload = asFrame(frame.payload);
+  return payload ? frameEvent(payload) : "";
+}
+
+function extractFrameText(frame: AnnaAgentRunFrame): string {
+  const messageContent = typeof frame.message === "object" && frame.message
+    ? contentToText(frame.message.content)
+    : "";
+  const direct = firstText(
+    frame.text,
+    frame.output_text,
+    contentToText(frame.content),
+    typeof frame.delta === "string" ? frame.delta : "",
+    contentToText(asRecord(frame.delta)?.content),
+    contentToText(asRecord(frame.delta)?.text),
+    messageContent,
+  );
+  if (direct) return direct;
+
+  const choiceText = (frame.choices || [])
+    .map((choice) => firstText(
+      choice?.delta?.content,
+      choice?.delta?.text,
+      contentToText(choice?.message?.content),
+    ))
+    .join("");
+  if (choiceText) return choiceText;
+
+  const payload = asFrame(frame.payload);
+  return payload ? extractFrameText(payload) : "";
+}
+
+function frameErrorMessage(frame: AnnaAgentRunFrame): string {
+  if (typeof frame.message === "string") return frame.message;
+  const direct = firstText(frame.text, contentToText(frame.message?.content));
+  if (direct) return direct;
+  const payload = asFrame(frame.payload);
+  return payload ? frameErrorMessage(payload) : "";
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function asFrame(value: unknown): AnnaAgentRunFrame | undefined {
+  return asRecord(value) as AnnaAgentRunFrame | undefined;
+}
+
+function firstText(...values: unknown[]): string {
+  return values.find(isText) as string | undefined || "";
 }
 
 function contentToText(content: unknown): string {

@@ -4,7 +4,6 @@ import asyncio
 from collections.abc import Iterable
 
 from .models import ExtractedPage
-from .utils import truncate_text
 
 
 class BrowserFallbackError(RuntimeError):
@@ -35,7 +34,7 @@ def extract_with_browser_fallback(
     except Exception as exc:  # noqa: BLE001
         return ExtractedPage(url=clean_url, content_type="html", status="failed", error=f"browser_fallback_failed: {type(exc).__name__}: {exc}")
 
-    content = truncate_text(markdown.strip(), max_chars_per_page)
+    content = markdown.strip()
     if not content:
         return ExtractedPage(url=clean_url, title=title, icon=icon, content_type="html", status="failed", error="empty_content")
     return ExtractedPage(url=clean_url, title=title, icon=icon, raw_content=content, content_type="html")
@@ -77,7 +76,7 @@ def extract_many_with_browser_fallback(
             page = result
         else:
             title, icon, markdown = result
-            content = truncate_text(markdown.strip(), max_chars_per_page)
+            content = markdown.strip()
             if content:
                 page = ExtractedPage(url=url, title=title, icon=icon, raw_content=content, content_type="html")
             else:
@@ -127,13 +126,6 @@ def _crawl4ai_runtime(*, query: str, timeout: float):
         delay_before_return_html=0.5,
         word_count_threshold=20,
     )
-    if query:
-        try:
-            from crawl4ai import BM25ContentFilter, DefaultMarkdownGenerator
-
-            config.markdown_generator = DefaultMarkdownGenerator(content_filter=BM25ContentFilter(user_query=query))
-        except Exception:
-            pass
     return AsyncWebCrawler, config
 
 
@@ -157,8 +149,8 @@ def _markdown_text(markdown_obj: object) -> str:
     if markdown_obj is None:
         return ""
     return _first_non_empty_text(
-        getattr(markdown_obj, "fit_markdown", None),
         getattr(markdown_obj, "raw_markdown", None),
+        getattr(markdown_obj, "fit_markdown", None),
         markdown_obj,
     )
 

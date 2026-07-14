@@ -26,6 +26,18 @@ describe("collectAgentText", () => {
     expect(messageText).toBe("message answer");
   });
 
+  it("supports direct deltas, nested payloads, and buffered frames", async () => {
+    const directDelta = await collectAgentText(frames({ event: "delta", delta: "direct delta" }, { event: "complete" }));
+    const nestedPayload = await collectAgentText(frames({ payload: { event: "delta", text: "nested payload" } }, { event: "complete" }));
+    const buffered = await collectAgentText(
+      frames({ frames: [{ event: "delta", text: "buffered " }, { event: "delta", text: "answer" }, { event: "complete" }] }),
+    );
+
+    expect(directDelta).toBe("direct delta");
+    expect(nestedPayload).toBe("nested payload");
+    expect(buffered).toBe("buffered answer");
+  });
+
   it("reads direct message text and does not duplicate alternate delta fields", async () => {
     const messageText = await collectAgentText(frames({ event: "message", text: "direct message" }, { event: "complete" }));
     const deltaText = await collectAgentText(
@@ -40,6 +52,18 @@ describe("collectAgentText", () => {
     await expect(collectAgentText(frames({ event: "tool_result", text: "tool payload" }, { event: "complete" }), "empty section")).rejects.toThrow(
       "empty section",
     );
+  });
+
+  it("surfaces agent stream errors instead of reporting an empty response", async () => {
+    await expect(
+      collectAgentText(frames({ event: "error", message: "session cache miss" }), "empty section"),
+    ).rejects.toThrow("session cache miss");
+  });
+
+  it("adds frame diagnostics to genuinely empty responses", async () => {
+    await expect(
+      collectAgentText(frames({ event: "run_meta" }, { event: "complete" }), "empty section"),
+    ).rejects.toThrow("received 2 frame(s): run_meta, complete");
   });
 
   it("exposes every frame to an observer", async () => {

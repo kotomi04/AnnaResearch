@@ -1,6 +1,7 @@
 import { Fragment, cloneElement, isValidElement, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type { MessageKey } from "../i18n/messages";
 import type { CitationSource, ResearchResult, SearchResult } from "../types";
 import { SourceList } from "./SourceList";
@@ -294,7 +295,11 @@ export function ReportView({
             onMouseUp={endReportSelection}
             onContextMenu={captureSelection}
           >
-            {markdown ? <ReactMarkdown components={markdownComponents}>{markdown}</ReactMarkdown> : t("emptyReport")}
+            {markdown ? (
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                {markdown}
+              </ReactMarkdown>
+            ) : t("emptyReport")}
           </article>
         )}
       </div>
@@ -470,7 +475,6 @@ function CitationCard({
           ) : (
             <strong>{citation.file_name}</strong>
           )}
-          {attachmentChunkLabel(citation) ? <span className="citation-card-host">{attachmentChunkLabel(citation)}</span> : null}
           {citation.quote ? <span className="citation-card-snippet">{citation.quote}</span> : null}
         </div>
       </aside>
@@ -577,6 +581,11 @@ function reportMarkdownComponents({
     h3: ({ children }) => wrap("h3", children),
     h4: ({ children }) => wrap("h4", children),
     blockquote: ({ children }) => wrap("blockquote", children),
+    table: ({ children }) => (
+      <div className="report-table-scroll" role="region" aria-label="Markdown table" tabIndex={0}>
+        <table>{children}</table>
+      </div>
+    ),
   };
 }
 
@@ -676,16 +685,7 @@ function uniqueNumbers(numbers: number[]): number[] {
 function citationTitle(source: CitationSource | undefined): string {
   if (!source) return "";
   if (source.kind === "url") return source.url;
-  const label = attachmentChunkLabel(source);
-  return `${source.file_name}${label ? ` · ${label}` : ""}`;
-}
-
-function attachmentChunkLabel(reference: Extract<CitationSource, { kind: "attachment" }>): string {
-  const chunkId = String(reference.chunk_id || "");
-  const match = /:(?:0*)(\d+)$/.exec(chunkId);
-  if (match) return `chunk ${Number(match[1])}`;
-  if (chunkId.endsWith(":image-summary")) return "";
-  return chunkId ? "chunk" : "";
+  return source.file_name;
 }
 
 function hostFromUrl(url: string): string {
@@ -713,7 +713,11 @@ function normalizeUrlForMatch(url: string): string {
 }
 
 function compactSnippet(text: string): string {
-  const clean = String(text || "").replace(/\s+/g, " ").trim();
+  const clean = String(text || "")
+    .replace(/\[(?:Chunk|Chunks)\s+\d+(?:\s*-\s*\d+)?\]\s*/gi, "")
+    .replace(/\[\.\.\.\s*omitted\s*\.\.\.\]/gi, "…")
+    .replace(/\s+/g, " ")
+    .trim();
   return clean.length > 260 ? `${clean.slice(0, 259).trim()}…` : clean;
 }
 

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import threading
 from typing import Any
 import uuid
+
+
+MAX_PARALLEL_EMBEDDING_BATCHES = 8
 
 
 class EmbeddingsError(Exception):
@@ -20,6 +24,12 @@ class _PendingEmbedding:
     condition: threading.Condition
     response: dict[str, Any] | None = None
     error: EmbeddingsError | None = None
+
+
+@dataclass
+class EmbeddingBatchOutcome:
+    result: dict[str, Any] | None = None
+    error: Exception | None = None
 
 
 class AnnaEmbeddingsClient:
@@ -58,6 +68,42 @@ class AnnaEmbeddingsClient:
             self._pending.pop(req_id, None)
         raise EmbeddingsError(-32505, f"embeddings/create timed out after {timeout}s")
 
+    def create_batches(
+        self,
+        *,
+        batches: list[list[str]],
+        model: str = "anna-managed-v1",
+        timeout: float = 30.0,
+    ) -> list[dict[str, Any]]:
+        outcomes = self.create_batches_settled(batches=batches, model=model, timeout=timeout)
+        results: list[dict[str, Any]] = []
+        for outcome in outcomes:
+            if outcome.error is not None:
+                raise outcome.error
+            results.append(outcome.result or {})
+        return results
+
+    def create_batches_settled(
+        self,
+        *,
+        batches: list[list[str]],
+        model: str = "anna-managed-v1",
+        timeout: float = 30.0,
+    ) -> list[EmbeddingBatchOutcome]:
+        prepared_batches = [list(batch) for batch in batches]
+        if not prepared_batches:
+            return []
+
+        def create_batch(texts: list[str]) -> EmbeddingBatchOutcome:
+            try:
+                return EmbeddingBatchOutcome(result=self.create(texts=texts, model=model, timeout=timeout))
+            except Exception as exc:  # noqa: BLE001 - callers need per-batch failures for checkpointing
+                return EmbeddingBatchOutcome(error=exc)
+
+        worker_count = min(MAX_PARALLEL_EMBEDDING_BATCHES, len(prepared_batches))
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="embedding") as pool:
+            return list(pool.map(create_batch, prepared_batches))
+
     def dispatch_response(self, msg: dict[str, Any]) -> bool:
         if not isinstance(msg, dict) or "method" in msg:
             return False
@@ -80,37 +126,3 @@ class AnnaEmbeddingsClient:
                 pending.response = msg.get("result") or {}
             pending.condition.notify()
         return True
-
-
-def embed_texts(args: dict[str, Any], *, embeddings: AnnaEmbeddingsClient) -> dict[str, Any]:
-    raw_texts = args.get("texts") or args.get("input") or []
-    texts = [raw_texts] if isinstance(raw_texts, str) else list(raw_texts)
-    clean_texts = [str(text or "").strip() for text in texts if str(text or "").strip()]
-    model = str(args.get("model") or "anna-managed-v1")
-    timeout = float(args.get("timeout") or 30.0)
-    vectors: list[list[Any]] = []
-    usage: Any = None
-    meta: dict[str, Any] = {}
-    result = embeddings.create(texts=clean_texts, model=model, timeout=timeout)
-    data = result.get("data") or []
-    for item in data:
-        if isinstance(item, dict) and isinstance(item.get("embedding"), list):
-            vectors.append(item.get("embedding"))
-    usage = result.get("usage") or usage
-    if isinstance(result.get("_meta"), dict):
-        meta = result.get("_meta") or meta
-    first = vectors[0] if vectors else []
-    return {
-        "count": len(vectors),
-        "dimensions": meta.get("dimensions") or (len(first) if first else 0),
-        "vectors": vectors,
-        "first_vector_preview": first[:8] if isinstance(first, list) else [],
-        "model": model,
-        "usage": usage,
-        "_meta": {
-            "latencyMs": meta.get("latencyMs"),
-            "costUsd": meta.get("costUsd"),
-            "backendModel": meta.get("backendModel"),
-            "provider": meta.get("provider"),
-        },
-    }

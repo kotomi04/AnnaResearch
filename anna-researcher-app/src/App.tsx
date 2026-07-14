@@ -53,7 +53,6 @@ export function App() {
   const [selectedRoleIndex, setSelectedRoleIndex] = useState(0);
   const [selectedFocusIds, setSelectedFocusIds] = useState<string[]>([]);
   const [regenInstruction, setRegenInstruction] = useState("");
-  const [autonomousMode, setAutonomousMode] = useState(false);
   const [requestedStep, setRequestedStep] = useState<GuidedStepId | undefined>("need");
 
   useEffect(() => {
@@ -147,10 +146,6 @@ export function App() {
     setBriefNameDraft(parsed.briefName);
     setResearchNeedDraft(parsed.researchNeed);
   }, [research.job?.research_id, research.job?.query]);
-
-  useEffect(() => {
-    setAutonomousMode(research.job?.execution_mode === "autonomous_agent");
-  }, [research.job?.execution_mode, research.job?.research_id]);
 
   useEffect(() => () => revokeAttachmentObjectUrl(), []);
 
@@ -336,7 +331,7 @@ export function App() {
       void research.resumeResearchJob();
       return;
     }
-    void research.confirmOutlineAndRun(research.outlineDraft, autonomousMode ? "autonomous_agent" : "guided_sections");
+    void research.confirmOutlineAndRun(research.outlineDraft);
   }
 
   function showSources() {
@@ -619,8 +614,6 @@ export function App() {
                   onRegenerate={() => research.regenerateOutline(regenInstruction)}
                   onBack={() => setRequestedStep("focus")}
                   onStartGeneration={startGeneration}
-                  autonomousMode={autonomousMode}
-                  onAutonomousModeChange={setAutonomousMode}
                 />
               ) : step === "generate" ? (
                 <ReportGenerationPage
