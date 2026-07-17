@@ -3497,7 +3497,7 @@ wheels = [
 
 [[package]]
 name = "tool-xhz-researcher-python-e7k8xa3s"
-version = "0.2.5"
+version = "0.2.6"
 source = { editable = "." }
 dependencies = [
     { name = "arxiv" },

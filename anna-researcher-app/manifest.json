@@ -1,14 +1,13 @@
 {
   "schema": 2,
   "permissions": [
-    "host.agent",
     "tools.invoke",
     "ui.svg"
   ],
   "required_executas": [
     {
       "tool_id": "bundled:researcher",
-      "min_version": "0.2.5",
+      "min_version": "0.2.6",
       "version": "latest"
     }
   ],
