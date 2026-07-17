@@ -8,7 +8,7 @@
   "required_executas": [
     {
       "tool_id": "bundled:researcher",
-      "min_version": "0.2.4",
+      "min_version": "0.2.5",
       "version": "latest"
     }
   ],

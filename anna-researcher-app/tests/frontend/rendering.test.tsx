@@ -3,10 +3,10 @@ import { describe, expect, it, vi } from "vitest";
 import { formatResearchQuery, hasCompletedResearchResult, makeIntroStepLabel, makeStepLabel, materializeAttachmentPreviewUrl } from "../../src/App";
 import { useState } from "react";
 import { DraftGenerationPage } from "../../src/components/DraftGenerationPage";
-import { FocusReviewPage } from "../../src/components/FocusReviewPage";
 import { RegenerationControl } from "../../src/components/RegenerationControl";
 import { OutlineReviewPage } from "../../src/components/OutlineReviewPage";
 import { ReportDisplayPage } from "../../src/components/ReportDisplayPage";
+import { ReportGenerationPage } from "../../src/components/ReportGenerationPage";
 import { ReportView } from "../../src/components/ReportView";
 import { ResearchLibraryPage } from "../../src/components/ResearchLibraryPage";
 import { appendSourcesToMarkdown } from "../../src/export/exportFiles";
@@ -78,6 +78,52 @@ function reportTextNodes(): Text[] {
 function normalizeWhitespace(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
+
+describe("OutlineReviewPage", () => {
+  it("lets the user enable optional LLM source curation", () => {
+    const onSourceCurationModeChange = vi.fn();
+    const sections = [{
+      id: "section-1",
+      title: "Market evidence",
+      outline: "Compare current primary and secondary evidence.",
+      allowed_source_ids: ["tavily"],
+      max_iterations: 2,
+    }];
+    const sources: ResearchSourceView[] = [{
+      id: "tavily",
+      name: "Tavily",
+      kind: "builtin",
+      enabled: true,
+      max_parallel: 3,
+      credential_status: "configured",
+    }];
+
+    render(
+      <OutlineReviewPage
+        sections={sections}
+        sources={sources}
+        instruction=""
+        summary={summarizePlan({ sections })}
+        isBusy={false}
+        sourceCurationMode="off"
+        t={createTranslator("en")}
+        onSectionChange={vi.fn()}
+        onAddSection={vi.fn()}
+        onDeleteSection={vi.fn()}
+        onMoveSection={vi.fn()}
+        onToggleSectionSource={vi.fn()}
+        onInstructionChange={vi.fn()}
+        onRegenerate={vi.fn()}
+        onBack={vi.fn()}
+        onStartGeneration={vi.fn()}
+        onSourceCurationModeChange={onSourceCurationModeChange}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /Use LLM source curation/i }));
+    expect(onSourceCurationModeChange).toHaveBeenCalledWith("llm");
+  });
+});
 
 describe("locale preference UI behavior", () => {
   it("persists language switching in localStorage", async () => {
@@ -346,39 +392,38 @@ describe("SourceList", () => {
   });
 });
 
-describe("FocusReviewPage", () => {
-  it("renders the continue action with the selected focus count", () => {
-    const t = createTranslator("en");
+describe("Draft planning UI", () => {
+  it("offers continuation from a failed report generation page", () => {
+    const t = createTranslator("zh-CN");
+    const onContinue = vi.fn();
     render(
-      <FocusReviewPage
-        candidates={[
-          { id: "focus-1", text: "Market risk", rationale: "Check demand." },
-          { id: "focus-2", text: "Product depth", rationale: "Check roadmap." },
-        ]}
-        selectedIds={["focus-1"]}
-        instruction=""
-        summary={summarizePlan({
-          role: { server: "Analyst", agent_role_prompt: "Use sources." },
-          focuses: [],
-          sections: [],
-        })}
+      <ReportGenerationPage
+        job={{
+          research_id: "r1",
+          status: "failed",
+          active_section_index: 0,
+          confirmed_outline: [{ id: "section-1", title: "市场分析", outline: "分析市场。", allowed_source_ids: ["tavily"], max_iterations: 3 }],
+        }}
+        events={[]}
+        previews={[]}
+        sources={[]}
+        summary={{ roleName: "分析师", rolePrompt: "", sectionCount: 1, totalIterations: 3 }}
+        message="模型请求失败"
+        isError={true}
+        canContinue={true}
         isBusy={false}
         t={t}
-        onSelectedIdsChange={vi.fn()}
-        onCandidateChange={vi.fn()}
-        onInstructionChange={vi.fn()}
-        onRegenerate={vi.fn()}
-        onBack={vi.fn()}
-        onConfirm={vi.fn()}
+        onContinue={onContinue}
       />,
     );
 
-    expect(screen.getByText("1 selected")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Confirm focuses and continue" })).toBeTruthy();
+    expect(screen.getByText("模型请求失败").getAttribute("data-error")).toBe("true");
+    expect(screen.getByLabelText("报告段落进度")).toBeTruthy();
+    expect(screen.getByText("正在研究")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "继续生成" }));
+    expect(onContinue).toHaveBeenCalledTimes(1);
   });
-});
 
-describe("Draft planning UI", () => {
   it("renders an explicit loading page while waiting for a draft", () => {
     const t = createTranslator("en");
     render(
@@ -392,6 +437,41 @@ describe("Draft planning UI", () => {
 
     expect(screen.getByRole("heading", { name: "Generating Research Roles" })).toBeTruthy();
     expect(screen.getByLabelText("Generating draft")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Compare research roles" })).toBeTruthy();
+    expect(screen.getByText("Working live")).toBeTruthy();
+  });
+
+  it("shows real outline discovery stages, counters, and facet coverage", () => {
+    const t = createTranslator("en");
+    render(
+      <DraftGenerationPage
+        stepLabel="Outline"
+        title="Generating Research Outline"
+        message="Building the plan."
+        kind="outline"
+        job={{
+          research_id: "r1",
+          query: "Research brief name: Agent market\nResearch need: Compare vendors.",
+          outline_discovery: {
+            status: "seed_selected",
+            facet_count: 2,
+            query_count: 1,
+            result_count: 8,
+            facets: [
+              { id: "f1", task: "Compare vendor capabilities" },
+              { id: "f2", task: "Assess current pricing" },
+            ],
+          },
+        }}
+        t={t}
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: "Plan facet-covered sub-queries" })).toBeTruthy();
+    expect(screen.getByText("Compare vendor capabilities")).toBeTruthy();
+    expect(screen.getByText("Assess current pricing")).toBeTruthy();
+    expect(screen.getByText("8")).toBeTruthy();
+    expect(screen.getByText("Agent market")).toBeTruthy();
   });
 
   it("opens regeneration requirements in a dialog before replacing a draft", () => {
@@ -937,6 +1017,32 @@ describe("ReportView", () => {
     expect(screen.getAllByRole("checkbox")).toHaveLength(2);
     expect(document.querySelector("del")?.textContent).toBe("obsolete");
     expect(document.querySelector("pre code")?.textContent).toContain("const score = 10;");
+  });
+
+  it("renders citations inside table cells as citation cards", () => {
+    const t = createTranslator("en");
+    render(
+      <ReportView
+        result={{
+          report_markdown: "| Metric | Evidence |\n| --- | --- |\n| Growth | Supported by the source [1] |",
+          source_urls: ["https://example.com/table-source"],
+          sources: [
+            {
+              url: "https://example.com/table-source",
+              title: "Table evidence source",
+              content: "Evidence used by the report table.",
+            },
+          ],
+        }}
+        t={t}
+      />,
+    );
+
+    const citation = within(screen.getByRole("cell", { name: /Supported by the source/ })).getByRole("button", { name: "[1]" });
+    fireEvent.mouseEnter(citation);
+
+    const card = document.querySelector(".citation-card") as HTMLElement;
+    expect(within(card).getByText("Table evidence source")).toBeTruthy();
   });
 
   it("previews a citation card on hover and switches between references from the same sentence", () => {

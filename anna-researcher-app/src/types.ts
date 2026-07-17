@@ -107,6 +107,13 @@ export interface SourceCallResult {
   calls: SourceCallSummary[];
 }
 
+export interface SectionResearchDecision {
+  type: "call_source" | "finish";
+  knowledge_gap?: string;
+  rationale?: string;
+  target_facet_ids?: string[];
+}
+
 export interface IterationEntry {
   iteration: number;
   source_id: string;
@@ -114,6 +121,7 @@ export interface IterationEntry {
   queries: string[];
   results_count: number;
   source_calls: SourceCallSummary[];
+  research_decision?: SectionResearchDecision | null;
   appended_at?: string;
 }
 
@@ -126,8 +134,16 @@ export interface ReportSection {
   id: string;
   title: string;
   outline: string;
+  facet_ids?: string[];
   allowed_source_ids: string[];
   max_iterations: number;
+}
+
+export type SourceCurationMode = "off" | "llm";
+
+export interface ResearchOptions {
+  source_curation_mode?: SourceCurationMode;
+  source_curation_version?: string;
 }
 
 export interface SectionContext {
@@ -147,6 +163,7 @@ export interface SectionResult {
   section_markdown?: string;
   section_markdown_chars?: number;
   section_summary: string;
+  subsection_headers?: string[];
   source_urls?: string[];
   source_count?: number;
   citation_sources?: CitationSource[];
@@ -316,8 +333,18 @@ export interface ResearchJob {
   schema_version?: number;
   workflow?: string;
   confirmed_role?: ConfirmedResearchRole | null;
-  confirmed_focuses?: string[];
   confirmed_outline?: ReportSection[];
+  research_options?: ResearchOptions;
+  section_source_curations?: Record<string, unknown>;
+  outline_discovery?: {
+    status?: string;
+    facets?: Array<{ id: string; task: string }>;
+    query_count?: number;
+    facet_count?: number;
+    result_count?: number;
+    selected_source_count?: number;
+    updated_at?: string;
+  } | null;
   active_section_index?: number | null;
   section_iterations?: Record<string, IterationEntry[]>;
   section_selected_context?: Record<string, SectionContext>;
@@ -494,10 +521,8 @@ export type ResearchPhase =
   | "settings_required"
   | "starting"
   | "generating_roles"
-  | "generating_focuses"
   | "generating_outline"
   | "role_review"
-  | "focus_review"
   | "outline_review"
   | "running"
   | "loading_result"

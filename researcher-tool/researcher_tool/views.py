@@ -64,9 +64,25 @@ def compact_job_view(job: dict[str, Any], *, include_section_markdown: bool = Fa
     data["schema_version"] = int(job.get("schema_version") or 1)
     data["workflow"] = job.get("workflow") or ("legacy" if int(job.get("schema_version") or 1) < 2 else "sectioned_research")
     data["confirmed_role"] = job.get("confirmed_role")
-    data["confirmed_focuses"] = job.get("confirmed_focuses") or []
     data["confirmed_outline"] = job.get("confirmed_outline") or []
     data["active_section_index"] = job.get("active_section_index")
+    data["research_options"] = job.get("research_options") or {}
+    data["section_source_curations"] = job.get("section_source_curations") or {}
+    discovery = job.get("outline_discovery") or {}
+    discovery_contexts = discovery.get("selected_contexts") or {}
+    research_context = discovery_contexts.get("research") or {}
+    seed = discovery.get("seed") or {}
+    research_calls = discovery.get("research_calls") or []
+    query_plan = discovery.get("query_plan") or {}
+    data["outline_discovery"] = {
+        "status": discovery.get("status"),
+        "facets": query_plan.get("facets") or [],
+        "query_count": len(query_plan.get("queries") or []),
+        "facet_count": len(query_plan.get("facets") or []),
+        "result_count": int(seed.get("results_count") or 0) + sum(int(entry.get("results_count") or 0) for entry in research_calls),
+        "selected_source_count": int(research_context.get("selected_sources_count") or 0),
+        "updated_at": discovery.get("updated_at"),
+    } if discovery else None
     data["section_iterations"] = {
         section_id: [iteration_summary_view(it) for it in (iterations or [])]
         for section_id, iterations in (job.get("section_iterations") or {}).items()
@@ -139,6 +155,7 @@ def section_result_view(result: dict[str, Any], *, include_markdown: bool = Fals
         "section_id": result.get("section_id"),
         "status": result.get("status"),
         "section_summary": result.get("section_summary") or "",
+        "subsection_headers": result.get("subsection_headers") or [],
         "source_urls": result.get("source_urls") or [],
         "citation_sources": result.get("citation_sources") or [],
         "error": result.get("error"),
@@ -165,6 +182,7 @@ def compact_section_result_view(result: dict[str, Any]) -> dict[str, Any]:
         "section_id": result.get("section_id"),
         "status": result.get("status"),
         "section_summary": result.get("section_summary") or "",
+        "subsection_headers": result.get("subsection_headers") or [],
         "source_count": len(source_urls),
         "citation_source_count": len(citation_sources),
         "attachment_citation_count": attachment_count,
@@ -214,6 +232,7 @@ def iteration_view(entry: dict[str, Any]) -> dict[str, Any]:
             {k: v for k, v in (call or {}).items() if k != "items"}
             for call in (entry.get("source_calls") or [])
         ],
+        "research_decision": entry.get("research_decision"),
         "appended_at": entry.get("appended_at"),
     }
 
@@ -232,6 +251,7 @@ def iteration_summary_view(entry: dict[str, Any]) -> dict[str, Any]:
         "source_name": entry.get("source_name") or "",
         "queries": entry.get("queries") or [],
         "results_count": int(entry.get("results_count") or 0),
+        "research_decision": entry.get("research_decision"),
         "appended_at": entry.get("appended_at"),
     }
 

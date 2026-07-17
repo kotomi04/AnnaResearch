@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import heapq
 import math
-from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -15,10 +14,10 @@ from .web_documents import WebDocumentStore
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 100
 RANK_TOP_K = 20
-RRF_K = 20
-MAX_SELECTED_CHUNKS = 12
-MAX_CHUNKS_PER_URL = 4
-EMBEDDING_BATCH_SIZE = 2
+RRF_K = 60
+MAX_SELECTED_CHUNKS_PER_QUERY = 8
+EMBEDDING_SIMILARITY_THRESHOLD = 0.35
+EMBEDDING_BATCH_SIZE = 1
 EMBEDDING_MODEL = "anna-managed-v1"
 EMBEDDING_TIMEOUT_SECONDS = 45.0
 
@@ -42,8 +41,8 @@ class EvidenceChunk:
     document_text: str
     bm25_ranks: dict[str, int] = field(default_factory=dict)
     embedding_ranks: dict[str, int] = field(default_factory=dict)
-    rrf_score: float = 0.0
-    best_rank: int = 10**9
+    embedding_scores: dict[str, float] = field(default_factory=dict)
+    query_rrf_scores: dict[str, float] = field(default_factory=dict)
 
 
 class HybridContextSelector:
@@ -60,13 +59,14 @@ class HybridContextSelector:
         search_queries: list[str],
         search_results: list[dict[str, Any]],
         research_id: str = "",
+        diversify_queries: bool = False,
     ) -> dict[str, Any]:
         queries = _unique_texts(search_queries) or _unique_texts([query])
         chunks = self._build_chunks(research_id, search_results)
         if not chunks or not queries:
             return {"selected_sources": [], "source_urls": [], "selected_context": ""}
 
-        rankings: list[tuple[str, str, list[EvidenceChunk]]] = []
+        bm25_rankings: list[list[EvidenceChunk]] = []
         tokenized = [tokenize(chunk.title + "\n" + chunk.text) for chunk in chunks]
         bm25 = BM25Okapi(tokenized)
         for sub_query in queries:
@@ -76,30 +76,44 @@ class HybridContextSelector:
                 for index in sorted(range(len(chunks)), key=lambda index: (-scores[index], chunks[index].source_order, chunks[index].chunk_index))
                 if scores[index] > 0
             ][:RANK_TOP_K]
-            rankings.append(("bm25", sub_query, ranked))
+            bm25_rankings.append(ranked)
 
         embedding_rankings = self._embedding_rankings(queries, chunks)
-        rankings.extend(("embedding", sub_query, ranked) for sub_query, ranked in zip(queries, embedding_rankings, strict=True))
-
-        for rank_type, sub_query, ranked in rankings:
-            for rank, chunk in enumerate(ranked, 1):
-                chunk.rrf_score += 1.0 / (RRF_K + rank)
-                chunk.best_rank = min(chunk.best_rank, rank)
-                target = chunk.bm25_ranks if rank_type == "bm25" else chunk.embedding_ranks
-                target[sub_query] = rank
-
-        candidates = [chunk for chunk in chunks if chunk.rrf_score > 0]
-        candidates.sort(key=lambda chunk: (-chunk.rrf_score, chunk.best_rank, chunk.source_order, chunk.chunk_index, chunk.chunk_id))
         selected_chunks: list[EvidenceChunk] = []
-        per_url: dict[str, int] = defaultdict(int)
-        for chunk in candidates:
-            source_key = same_url_without_fragment(chunk.url) or chunk.document_id
-            if per_url[source_key] >= MAX_CHUNKS_PER_URL:
-                continue
-            selected_chunks.append(chunk)
-            per_url[source_key] += 1
-            if len(selected_chunks) >= MAX_SELECTED_CHUNKS:
-                break
+        selected_ids: set[str] = set()
+        del diversify_queries  # Per-query Top K now provides query coverage directly.
+        for sub_query, bm25_ranked, embedding_ranked in zip(queries, bm25_rankings, embedding_rankings, strict=True):
+            for rank, chunk in enumerate(bm25_ranked, 1):
+                chunk.bm25_ranks[sub_query] = rank
+            for rank, (chunk, similarity) in enumerate(embedding_ranked, 1):
+                chunk.embedding_ranks[sub_query] = rank
+                chunk.embedding_scores[sub_query] = similarity
+
+            candidate_by_id = {chunk.chunk_id: chunk for chunk in bm25_ranked}
+            candidate_by_id.update({chunk.chunk_id: chunk for chunk, _similarity in embedding_ranked})
+            ranked_for_query = list(candidate_by_id.values())
+            query_scores: dict[str, float] = {}
+            for chunk in ranked_for_query:
+                score = 0.0
+                if sub_query in chunk.bm25_ranks:
+                    score += 1.0 / (RRF_K + chunk.bm25_ranks[sub_query])
+                if sub_query in chunk.embedding_ranks:
+                    score += 1.0 / (RRF_K + chunk.embedding_ranks[sub_query])
+                query_scores[chunk.chunk_id] = score
+            ranked_for_query.sort(
+                key=lambda chunk: (
+                    -query_scores[chunk.chunk_id],
+                    min(chunk.bm25_ranks.get(sub_query, 10**9), chunk.embedding_ranks.get(sub_query, 10**9)),
+                    chunk.source_order,
+                    chunk.chunk_index,
+                    chunk.chunk_id,
+                )
+            )
+            for chunk in ranked_for_query[:MAX_SELECTED_CHUNKS_PER_QUERY]:
+                chunk.query_rrf_scores[sub_query] = query_scores[chunk.chunk_id]
+                if chunk.chunk_id not in selected_ids:
+                    selected_chunks.append(chunk)
+                    selected_ids.add(chunk.chunk_id)
 
         selected_sources = _group_selected_chunks(selected_chunks)
         return {
@@ -167,7 +181,7 @@ class HybridContextSelector:
                 )
         return chunks
 
-    def _embedding_rankings(self, queries: list[str], chunks: list[EvidenceChunk]) -> list[list[EvidenceChunk]]:
+    def _embedding_rankings(self, queries: list[str], chunks: list[EvidenceChunk]) -> list[list[tuple[EvidenceChunk, float]]]:
         query_vectors = _embed_texts(self.embeddings, queries)
         query_norms = [_vector_norm(vector) for vector in query_vectors]
         heaps: list[list[tuple[float, int, int, str]]] = [[] for _query in queries]
@@ -183,6 +197,8 @@ class HybridContextSelector:
                 vector_norm = _vector_norm(vector)
                 for query_index, query_vector in enumerate(query_vectors):
                     similarity = _cosine(query_vector, query_norms[query_index], vector, vector_norm)
+                    if similarity < EMBEDDING_SIMILARITY_THRESHOLD:
+                        continue
                     entry = (similarity, -chunk.source_order, -chunk.chunk_index, chunk.chunk_id)
                     heap = heaps[query_index]
                     if len(heap) < RANK_TOP_K:
@@ -191,10 +207,10 @@ class HybridContextSelector:
                         heapq.heapreplace(heap, entry)
             del vectors
 
-        rankings: list[list[EvidenceChunk]] = []
+        rankings: list[list[tuple[EvidenceChunk, float]]] = []
         for heap in heaps:
             ordered = sorted(heap, key=lambda entry: (-entry[0], -entry[1], -entry[2], entry[3]))
-            rankings.append([chunk_by_id[entry[3]] for entry in ordered])
+            rankings.append([(chunk_by_id[entry[3]], entry[0]) for entry in ordered])
         return rankings
 
 
@@ -264,6 +280,7 @@ def _group_selected_chunks(selected: list[EvidenceChunk]) -> list[dict[str, Any]
     sources: list[dict[str, Any]] = []
     for key in group_order:
         chunks = sorted(groups[key], key=lambda chunk: chunk.chunk_index)
+        source_score = max((score for chunk in chunks for score in chunk.query_rrf_scores.values()), default=0.0)
         sources.append(
             {
                 "query": chunks[0].query,
@@ -272,8 +289,8 @@ def _group_selected_chunks(selected: list[EvidenceChunk]) -> list[dict[str, Any]
                 "content": _reassemble(chunks),
                 "source_id": chunks[0].source_id,
                 "source_name": chunks[0].source_name,
-                "score": round(max(chunk.rrf_score for chunk in chunks), 8),
-                "rrf_score": round(max(chunk.rrf_score for chunk in chunks), 8),
+                "score": round(source_score, 8),
+                "rrf_score": round(source_score, 8),
                 "content_type": chunks[0].content_type,
                 "icon": chunks[0].icon,
                 "selected_chunks": [
@@ -282,9 +299,25 @@ def _group_selected_chunks(selected: list[EvidenceChunk]) -> list[dict[str, Any]
                         "chunk_index": chunk.chunk_index,
                         "start": chunk.start,
                         "end": chunk.end,
-                        "rrf_score": round(chunk.rrf_score, 8),
+                        "rrf_score": round(max(chunk.query_rrf_scores.values(), default=0.0), 8),
                         "bm25_ranks": chunk.bm25_ranks,
                         "embedding_ranks": chunk.embedding_ranks,
+                        "embedding_scores": {query: round(score, 8) for query, score in chunk.embedding_scores.items()},
+                        "query_rrf_scores": {query: round(score, 8) for query, score in chunk.query_rrf_scores.items()},
+                        "matched_queries": [
+                            {
+                                "query": query,
+                                "rrf_score": round(score, 8),
+                                "bm25_rank": chunk.bm25_ranks.get(query),
+                                "embedding_rank": chunk.embedding_ranks.get(query),
+                                "embedding_similarity": (
+                                    round(chunk.embedding_scores[query], 8)
+                                    if query in chunk.embedding_scores
+                                    else None
+                                ),
+                            }
+                            for query, score in chunk.query_rrf_scores.items()
+                        ],
                     }
                     for chunk in chunks
                 ],

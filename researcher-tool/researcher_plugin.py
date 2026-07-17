@@ -13,11 +13,12 @@ from researcher_tool.attachment_summary import select_attachment_context, summar
 from researcher_tool.dispatcher import AppDispatcher
 from researcher_tool.embedding import AnnaEmbeddingsClient, EmbeddingsError
 from researcher_tool.errors import ResearcherToolError, ValidationError
+from researcher_tool.outline_discovery import generate_outline_draft
 from researcher_tool.sampling import AnnaSamplingClient, SamplingError
 from researcher_tool.sources.native.executor import NativeResearchSourceExecutor
 
 TOOL_ID = "tool-xhz-researcher-python-e7k8xa3s"
-VERSION = "0.2.4"
+VERSION = "0.2.5"
 APP_METHODS = [
     "app_get_settings",
     "app_create_research_job",
@@ -27,7 +28,7 @@ APP_METHODS = [
     "app_summarize_attachments",
     "app_select_attachment_context",
     "app_save_confirmed_research_role",
-    "app_save_confirmed_research_focuses",
+    "app_generate_outline_draft",
     "app_save_confirmed_research_outline",
     "app_get_research_job",
     "app_list_research_jobs",
@@ -137,6 +138,19 @@ def handle_invoke(req_id: Any, params: dict[str, Any]) -> dict[str, Any]:
                 research_id=str(args.get("research_id") or ""),
                 query=str(args.get("query") or ""),
                 top_k=int(args.get("top_k") or 8),
+            )
+        elif tool == "app_generate_outline_draft":
+            source_ids = args.get("source_ids") or []
+            if not isinstance(source_ids, list):
+                raise ValidationError("source_ids must be an array")
+            data = generate_outline_draft(
+                dispatcher=dispatcher,
+                sampling=sampling,
+                research_id=str(args.get("research_id") or ""),
+                source_ids=[str(source_id) for source_id in source_ids],
+                instruction=str(args.get("instruction") or ""),
+                reuse_discovery=bool(args.get("reuse_discovery")),
+                invoke_id=invoke_id,
             )
         else:
             data = dispatcher.dispatch(tool, args)

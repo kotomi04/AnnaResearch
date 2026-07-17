@@ -3,7 +3,6 @@ import { connectAnnaRuntime } from "./api/annaRuntime";
 import { getResearchFileDownloadDescriptors, uploadResearchFilesToAps } from "./api/apsFiles";
 import { AnnaResearchApi, createStandaloneApi, type ResearchApi } from "./api/researchApi";
 import { DraftGenerationPage } from "./components/DraftGenerationPage";
-import { FocusReviewPage } from "./components/FocusReviewPage";
 import { LanguageToggle } from "./components/LanguageToggle";
 import { OutlineReviewPage } from "./components/OutlineReviewPage";
 import { AttachmentPreviewDialog, type AttachmentPreviewKind } from "./components/AttachmentPreviewDialog";
@@ -20,7 +19,7 @@ import { RoleReviewPage } from "./components/RoleReviewPage";
 import { TaskPickerPage } from "./components/TaskPickerPage";
 import { WorkflowStepper } from "./components/WorkflowStepper";
 import { MAX_RESEARCH_ITERATIONS, useResearchJob } from "./hooks/useResearchJob";
-import type { FocusCandidate, RoleCandidate } from "./hooks/useResearchJob";
+import type { RoleCandidate } from "./hooks/useResearchJob";
 import { localizedError, localizedJobMessage } from "./i18n/status";
 import { useLocale } from "./i18n/useLocale";
 import type { AnnaRuntimeApi, CitationSource, ReportSection, ResearchAttachment } from "./types";
@@ -51,7 +50,6 @@ export function App() {
   const [attachmentPreview, setAttachmentPreview] = useState<AttachmentPreviewState | null>(null);
   const attachmentObjectUrlRef = useRef<string | null>(null);
   const [selectedRoleIndex, setSelectedRoleIndex] = useState(0);
-  const [selectedFocusIds, setSelectedFocusIds] = useState<string[]>([]);
   const [regenInstruction, setRegenInstruction] = useState("");
   const [requestedStep, setRequestedStep] = useState<GuidedStepId | undefined>("need");
 
@@ -108,7 +106,6 @@ export function App() {
   );
   const planSummary = summarizePlan({
     role: research.job?.confirmed_role,
-    focuses: research.job?.confirmed_focuses,
     sections: research.outlineDraft.length ? research.outlineDraft : research.job?.confirmed_outline,
   });
 
@@ -117,8 +114,6 @@ export function App() {
       setRequestedStep("need");
     } else if (research.phase === "role_review" || research.phase === "generating_roles") {
       setRequestedStep("role");
-    } else if (research.phase === "focus_review" || research.phase === "generating_focuses") {
-      setRequestedStep("focus");
     } else if (research.phase === "outline_review" || research.phase === "generating_outline") {
       setRequestedStep("outline");
     } else if (research.phase === "running") {
@@ -133,12 +128,6 @@ export function App() {
       setSelectedRoleIndex(0);
     }
   }, [research.roleCandidates.length, selectedRoleIndex]);
-
-  useEffect(() => {
-    if (research.job?.confirmed_focuses?.length && research.focusCandidates.length) {
-      setSelectedFocusIds(research.focusCandidates.map((focus) => focus.id));
-    }
-  }, [research.focusCandidates, research.job?.confirmed_focuses]);
 
   useEffect(() => {
     if (!research.job?.query) return;
@@ -234,7 +223,6 @@ export function App() {
   function start(input: { briefName: string; researchNeed: string }) {
     setValidationMessage("");
     setSelectedRoleIndex(0);
-    setSelectedFocusIds([]);
     setRegenInstruction("");
     setRequestedStep("role");
     const attachments = pendingAttachments;
@@ -264,10 +252,6 @@ export function App() {
 
   function updateRoleCandidate(index: number, patch: Partial<RoleCandidate>) {
     research.setRoleCandidates(research.roleCandidates.map((candidate, idx) => (idx === index ? { ...candidate, ...patch } : candidate)));
-  }
-
-  function updateFocusCandidate(index: number, patch: Partial<FocusCandidate>) {
-    research.setFocusCandidates(research.focusCandidates.map((candidate, idx) => (idx === index ? { ...candidate, ...patch } : candidate)));
   }
 
   function updateOutlineSection(index: number, patch: Partial<ReportSection>) {
@@ -318,12 +302,6 @@ export function App() {
     void research.confirmRole(role);
   }
 
-  function confirmFocuses() {
-    const focuses = research.focusCandidates.filter((focus) => selectedFocusIds.includes(focus.id)).map((focus) => focus.text);
-    setRegenInstruction("");
-    void research.confirmFocuses(focuses);
-  }
-
   function startGeneration() {
     setRegenInstruction("");
     setRequestedStep("generate");
@@ -353,7 +331,6 @@ export function App() {
     setResearchNeedDraft("");
     setPendingAttachments([]);
     setSelectedRoleIndex(0);
-    setSelectedFocusIds([]);
     setRegenInstruction("");
     setRequestedStep("need");
     setAppPage("workflow");
@@ -529,13 +506,8 @@ export function App() {
                   stepLabel={t("stepRole")}
                   title={t("generatingRolesTitle")}
                   message={t("generatingRolesMessage")}
-                  t={t}
-                />
-              ) : research.phase === "generating_focuses" ? (
-                <DraftGenerationPage
-                  stepLabel={t("stepFocus")}
-                  title={t("generatingFocusesTitle")}
-                  message={t("generatingFocusesMessage")}
+                  kind="role"
+                  job={research.job}
                   t={t}
                 />
               ) : research.phase === "generating_outline" ? (
@@ -543,6 +515,8 @@ export function App() {
                   stepLabel={t("stepOutline")}
                   title={t("generatingOutlineTitle")}
                   message={t("generatingOutlineMessage")}
+                  kind="outline"
+                  job={research.job}
                   t={t}
                 />
               ) : step === "need" ? (
@@ -582,21 +556,6 @@ export function App() {
                   onBack={() => setRequestedStep("need")}
                   onConfirm={confirmRole}
                 />
-              ) : step === "focus" ? (
-                <FocusReviewPage
-                  candidates={research.focusCandidates}
-                  selectedIds={selectedFocusIds}
-                  instruction={regenInstruction}
-                  summary={planSummary}
-                  isBusy={research.isBusy}
-                  t={t}
-                  onSelectedIdsChange={setSelectedFocusIds}
-                  onCandidateChange={updateFocusCandidate}
-                  onInstructionChange={setRegenInstruction}
-                  onRegenerate={() => research.regenerateFocuses(regenInstruction)}
-                  onBack={() => setRequestedStep("role")}
-                  onConfirm={confirmFocuses}
-                />
               ) : step === "outline" ? (
                 <OutlineReviewPage
                   sections={research.outlineDraft}
@@ -604,6 +563,7 @@ export function App() {
                   instruction={regenInstruction}
                   summary={planSummary}
                   isBusy={research.isBusy}
+                  sourceCurationMode={research.sourceCurationMode}
                   t={t}
                   onSectionChange={updateOutlineSection}
                   onAddSection={addOutlineSection}
@@ -612,8 +572,9 @@ export function App() {
                   onToggleSectionSource={toggleSectionSource}
                   onInstructionChange={setRegenInstruction}
                   onRegenerate={() => research.regenerateOutline(regenInstruction)}
-                  onBack={() => setRequestedStep("focus")}
+                  onBack={() => setRequestedStep("role")}
                   onStartGeneration={startGeneration}
+                  onSourceCurationModeChange={research.setSourceCurationMode}
                 />
               ) : step === "generate" ? (
                 <ReportGenerationPage
@@ -624,7 +585,10 @@ export function App() {
                   summary={planSummary}
                   message={message}
                   isError={isMessageError}
+                  canContinue={research.phase === "failed" && Boolean(research.job?.confirmed_outline?.length)}
+                  isBusy={research.isBusy}
                   t={t}
+                  onContinue={() => void research.resumeResearchJob()}
                 />
               ) : (
                 <ReportDisplayPage
@@ -746,7 +710,7 @@ export function hasCompletedResearchResult(
 }
 
 export function canResumeResearchJob(
-  job: { status?: string; confirmed_role?: unknown; confirmed_focuses?: unknown[]; confirmed_outline?: unknown[] } | null | undefined,
+  job: { status?: string; confirmed_role?: unknown; confirmed_outline?: unknown[] } | null | undefined,
 ): boolean {
-  return job?.status !== "completed" && Boolean(job?.confirmed_role && job.confirmed_focuses?.length && job.confirmed_outline?.length);
+  return job?.status !== "completed" && Boolean(job?.confirmed_role && job.confirmed_outline?.length);
 }

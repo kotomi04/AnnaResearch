@@ -5,7 +5,6 @@ import type {
   AnnaAgentSession,
   CitationSource,
   ConfirmedResearchRole,
-  IterationEntry,
   ReportFraming,
   ReportSection,
   ResearchJob,
@@ -13,6 +12,8 @@ import type {
   ResearchResult,
   ResearchSourceTestResult,
   ResearchSourceView,
+  SearchResult,
+  SourceCurationMode,
   ToolSettings,
 } from "../types";
 import {
@@ -31,34 +32,31 @@ export interface RoleCandidate extends ConfirmedResearchRole {
   rationale?: string;
 }
 
-export interface FocusCandidate {
-  id: string;
-  text: string;
-  rationale?: string;
-}
-
 interface CitationReference {
   number: number;
   source: CitationSource;
 }
 
-interface DecideCallSource {
-  type: "call_source";
+interface SectionSerpQuery {
+  query: string;
+  researchGoal: string;
+}
+
+interface SectionQueryPlan {
   source_id?: string;
-  queries: string[];
+  queries: SectionSerpQuery[];
 }
 
-interface DecideFinish {
-  type: "finish";
-  reason?: string;
+interface SectionResearchLearning {
+  learnings: string[];
+  followUpQuestions: string[];
 }
-
-type Decision = DecideCallSource | DecideFinish;
 
 interface SectionRunResult {
   section: ReportSection;
   markdown: string;
   summary: string;
+  subsectionHeaders: string[];
   sourceUrls: string[];
   citationSources: CitationSource[];
 }
@@ -105,8 +103,8 @@ export function useResearchJob(api: ResearchApi) {
   const [phase, setPhase] = useState<ResearchPhase>("idle");
   const [error, setError] = useState<unknown>(null);
   const [roleCandidates, setRoleCandidates] = useState<RoleCandidate[]>([]);
-  const [focusCandidates, setFocusCandidates] = useState<FocusCandidate[]>([]);
   const [outlineDraft, setOutlineDraft] = useState<ReportSection[]>([]);
+  const [sourceCurationMode, setSourceCurationMode] = useState<SourceCurationMode>("off");
   const [runEvents, setRunEvents] = useState<RunEvent[]>([]);
   const [sectionPreviews, setSectionPreviews] = useState<SectionPreview[]>([]);
   const runIdRef = useRef(0);
@@ -142,7 +140,7 @@ export function useResearchJob(api: ResearchApi) {
         setResult(latest?.result || null);
         setHistoryJobs(history);
         setRoleCandidates(roleCandidatesFromJob(latest));
-        setFocusCandidates(focusCandidatesFromJob(latest));
+        setSourceCurationMode(sourceCurationModeFromJob(latest));
         setRunEvents(projectStoredRunEvents(latest));
         setSectionPreviews(projectSectionPreviews(latest));
         if (latest?.status === "completed" && latest.result) {
@@ -152,6 +150,7 @@ export function useResearchJob(api: ResearchApi) {
         const ready = hasConfiguredSource(nextSources);
         if (!ready) setPhase("settings_required");
         else if (latest?.status === "completed" && latest.result) setPhase("completed");
+        else if (latest?.status === "failed") setPhase("failed");
         else setPhase("idle");
       } catch (err) {
         if (!cancelled) {
@@ -179,8 +178,8 @@ export function useResearchJob(api: ResearchApi) {
       setJob(selected);
       setResult(selected?.result || null);
       setRoleCandidates(roleCandidatesFromJob(selected));
-      setFocusCandidates(focusCandidatesFromJob(selected));
       setOutlineDraft(selected?.confirmed_outline || []);
+      setSourceCurationMode(sourceCurationModeFromJob(selected));
       setRunEvents(projectStoredRunEvents(selected));
       setSectionPreviews(projectSectionPreviews(selected));
       if (selected?.status === "completed" && selected.result) {
@@ -247,8 +246,8 @@ export function useResearchJob(api: ResearchApi) {
     setResult(null);
     setError(null);
     setRoleCandidates([]);
-    setFocusCandidates([]);
     setOutlineDraft([]);
+    setSourceCurationMode("off");
     setRunEvents([]);
     setSectionPreviews([]);
     setPhase(hasConfiguredSource(sources) ? "idle" : "settings_required");
@@ -262,8 +261,8 @@ export function useResearchJob(api: ResearchApi) {
       setPhase("generating_roles");
       setError(null);
       setResult(null);
-      setFocusCandidates([]);
       setOutlineDraft([]);
+      setSourceCurationMode("off");
       setRunEvents([]);
       setSectionPreviews([]);
       try {
@@ -316,46 +315,22 @@ export function useResearchJob(api: ResearchApi) {
   const confirmRole = useCallback(
     async (role: ConfirmedResearchRole) => {
       if (!job?.research_id) throw new Error("Research job is missing research_id.");
-      setPhase("generating_focuses");
-      try {
-        const saved = await api.saveConfirmedResearchRole(job.research_id, role);
-        setJob({ ...job, ...saved, confirmed_role: role });
-        const candidates = await generateFocusCandidates(api, promptQueryForJob(job), role);
-        setFocusCandidates(candidates);
-        setPhase("focus_review");
-      } catch (err) {
-        setError(err);
-        setPhase("failed");
-      }
-    },
-    [api, job],
-  );
-
-  const regenerateFocuses = useCallback(
-    async (instruction = "") => {
-      const role = job?.confirmed_role;
-      if (!job?.query || !role) return;
-      setPhase("generating_focuses");
-      try {
-        setFocusCandidates(await generateFocusCandidates(api, promptQueryForJob(job), role, instruction));
-        setPhase("focus_review");
-      } catch (err) {
-        setError(err);
-        setPhase("failed");
-      }
-    },
-    [api, job?.confirmed_role, job?.query],
-  );
-
-  const confirmFocuses = useCallback(
-    async (focuses: string[]) => {
-      if (!job?.research_id || !job.confirmed_role) throw new Error("Research job is not ready for focus confirmation.");
       setPhase("generating_outline");
       try {
-        const saved = await api.saveConfirmedResearchFocuses(job.research_id, focuses);
-        setJob({ ...job, ...saved, confirmed_focuses: focuses });
-        const outline = await generateOutlineDraft(api, promptQueryForJob(job), job.confirmed_role, focuses);
-        const assigned = await assignAllowedSources(api, outline, readyEnabledSources(sources));
+        const saved = await api.saveConfirmedResearchRole(job.research_id, role);
+        const activeJob = { ...job, ...saved, confirmed_role: role };
+        setJob(activeJob);
+        const readySources = readyEnabledSources(sources);
+        const outline = await observeJobProgress(
+          api,
+          activeJob.research_id,
+          api.generateOutlineDraft({
+          research_id: activeJob.research_id,
+          source_ids: readySources.map((source) => source.id),
+          }),
+          (snapshot) => setJob((current) => ({ ...(current || activeJob), ...snapshot })),
+        );
+        const assigned = await assignAllowedSources(api, outline, readySources);
         setOutlineDraft(assigned);
         setPhase("outline_review");
       } catch (err) {
@@ -368,18 +343,29 @@ export function useResearchJob(api: ResearchApi) {
 
   const regenerateOutline = useCallback(
     async (instruction = "") => {
-      if (!job?.query || !job.confirmed_role || !job.confirmed_focuses?.length) return;
+      if (!job?.query || !job.confirmed_role) return;
       setPhase("generating_outline");
       try {
-        const outline = await generateOutlineDraft(api, promptQueryForJob(job), job.confirmed_role, job.confirmed_focuses, instruction);
-        setOutlineDraft(await assignAllowedSources(api, outline, readyEnabledSources(sources), instruction));
+        const readySources = readyEnabledSources(sources);
+        const outline = await observeJobProgress(
+          api,
+          job.research_id,
+          api.generateOutlineDraft({
+          research_id: job.research_id,
+          source_ids: readySources.map((source) => source.id),
+          instruction,
+          reuse_discovery: true,
+          }),
+          (snapshot) => setJob((current) => ({ ...(current || job), ...snapshot })),
+        );
+        setOutlineDraft(await assignAllowedSources(api, outline, readySources, instruction));
         setPhase("outline_review");
       } catch (err) {
         setError(err);
         setPhase("failed");
       }
     },
-    [api, job?.confirmed_focuses, job?.confirmed_role, job?.query, sources],
+    [api, job, sources],
   );
 
   const runConfirmedSections = useCallback(
@@ -388,13 +374,24 @@ export function useResearchJob(api: ResearchApi) {
       if (!initialJob?.research_id) throw new Error("Research job is missing research_id.");
       const runId = runIdRef.current + 1;
       runIdRef.current = runId;
+      setError(null);
       setPhase("running");
       try {
-        let currentJob = options.resume ? initialJob : await api.saveConfirmedResearchOutline(initialJob.research_id, sections);
+        let configuredJob = initialJob;
+        if (!options.resume) {
+          configuredJob = await api.updateResearchJob(initialJob.research_id, {
+            research_options: {
+              ...(initialJob.research_options || {}),
+              source_curation_mode: sourceCurationMode,
+              source_curation_version: "upstream-v1",
+            },
+          });
+        }
+        const activeCurationMode = options.resume ? sourceCurationModeFromJob(configuredJob) : sourceCurationMode;
+        let currentJob = options.resume ? configuredJob : await api.saveConfirmedResearchOutline(initialJob.research_id, sections);
         const confirmedSections = currentJob.confirmed_outline?.length ? currentJob.confirmed_outline : sections;
         const role = currentJob.confirmed_role || initialJob.confirmed_role;
-        const focuses = currentJob.confirmed_focuses || initialJob.confirmed_focuses || [];
-        if (!role || !focuses.length || !confirmedSections.length) throw new Error("Research job is not ready to run.");
+        if (!role || !confirmedSections.length) throw new Error("Research job is not ready to run.");
         setRunEvents(options.resume ? projectStoredRunEvents(currentJob) : []);
         setSectionPreviews(options.resume ? projectSectionPreviews(currentJob) : []);
         setOutlineDraft(confirmedSections);
@@ -431,9 +428,9 @@ export function useResearchJob(api: ResearchApi) {
             reportOutline: confirmedSections,
             priorSectionResults: sectionResults,
             role,
-            focuses,
             sources: readyEnabledSources(sources),
             citationRegistry,
+            sourceCurationMode: activeCurationMode,
             onEvent: (event) => appendRunEvent(setRunEvents, event),
           });
           sectionResults.push({ section, ...sectionResult });
@@ -449,7 +446,7 @@ export function useResearchJob(api: ResearchApi) {
         });
         currentJob = await updateJob(api, currentJob, { stage: "report_framing", progress: 94 });
         setJob(currentJob);
-        const framing = await generateReportFraming(api, currentJob.query || initialJob.query || "", focuses, confirmedSections, sectionResults);
+        const framing = await generateReportFraming(api, currentJob.query || initialJob.query || "", confirmedSections, sectionResults);
         currentJob = await api.saveReportFraming({ research_id: initialJob.research_id, framing });
         const reportMarkdown = assembleReport(framing, sectionResults);
         const citationSources = citationRegistry.length ? [...citationRegistry] : citationSourcesFromUrls(sortedUnique(sectionResults.flatMap((section) => section.sourceUrls)));
@@ -473,7 +470,7 @@ export function useResearchJob(api: ResearchApi) {
         setPhase("failed");
       }
     },
-    [api, job, sources],
+    [api, job, sourceCurationMode, sources],
   );
 
   const confirmOutlineAndRun = useCallback(
@@ -585,6 +582,7 @@ export function useResearchJob(api: ResearchApi) {
           section_id: target.section.id,
           section_markdown: updatedMarkdown,
           section_summary: previousResult.section_summary || deriveSummary(updatedMarkdown),
+          subsection_headers: previousResult.subsection_headers || [],
           source_urls: updatedSourceUrls,
           status: "completed",
         });
@@ -599,7 +597,6 @@ export function useResearchJob(api: ResearchApi) {
           ...hydratedJob,
           ...savedJob,
           confirmed_role: savedJob.confirmed_role || hydratedJob.confirmed_role,
-          confirmed_focuses: savedJob.confirmed_focuses || hydratedJob.confirmed_focuses,
           confirmed_outline: savedJob.confirmed_outline || hydratedJob.confirmed_outline,
           report_framing: savedJob.report_framing || hydratedJob.report_framing,
           result: savedJob.result || hydratedJob.result,
@@ -620,7 +617,6 @@ export function useResearchJob(api: ResearchApi) {
             ...hydratedJob,
             ...savedJob,
             confirmed_role: savedJob.confirmed_role || hydratedJob.confirmed_role,
-            confirmed_focuses: savedJob.confirmed_focuses || hydratedJob.confirmed_focuses,
             confirmed_outline: savedJob.confirmed_outline || hydratedJob.confirmed_outline,
             report_framing: savedJob.report_framing || updatedFraming,
             result: savedJob.result || hydratedJob.result,
@@ -653,7 +649,6 @@ export function useResearchJob(api: ResearchApi) {
         ...nextJob,
         ...assembledJob,
         confirmed_role: assembledJob.confirmed_role || nextJob.confirmed_role,
-        confirmed_focuses: assembledJob.confirmed_focuses || nextJob.confirmed_focuses,
         confirmed_outline: assembledJob.confirmed_outline || nextJob.confirmed_outline,
         report_framing: assembledJob.report_framing || nextJob.report_framing,
       }, nextJob.section_results);
@@ -700,7 +695,6 @@ export function useResearchJob(api: ResearchApi) {
             ...structuredJob,
             ...savedFramingJob,
             confirmed_role: savedFramingJob.confirmed_role || structuredJob.confirmed_role,
-            confirmed_focuses: savedFramingJob.confirmed_focuses || structuredJob.confirmed_focuses,
             confirmed_outline: savedFramingJob.confirmed_outline || structuredJob.confirmed_outline,
             report_framing: savedFramingJob.report_framing || manualParts.framing,
             result: savedFramingJob.result || structuredJob.result,
@@ -716,6 +710,7 @@ export function useResearchJob(api: ResearchApi) {
           section_id: update.section.id,
           section_markdown: update.markdown,
           section_summary: previous?.section_summary || deriveSummary(update.markdown),
+          subsection_headers: previous?.subsection_headers || [],
           source_urls: previous?.source_urls || [],
           status: "completed",
         });
@@ -727,6 +722,7 @@ export function useResearchJob(api: ResearchApi) {
             status: "completed",
             section_markdown: update.markdown,
             section_summary: previous?.section_summary || deriveSummary(update.markdown),
+            subsection_headers: previous?.subsection_headers || [],
             source_urls: previous?.source_urls || [],
           },
         };
@@ -735,7 +731,6 @@ export function useResearchJob(api: ResearchApi) {
             ...structuredJob,
             ...savedSectionJob,
             confirmed_role: savedSectionJob.confirmed_role || structuredJob.confirmed_role,
-            confirmed_focuses: savedSectionJob.confirmed_focuses || structuredJob.confirmed_focuses,
             confirmed_outline: savedSectionJob.confirmed_outline || structuredJob.confirmed_outline,
             report_framing: savedSectionJob.report_framing || structuredJob.report_framing,
             result: savedSectionJob.result || structuredJob.result,
@@ -768,7 +763,6 @@ export function useResearchJob(api: ResearchApi) {
           stage: savedJob.stage || structuredJob.stage || "completed",
           progress: savedJob.progress ?? structuredJob.progress ?? 100,
           confirmed_role: savedJob.confirmed_role || structuredJob.confirmed_role,
-          confirmed_focuses: savedJob.confirmed_focuses || structuredJob.confirmed_focuses,
           confirmed_outline: savedJob.confirmed_outline || structuredJob.confirmed_outline,
           report_framing: savedJob.report_framing || structuredJob.report_framing,
         },
@@ -796,11 +790,17 @@ export function useResearchJob(api: ResearchApi) {
 
   const resumeResearchJob = useCallback(
     async (researchId?: string) => {
-      const baseJob = researchId ? await api.getResearchJob(researchId) : job;
-      if (!baseJob) throw new Error("Research job was not found.");
-      const hydratedJob = await hydrateCompletedSectionResults(api, baseJob);
-      const sections = hydratedJob.confirmed_outline?.length ? hydratedJob.confirmed_outline : outlineDraft;
-      await runConfirmedSections(sections, { resume: true, baseJob: hydratedJob });
+      setError(null);
+      try {
+        const baseJob = researchId ? await api.getResearchJob(researchId) : job;
+        if (!baseJob) throw new Error("Research job was not found.");
+        const hydratedJob = await hydrateCompletedSectionResults(api, baseJob);
+        const sections = hydratedJob.confirmed_outline?.length ? hydratedJob.confirmed_outline : outlineDraft;
+        await runConfirmedSections(sections, { resume: true, baseJob: hydratedJob });
+      } catch (err) {
+        setError(err);
+        setPhase("failed");
+      }
     },
     [api, job, outlineDraft, runConfirmedSections],
   );
@@ -816,14 +816,14 @@ export function useResearchJob(api: ResearchApi) {
     phase,
     error,
     roleCandidates,
-    focusCandidates,
     outlineDraft,
+    sourceCurationMode,
     runEvents,
     sectionPreviews,
     setRoleCandidates,
-    setFocusCandidates,
     setOutlineDraft,
-    isBusy: phase === "starting" || phase === "generating_roles" || phase === "generating_focuses" || phase === "generating_outline" || phase === "running" || phase === "loading_result",
+    setSourceCurationMode,
+    isBusy: phase === "starting" || phase === "generating_roles" || phase === "generating_outline" || phase === "running" || phase === "loading_result",
     canStart: hasConfiguredSource(sources),
     refreshSettings,
     refreshSources,
@@ -837,8 +837,6 @@ export function useResearchJob(api: ResearchApi) {
     start,
     regenerateRoles,
     confirmRole,
-    regenerateFocuses,
-    confirmFocuses,
     regenerateOutline,
     confirmOutlineAndRun,
     resumeResearchJob,
@@ -864,12 +862,6 @@ function roleCandidatesFromJob(job: ResearchJob | null | undefined): RoleCandida
   return role?.server && role.agent_role_prompt ? [{ ...role }] : [];
 }
 
-function focusCandidatesFromJob(job: ResearchJob | null | undefined): FocusCandidate[] {
-  return (job?.confirmed_focuses || [])
-    .map((text, index) => ({ id: `confirmed-focus-${index + 1}`, text: String(text || "").trim() }))
-    .filter((candidate) => candidate.text);
-}
-
 function reusableSectionResult(section: ReportSection, result: NonNullable<ResearchJob["section_results"]>[string] | undefined): SectionRunResult | null {
   if (!result || result.status !== "completed") return null;
   const markdown = String(result.section_markdown || "").trim();
@@ -879,6 +871,7 @@ function reusableSectionResult(section: ReportSection, result: NonNullable<Resea
     section,
     markdown,
     summary: result.section_summary || deriveSummary(markdown),
+    subsectionHeaders: result.subsection_headers || [],
     sourceUrls,
     citationSources: result.citation_sources?.length ? result.citation_sources : citationSourcesFromUrls(sourceUrls),
   };
@@ -923,6 +916,7 @@ function sectionRunResultsFromJob(job: ResearchJob): SectionRunResult[] {
         section,
         markdown,
         summary: result.section_summary || deriveSummary(markdown),
+        subsectionHeaders: result.subsection_headers || [],
         sourceUrls: Array.isArray(result.source_urls) ? result.source_urls.filter(Boolean) : [],
         citationSources: result.citation_sources?.length ? result.citation_sources : citationSourcesFromUrls(Array.isArray(result.source_urls) ? result.source_urls.filter(Boolean) : []),
       };
@@ -1255,7 +1249,6 @@ async function refreshRewriteResearchContext(
             query: job.query || "",
             rolePrompt: role.agent_role_prompt,
             section: focusedSection,
-            focuses: job.confirmed_focuses || [],
             iteration,
             maxIterations: focusedSection.max_iterations,
             enabledSources: allowedSources,
@@ -1306,7 +1299,7 @@ async function refreshRewriteResearchContext(
     sourceUrls.map((url) => ({ number: globalSourceUrls.indexOf(url) + 1, url, scope: "fresh" as const })),
   );
   return {
-    selectedContext: selected.selected_context || "",
+    selectedContext: stripInternalChunkMarkers(selected.selected_context || ""),
     sourceUrls,
     baseGlobalSourceUrls: existingGlobalUrls,
     globalSourceUrls,
@@ -1496,31 +1489,8 @@ function progressForIteration(iteration: number, maxIterations: number): number 
   return Math.min(85, 40 + Math.round((iteration / Math.max(1, maxIterations)) * 35));
 }
 
-function promptQueryForJob(job: ResearchJob | null | undefined, fallbackQuery = ""): string {
-  const query = String(job?.query || fallbackQuery || "").trim();
-  const context = job?.attachment_context;
-  if (!context?.summary) return query;
-  const fileSummaries = (context.files || [])
-    .filter((file) => file.status === "ready" && isAttachmentFileRelevant(file) && (file.analysis?.summary || file.analysis?.key_points?.length))
-    .slice(0, 8)
-    .map((file) => {
-      const analysis = file.analysis;
-      const points = (analysis?.key_points || []).slice(0, 4).map((point) => `  - ${point}`).join("\n");
-      return [`File: ${file.name}`, analysis?.summary ? `Summary: ${analysis.summary}` : "", points ? `Key points:\n${points}` : ""].filter(Boolean).join("\n");
-    })
-    .join("\n\n");
-  if (!fileSummaries) return query;
-  const attachmentBlock = [`Relevant uploaded file summary:`, `Uploaded-file evidence policy: ${ATTACHMENT_EVIDENCE_POLICY}`, fileSummaries].filter(Boolean).join("\n\n").slice(0, 5000);
-  return [query, attachmentBlock].filter(Boolean).join("\n\n");
-}
-
 const ATTACHMENT_EVIDENCE_POLICY =
   "Use this analysis as supporting evidence only when the claim is directly grounded in visible content. Do not use it to verify external facts, dates, source credibility, or causal explanations unless those are explicitly visible in the attachment content.";
-
-function isAttachmentFileRelevant(file: { analysis?: { relevance_score?: number | null } }): boolean {
-  if (typeof file.analysis?.relevance_score === "number") return file.analysis.relevance_score >= 0.25;
-  return false;
-}
 
 interface AttachmentSelectedItem {
   kind?: string;
@@ -1552,6 +1522,69 @@ function attachmentChunkQueryForSection(section: ReportSection): string {
   return [section.title, outline.slice(0, 160)].filter(Boolean).join("\n");
 }
 
+const MAX_ATTACHMENT_SEARCH_BASELINE_CHARS = 4_000;
+
+export function buildAttachmentSearchBaseline(
+  job: ResearchJob,
+  selection: { context: string; items: AttachmentSelectedItem[] },
+): string {
+  if (!selection.items.length) return "";
+  const files = new Map((job.attachment_context?.files || []).map((file) => [file.id, file]));
+  const grouped = new Map<string, AttachmentSelectedItem[]>();
+  for (const item of selection.items) {
+    const key = String(item.file_id || item.file_name || item.item_id || "attachment");
+    grouped.set(key, [...(grouped.get(key) || []), item]);
+  }
+  const blocks: string[] = [];
+  for (const [key, items] of grouped) {
+    const file = files.get(String(items[0]?.file_id || ""));
+    const analysis = file?.analysis;
+    const lines = [`File: ${file?.name || items[0]?.file_name || key}`];
+    if (analysis?.summary) lines.push(`Summary: ${analysis.summary}`);
+    const points = (analysis?.key_points || []).slice(0, 4).filter(Boolean);
+    if (points.length) lines.push(`Key points:\n${points.map((point) => `  - ${point}`).join("\n")}`);
+    if (analysis?.relevance) lines.push(`Research relevance: ${analysis.relevance}`);
+
+    const payload = analysis?.payload && typeof analysis.payload === "object" && !Array.isArray(analysis.payload)
+      ? analysis.payload as Record<string, unknown>
+      : null;
+    if (analysis?.type === "image" && payload) {
+      const visibleText = Array.isArray(payload.visible_text)
+        ? payload.visible_text
+            .map((value) => value && typeof value === "object" ? String((value as Record<string, unknown>).text || "").trim() : "")
+            .filter(Boolean)
+            .slice(0, 6)
+        : [];
+      const observations = Array.isArray(payload.key_observations)
+        ? payload.key_observations
+            .map((value) => value && typeof value === "object" ? String((value as Record<string, unknown>).observation || "").trim() : "")
+            .filter(Boolean)
+            .slice(0, 4)
+        : [];
+      const uncertainties = Array.isArray(payload.uncertainties)
+        ? payload.uncertainties.map((value) => String(value || "").trim()).filter(Boolean).slice(0, 3)
+        : [];
+      if (visibleText.length) lines.push(`Visible text:\n${visibleText.map((value) => `  - ${value}`).join("\n")}`);
+      if (observations.length) lines.push(`Visible observations:\n${observations.map((value) => `  - ${value}`).join("\n")}`);
+      if (uncertainties.length) lines.push(`Uncertainties:\n${uncertainties.map((value) => `  - ${value}`).join("\n")}`);
+    }
+
+    const excerpts = items
+      .filter((item) => item.kind !== "image_analysis")
+      .map((item) => String(item.quote || "").trim())
+      .filter(Boolean)
+      .slice(0, 4);
+    if (excerpts.length) lines.push(`Selected excerpts:\n${excerpts.map((value) => `  - ${value}`).join("\n")}`);
+    if (lines.length > 1) blocks.push(lines.join("\n"));
+  }
+  if (!blocks.length) return "";
+  return [
+    `Uploaded-file evidence policy: ${ATTACHMENT_EVIDENCE_POLICY}`,
+    "Use this baseline to identify what is already supported and what still needs external research.",
+    ...blocks,
+  ].join("\n\n").slice(0, MAX_ATTACHMENT_SEARCH_BASELINE_CHARS);
+}
+
 async function generateRoleCandidates(api: ResearchApi, query: string, instruction = ""): Promise<RoleCandidate[]> {
   const text = await completeText(api, [
     {
@@ -1571,7 +1604,8 @@ async function generateRoleCandidates(api: ResearchApi, query: string, instructi
         type: "text",
         text:
           "Generate exactly 3 possible research roles for this task. " +
-          "Each agent_role_prompt must be specific, source-grounded, and suitable as the later system prompt for focus planning and report writing.\n" +
+          "Write each user-visible server name and agent_role_prompt in the same language as the task. Do not default to English when the task is written in another language. " +
+          "Each agent_role_prompt must be specific, source-grounded, and suitable as the later system prompt for outline planning and report writing.\n" +
           (instruction ? `Regeneration requirement: ${instruction}\n` : "") +
           `Task:\n${query}`,
       },
@@ -1583,50 +1617,8 @@ async function generateRoleCandidates(api: ResearchApi, query: string, instructi
   return padRoles(candidates).slice(0, 3);
 }
 
-async function generateFocusCandidates(api: ResearchApi, query: string, role: ConfirmedResearchRole, instruction = ""): Promise<FocusCandidate[]> {
-  const text = await completeText(api, [
-    {
-      role: "system",
-      content: { type: "text", text: role.agent_role_prompt },
-    },
-    {
-      role: "user",
-      content: {
-        type: "text",
-        text:
-          'Generate exactly 5 research focus candidates. Return strict JSON only: {"focuses":[{"text":"...","rationale":"..."}]}.\n' +
-          (instruction ? `Regeneration requirement: ${instruction}\n` : "") +
-          `Task:\n${query}`,
-      },
-    },
-  ]);
-  const parsed = parseJsonObject(text);
-  const focuses = Array.isArray(parsed?.focuses) ? parsed.focuses : [];
-  const candidates = focuses
-    .map((item, index) => ({ id: `focus-${index + 1}`, text: String(item?.text || item || "").trim(), rationale: String(item?.rationale || "").trim() }))
-    .filter((item) => item.text);
-  return padFocuses(candidates).slice(0, 5);
-}
-
-async function generateOutlineDraft(api: ResearchApi, query: string, role: ConfirmedResearchRole, focuses: string[], instruction = ""): Promise<ReportSection[]> {
-  const text = await completeText(api, [
-    { role: "system", content: { type: "text", text: role.agent_role_prompt } },
-    {
-      role: "user",
-      content: {
-        type: "text",
-        text:
-          'Draft 4 to 6 report sections. Return strict JSON only: {"sections":[{"title":"...","outline":"...","max_iterations":5}]}.\n' +
-          "Do not assign sources in this call.\n" +
-          (instruction ? `Regeneration requirement: ${instruction}\n` : "") +
-          `Task:\n${query}\n\nResearch focuses:\n${focuses.map((focus) => `- ${focus}`).join("\n")}`,
-      },
-    },
-  ]);
-  const parsed = parseJsonObject(text);
-  const sections = Array.isArray(parsed?.sections) ? parsed.sections : [];
-  const normalized = sections.map(normalizeSectionDraft).filter(Boolean) as ReportSection[];
-  return padSections(normalized).slice(0, 6);
+function localDateString(date: Date): string {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
 
 async function assignAllowedSources(api: ResearchApi, sections: ReportSection[], sources: ResearchSourceView[], instruction = ""): Promise<ReportSection[]> {
@@ -1663,11 +1655,11 @@ async function runSection(input: {
   reportOutline: ReportSection[];
   priorSectionResults: SectionRunResult[];
   role: ConfirmedResearchRole;
-  focuses: string[];
   sources: ResearchSourceView[];
   citationRegistry: CitationSource[];
+  sourceCurationMode: SourceCurationMode;
   onEvent?(event: Parameters<typeof makeLiveRunEvent>[0]): void;
-}): Promise<{ markdown: string; summary: string; sourceUrls: string[]; citationSources: CitationSource[] }> {
+}): Promise<{ markdown: string; summary: string; subsectionHeaders: string[]; sourceUrls: string[]; citationSources: CitationSource[] }> {
   const allowedSources = input.sources.filter((source) => input.section.allowed_source_ids.includes(source.id));
   if (!allowedSources.length) throw new Error(`Section has no configured allowed source: ${input.section.title}`);
   const continuityContext = buildReportContinuityContext(input.reportOutline, input.priorSectionResults, input.section);
@@ -1687,97 +1679,172 @@ async function runSectionInSession(
     reportOutline: ReportSection[];
     priorSectionResults: SectionRunResult[];
     role: ConfirmedResearchRole;
-    focuses: string[];
     citationRegistry: CitationSource[];
+    sourceCurationMode: SourceCurationMode;
     onEvent?(event: Parameters<typeof makeLiveRunEvent>[0]): void;
     allowedSources: ResearchSourceView[];
     continuityContext: string;
     session: AnnaAgentSession;
   },
-): Promise<{ markdown: string; summary: string; sourceUrls: string[]; citationSources: CitationSource[] }> {
-  const { api, job, section, role, focuses, citationRegistry, onEvent, allowedSources, continuityContext, session } = input;
-  const history: IterationEntry[] = [];
+): Promise<{ markdown: string; summary: string; subsectionHeaders: string[]; sourceUrls: string[]; citationSources: CitationSource[] }> {
+  const { api, job, section, role, citationRegistry, onEvent, allowedSources, continuityContext, session } = input;
+  const learnings: string[] = [];
+  let followUpQuestions: string[] = [];
+  let previousResearchGoals: string[] = [];
+  let breadth = 3;
+  let selected: Awaited<ReturnType<ResearchApi["selectSectionContext"]>> | null = null;
+  const executedQueries: string[] = [];
+  const attachmentSelection = await selectAttachmentContextForSection(api, job, section);
+  const attachmentBaseline = buildAttachmentSearchBaseline(job, attachmentSelection);
   for (let iteration = 1; iteration <= section.max_iterations; iteration++) {
     await updateJob(api, job, { stage: "section_research", iteration, progress: progressForIteration(iteration, section.max_iterations) });
     onEvent?.({
       kind: "decision",
       sectionId: section.id,
       sectionTitle: section.title,
-      title: "Deciding next research action",
-      detail: `${iteration}/${section.max_iterations}`,
+      title: "Generating deep-research queries",
+      detail: `Depth ${iteration}/${section.max_iterations} · breadth ${breadth}`,
     });
-    const decision = await decideNextAction({
-      api,
+    const plan = await generateSectionSerpQueries({
       query: job.query || "",
       rolePrompt: role.agent_role_prompt,
       section,
-      focuses,
       iteration,
       maxIterations: section.max_iterations,
+      numQueries: breadth,
       enabledSources: allowedSources,
-      history,
-      continuityContext,
+      facets: sectionFacets(job, section),
+      learnings,
+      followUpQuestions,
+      previousResearchGoals,
+      executedQueries,
+      attachmentBaseline,
       agentSession: session,
     });
-    if (decision.type !== "call_source") break;
-    const sourceId = allowedSources.some((source) => source.id === decision.source_id) ? String(decision.source_id) : allowedSources[0].id;
-    const queries = uniqueQueries(decision.queries.length ? decision.queries : [section.title]);
-    if (!queries.length) break;
-    let stopAfterIteration = false;
-    for (const query of queries) {
-      const call = await api.callSectionResearchSource({
-        research_id: requiredResearchId(job),
-        section_id: section.id,
-        iteration,
-        source_id: sourceId,
-        queries: [query],
-      });
-      if (call.source_call) {
-        onEvent?.(sourceCallEvent(section, call.source_call));
-        history.push({
-          iteration,
-          source_id: call.source_call.source_id,
-          source_name: call.source_call.source_name,
-          queries: call.source_call.queries,
-          results_count: call.source_call.results_count,
-          source_calls: call.source_call.calls,
-        });
-      }
-      if (call.source_call?.error && iteration >= section.max_iterations) {
-        stopAfterIteration = true;
-        break;
-      }
+    const sourceId = allowedSources.some((source) => source.id === plan.source_id) ? String(plan.source_id) : allowedSources[0].id;
+    const executedQueryKeys = new Set(executedQueries.map((query) => query.toLocaleLowerCase()));
+    const queries = uniqueQueries(plan.queries.map((item) => item.query))
+      .filter((query) => !executedQueryKeys.has(query.toLocaleLowerCase()))
+      .slice(0, breadth);
+    if (!queries.length) throw new Error(`Anna Agent did not generate research queries for ${section.title}.`);
+    previousResearchGoals = plan.queries
+      .filter((item) => queries.includes(item.query))
+      .map((item) => item.researchGoal);
+    executedQueries.push(...queries);
+    const call = await api.callSectionResearchSource({
+      research_id: requiredResearchId(job),
+      section_id: section.id,
+      iteration,
+      source_id: sourceId,
+      queries,
+      research_decision: {
+        type: "call_source",
+        knowledge_gap: previousResearchGoals.join(" ").slice(0, 1000),
+        rationale: `deep-research depth ${iteration}/${section.max_iterations}; breadth ${breadth}`,
+        target_facet_ids: sectionFacets(job, section).map((facet) => facet.id),
+      },
+    });
+    if (call.source_call) {
+      onEvent?.(sourceCallEvent(section, call.source_call));
     }
-    if (stopAfterIteration) break;
+    selected = await api.selectSectionContext({
+      research_id: requiredResearchId(job),
+      section_id: section.id,
+      iteration,
+      query: `${job.query || ""}\n\nSection: ${section.title}\n${section.outline}`,
+      search_queries: queries,
+    });
+    const nextBreadth = Math.max(1, Math.ceil(breadth / 2));
+    const learningBatch = await processSectionSerpResults({
+      agentSession: session,
+      section,
+      queryPlan: plan.queries.filter((item) => queries.includes(item.query)),
+      selectedContext: stripInternalChunkMarkers(selected.selected_context || ""),
+      numLearnings: 3,
+      numFollowUpQuestions: nextBreadth,
+    });
+    mergeUniqueText(learnings, learningBatch.learnings);
+    followUpQuestions = learningBatch.followUpQuestions;
+    breadth = nextBreadth;
   }
-  const selected = await api.selectSectionContext({ research_id: requiredResearchId(job), section_id: section.id });
+  if (!selected) throw new Error(`No research evidence was selected for ${section.title}.`);
+  if (section.max_iterations > 1) {
+    selected = await api.selectSectionContext({
+      research_id: requiredResearchId(job),
+      section_id: section.id,
+      query: `${job.query || ""}\n\nSection: ${section.title}\n${section.outline}`,
+      search_queries: uniqueQueriesUnlimited(executedQueries),
+    });
+  }
+  const curation = input.sourceCurationMode === "llm" && (selected.selected_sources || []).length > 0
+    ? await curateSelectedSources(api, job, section, selected.selected_sources || [])
+    : null;
+  const selectedSources = curation?.sources || selected.selected_sources || [];
+  const selectedContext = stripInternalChunkMarkers(
+    curation ? buildCuratedSelectedContext(selectedSources) : selected.selected_context || "",
+  );
+  const selectedSourceUrls = curation ? selectedSources.map((source) => source.url).filter(Boolean) : selected.source_urls || [];
+  if (curation) {
+    await api.updateResearchJob(requiredResearchId(job), {
+      section_source_curations: {
+        ...(job.section_source_curations || {}),
+        [section.id]: curation.audit,
+      },
+    }).catch(() => undefined);
+  }
   onEvent?.({
     kind: "context_selected",
     sectionId: section.id,
     sectionTitle: section.title,
     title: "Context selected",
-    detail: `${(selected.source_urls || []).length} sources`,
-    count: (selected.source_urls || []).length,
+    detail: curation
+      ? `${selectedSourceUrls.length}/${(selected.selected_sources || []).length} sources${curation.audit.status === "failed_open" ? " · fallback" : ""}`
+      : `${selectedSourceUrls.length} sources`,
+    count: selectedSourceUrls.length,
   });
-  const sourceUrls = selected.source_urls || [];
+  const sourceUrls = selectedSourceUrls;
+  onEvent?.({
+    kind: "decision",
+    sectionId: section.id,
+    sectionTitle: section.title,
+    title: "Planning subsection structure",
+    detail: "Up to 5 evidence-grounded headers",
+  });
+  const subsectionHeaders = await generateSubsectionHeaders({
+    agentSession: session,
+    query: job.query || "",
+    section,
+    continuityContext,
+    selectedContext,
+    attachmentContext: attachmentSelection.context,
+  });
   const webReferences = registerCitationReferences(citationRegistry, sourceUrls);
-  const attachmentSelection = await selectAttachmentContextForSection(api, job, section);
   const attachmentReferences = registerAttachmentCitationReferences(citationRegistry, attachmentSelection.items);
   const citationReferences = [...webReferences, ...attachmentReferences];
+  const relevantPriorContents = selectRelevantPriorWrittenContents(
+    input.priorSectionResults,
+    section,
+    subsectionHeaders,
+  );
   const writer = await writeSection(
     session,
-    remapSelectedContextCitationLabels(selected.selected_context || "", webReferences),
+    stripSelectedContextCitationLabels(selectedContext),
     citationReferences,
     attachmentSelection.context,
-    section.title,
+    job.query || "",
+    section,
+    subsectionHeaders,
+    continuityContext,
+    relevantPriorContents,
   );
-  const markdown = normalizeSectionCitations(writer.markdown, citationReferences);
+  const markdown = convertSectionUrlCitations(writer.markdown, citationReferences);
   const sectionCitationSources = citationReferences.map((reference) => reference.source);
   await api.saveSectionResult({
     research_id: requiredResearchId(job),
     section_id: section.id,
     section_markdown: markdown,
     section_summary: writer.summary,
+    subsection_headers: subsectionHeaders,
     source_urls: sourceUrls,
     citation_sources: sectionCitationSources,
     status: "completed",
@@ -1789,75 +1856,250 @@ async function runSectionInSession(
     title: "Section written",
     detail: writer.summary,
   });
-  return { ...writer, markdown, sourceUrls, citationSources: sectionCitationSources };
+  return { ...writer, markdown, subsectionHeaders, sourceUrls, citationSources: sectionCitationSources };
 }
 
-async function decideNextAction(input: {
-  api: ResearchApi;
+async function generateSectionSerpQueries(input: {
   query: string;
   rolePrompt: string;
   section: ReportSection;
-  focuses: string[];
   iteration: number;
   maxIterations: number;
+  numQueries: number;
   enabledSources: ResearchSourceView[];
-  history: IterationEntry[];
-  continuityContext?: string;
-  agentSession?: AnnaAgentSession;
-}): Promise<Decision> {
-  const { api, query, rolePrompt, section, focuses, iteration, maxIterations, enabledSources, history, continuityContext, agentSession } = input;
-  const sourcesBlock = enabledSources.map((source) => `- ${source.id} (${source.name})`).join("\n");
-  const decisionFormat =
-    'Reply with strict JSON only: {"type":"call_source","source_id":"<allowed-id>","queries":["..."]} or {"type":"finish"}. ' +
-    "Return at most 3 search queries, ordered from highest to lowest priority.";
-  const messages: ResearchLlmMessages = iteration === 1
-    ? [
-        {
-          role: "system",
-          content: {
-            type: "text",
-            text:
-              rolePrompt +
-              "\n\nDecide the next research step for the active report section. " +
-              "The frontend owns all research source execution. Do not call tools or search directly. " +
-              decisionFormat,
-          },
-        },
-        {
-          role: "user",
-          content: {
-            type: "text",
-            text:
-              `Task:\n${query}\n\n${continuityContext ? `${continuityContext}\n\n` : `Current section:\n${section.title}\n${section.outline}\n\n`}` +
-              `Focuses:\n${focuses.map((focus) => `- ${focus}`).join("\n")}\n\n` +
-              `Allowed sources:\n${sourcesBlock}\nIteration: ${iteration}/${maxIterations}`,
-          },
-        },
-      ]
-    : [
-        {
-          role: "user",
-          content: {
-            type: "text",
-            text:
-              "The frontend completed the previous research calls. Decide whether the active section needs another search. " +
-              "Use the role, task, outline, section boundary, focuses, and allowed sources already established in this session. " +
-              "Do not call tools or search directly.\n\n" +
-              `Latest external research update:\n${formatIterationResearchUpdate(history, iteration - 1)}\n\n` +
-              `Iteration: ${iteration}/${maxIterations}\n${decisionFormat}`,
-          },
-        },
-      ];
-  const text = agentSession
-    ? await runSectionAgent(agentSession, messages, `Anna Agent returned an empty research decision for ${section.title}.`)
-    : await completeText(api, messages);
-  const parsed = parseJsonObject(text);
-  if (parsed?.type === "call_source") {
-    const queries = Array.isArray(parsed.queries) ? parsed.queries.map(String).filter(Boolean) : [];
-    return { type: "call_source", source_id: String(parsed.source_id || ""), queries };
+  facets?: Array<{ id: string; task: string }>;
+  learnings: string[];
+  followUpQuestions: string[];
+  previousResearchGoals: string[];
+  executedQueries: string[];
+  attachmentBaseline: string;
+  agentSession: AnnaAgentSession;
+}): Promise<SectionQueryPlan> {
+  const { query, rolePrompt, section, iteration, maxIterations, numQueries, enabledSources, facets = [], agentSession } = input;
+  const sourcesBlock = enabledSources
+    .map((source) => `- ${source.id} (${source.name}): ${source.description || "No capability description provided."}`)
+    .join("\n");
+  const facetsBlock = facets.length
+    ? facets.map((facet) => `- ${facet.id}: ${facet.task}`).join("\n")
+    : "(use the current section task and boundary)";
+  const learningsBlock = input.learnings.length ? input.learnings.map((learning) => `- ${learning}`).join("\n") : "(none yet)";
+  const followUpBlock = input.followUpQuestions.length ? input.followUpQuestions.map((question) => `- ${question}`).join("\n") : "(none yet)";
+  const goalsBlock = input.previousResearchGoals.length ? input.previousResearchGoals.map((goal) => `- ${goal}`).join("\n") : "(none yet)";
+  const executedQueriesBlock = input.executedQueries.length ? input.executedQueries.map((executedQuery) => `- ${executedQuery}`).join("\n") : "(none yet)";
+  const attachmentBaselineBlock = input.attachmentBaseline
+    ? iteration === 1
+      ? input.attachmentBaseline
+      : "(provided at depth 1 in this session; continue using it as the existing attachment evidence baseline)"
+    : "(none)";
+  const temporalSearchRules =
+    `Current date: ${localDateString(new Date())}.\n` +
+    'Interpret "recent" and "latest" relative to this date. Prioritize the current year and the most recent available months for recent-event research. ' +
+    "Do not add an older year unless the task explicitly requests that historical period or it is needed for a clearly stated comparison.";
+  const prompt = [
+    rolePrompt,
+    "",
+    "Generate SERP queries for the next depth of one report section.",
+    `Return at most ${numQueries} queries, but return fewer when the research direction is already clear.`,
+    "Every query must be unique and materially different from the others.",
+    "Use previous learnings to make later-depth queries more specific. Do not repeat an earlier query.",
+    "Use uploaded attachment evidence to avoid redundant searches and prioritize missing context, independent corroboration, source provenance, current developments, and conflicting evidence.",
+    "Do not put attachment text or file names into a query unless they are themselves part of the requested research subject.",
+    "Treat attachment evidence as supporting evidence, not as externally verified facts.",
+    "The frontend owns all research source execution. Do not call tools or search directly.",
+    `Return exactly one JSON object: {"source_id":"<allowed-id>","queries":[{"query":"...","research_goal":"..."}]}.`,
+    "For each research_goal, first state what the query must establish, then explain how its results should advance deeper research and identify likely next directions.",
+    "Do not include markdown, prose, code fences, or extra keys.",
+    "",
+    temporalSearchRules,
+    "",
+    `Research task:\n${query}`,
+    "",
+    `Section subtopic task:\n${section.title}\n${section.outline}`,
+    "",
+    `Research facets:\n${facetsBlock}`,
+    "",
+    `Uploaded attachment evidence baseline:\n${attachmentBaselineBlock}`,
+    "",
+    `Allowed sources:\n${sourcesBlock}`,
+    "",
+    `Depth: ${iteration}/${maxIterations}`,
+    `Previous research goals:\n${goalsBlock}`,
+    `Already executed queries (do not repeat):\n${executedQueriesBlock}`,
+    `Learnings from previous research:\n${learningsBlock}`,
+    `Follow-up research directions:\n${followUpBlock}`,
+  ].join("\n");
+  const messages: ResearchLlmMessages = [
+    {
+      role: "user",
+      content: {
+        type: "text",
+        text: prompt,
+      },
+    },
+  ];
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const attemptMessages = attempt === 0 ? messages : [{
+      role: "user" as const,
+      content: {
+        type: "text" as const,
+        text: `Your previous query plan was invalid. Return exactly {"source_id":"<allowed-id>","queries":[{"query":"...","research_goal":"..."}]}, with 1 to ${numQueries} unique queries and no prose or code fences.`,
+      },
+    }];
+    const text = await runSectionAgent(agentSession, attemptMessages, `Anna Agent returned an empty query plan for ${section.title}.`);
+    const plan = parseSectionQueryPlan(text, numQueries, enabledSources);
+    if (plan) return plan;
   }
-  if (iteration === 1) return { type: "call_source", source_id: enabledSources[0]?.id, queries: [section.title] };
-  return { type: "finish" };
+  throw new Error(`Anna Agent did not return valid SERP queries for ${section.title}.`);
+}
+
+async function processSectionSerpResults(input: {
+  agentSession: AnnaAgentSession;
+  section: ReportSection;
+  queryPlan: SectionSerpQuery[];
+  selectedContext: string;
+  numLearnings: number;
+  numFollowUpQuestions: number;
+}): Promise<SectionResearchLearning> {
+  const planBlock = input.queryPlan
+    .map((item) => `<query>\n${item.query}\n</query>\n<research_goal>\n${item.researchGoal}\n</research_goal>`)
+    .join("\n\n");
+  const prompt = [
+    "Process the selected contents from the latest SERP searches for this report section.",
+    `Return at most ${input.numLearnings} learnings and at most ${input.numFollowUpQuestions} follow-up research questions. Return fewer when the evidence is limited or clear.`,
+    "Each learning must be unique, concise, information-dense, and directly grounded in the supplied contents.",
+    "Preserve exact entities, metrics, numbers, and dates when they are visibly supported by the contents.",
+    "Follow-up questions must advance the research beyond what is already known and must not merely rephrase an executed query.",
+    "If the supplied contents contain no usable evidence, return empty arrays rather than inventing information.",
+    `Return exactly one JSON object: {"learnings":["..."],"follow_up_questions":["..."]}.`,
+    "Do not include markdown, prose, code fences, or extra keys.",
+    "",
+    `Section:\n${input.section.title}\n${input.section.outline}`,
+    "",
+    `Executed query plans:\n${planBlock}`,
+    "",
+    `<contents>\n${input.selectedContext || "(no usable evidence)"}\n</contents>`,
+  ].join("\n");
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const messages: ResearchLlmMessages = [{
+      role: "user",
+      content: {
+        type: "text",
+        text: attempt === 0
+          ? prompt
+          : `Your previous learning response was invalid. Return exactly {"learnings":["..."],"follow_up_questions":["..."]}, with no more than ${input.numLearnings} learnings and ${input.numFollowUpQuestions} follow-up questions.`,
+      },
+    }];
+    const text = await runSectionAgent(input.agentSession, messages, `Anna Agent returned empty SERP learnings for ${input.section.title}.`);
+    const learning = parseSectionResearchLearning(text, input.numLearnings, input.numFollowUpQuestions);
+    if (learning) return learning;
+  }
+  throw new Error(`Anna Agent did not return valid SERP learnings for ${input.section.title}.`);
+}
+
+function parseSectionQueryPlan(text: string, maxQueries: number, enabledSources: ResearchSourceView[]): SectionQueryPlan | null {
+  const parsed = parseJsonObject(text);
+  const values = Array.isArray(parsed?.queries) ? parsed.queries : [];
+  if (!values.length || values.length > maxQueries) return null;
+  const queries = values.map((value) => {
+    const item = value as Record<string, unknown>;
+    return {
+      query: String(item?.query || "").trim(),
+      researchGoal: String(item?.research_goal || "").trim(),
+    };
+  });
+  if (queries.some((item) => !item.query || !item.researchGoal)) return null;
+  if (new Set(queries.map((item) => item.query.toLocaleLowerCase())).size !== queries.length) return null;
+  const requestedSource = String(parsed?.source_id || "").trim();
+  const sourceId = enabledSources.some((source) => source.id === requestedSource) ? requestedSource : enabledSources[0]?.id;
+  if (!sourceId) return null;
+  return { source_id: sourceId, queries };
+}
+
+function parseSectionResearchLearning(text: string, maxLearnings: number, maxFollowUps: number): SectionResearchLearning | null {
+  const parsed = parseJsonObject(text);
+  if (!Array.isArray(parsed?.learnings) || !Array.isArray(parsed?.follow_up_questions)) return null;
+  const learnings = uniqueTextValues(parsed.learnings, maxLearnings);
+  const followUpQuestions = uniqueTextValues(parsed.follow_up_questions, maxFollowUps);
+  if (learnings.length !== parsed.learnings.length || followUpQuestions.length !== parsed.follow_up_questions.length) return null;
+  return { learnings, followUpQuestions };
+}
+
+async function generateSubsectionHeaders(input: {
+  agentSession: AnnaAgentSession;
+  query: string;
+  section: ReportSection;
+  continuityContext: string;
+  selectedContext: string;
+  attachmentContext: string;
+}): Promise<string[]> {
+  const prompt = [
+    "Plan the subsection structure for the active report section after formal research is complete.",
+    'Return exactly one valid JSON object: {"subsection_headers":["..."]}. Do not include markdown, code fences, prose, or extra keys.',
+    "",
+    `Current date: ${localDateString(new Date())}`,
+    "",
+    `Research task:\n${input.query}`,
+    "",
+    `Current subtopic:\nTitle: ${input.section.title}\nTask and boundary: ${input.section.outline}`,
+    "",
+    input.continuityContext,
+    "",
+    "Rules:",
+    "- Return at least 1 and at most 5 subsection headers, ordered for a coherent section.",
+    "- Each header must be a distinct analysis dimension supported by the selected evidence.",
+    "- Return plain header text without Markdown markers, bullets, numbering, or citations.",
+    "- Do not include introduction, conclusion, summary, references, or sources sections.",
+    "- Do not repeat analysis or subsection headers already used in previous sections.",
+    "- Do not cover analysis reserved for upcoming sections.",
+    "- Treat figures found in retrieved evidence as claims to verify, not established conclusions.",
+    "- Numbers may appear only when supplied by the user or needed to define a timeframe or research scope.",
+    "- Do not write section content or make unsupported factual claims in a header.",
+    "",
+    `Selected web evidence:\n${input.selectedContext || "(none)"}`,
+    "",
+    `Selected attachment evidence:\n${input.attachmentContext || "(none)"}`,
+  ].join("\n");
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const messages: ResearchLlmMessages = [{
+      role: "user",
+      content: {
+        type: "text",
+        text: attempt === 0
+          ? prompt
+          : 'Your previous subsection header response was invalid. Return exactly {"subsection_headers":["..."]} with 1 to 5 unique plain-text headers and no other text.',
+      },
+    }];
+    let text = "";
+    try {
+      text = await runSectionAgent(
+        input.agentSession,
+        messages,
+        `Anna Agent returned an empty subsection header plan for ${input.section.title}.`,
+      );
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("empty subsection header plan")) continue;
+      throw error;
+    }
+    const headers = parseSubsectionHeaders(text);
+    if (headers) return headers;
+  }
+  throw new Error(`Anna Agent did not return valid subsection headers for ${input.section.title}.`);
+}
+
+function parseSubsectionHeaders(text: string): string[] | null {
+  const parsed = parseJsonObject(text);
+  if (!Array.isArray(parsed?.subsection_headers)) return null;
+  const headers = parsed.subsection_headers.map((value) => String(value || "").trim());
+  if (headers.length < 1 || headers.length > 5 || headers.some((header) => !isValidSubsectionHeader(header))) return null;
+  const unique = new Set(headers.map((header) => header.toLocaleLowerCase()));
+  return unique.size === headers.length ? headers : null;
+}
+
+function isValidSubsectionHeader(header: string): boolean {
+  if (!header || header.length > 200) return false;
+  if (/^(?:#{1,6}|[-*+]\s|\d+[.)、]\s*)/.test(header)) return false;
+  return !/^(?:introduction|conclusion|summary|references?|sources?|引言|结论|总结|参考文献|来源)$/i.test(header);
 }
 
 async function writeSection(
@@ -1865,7 +2107,11 @@ async function writeSection(
   selectedContext: string,
   citationReferences: CitationReference[],
   attachmentContext: string,
-  sectionTitle: string,
+  researchTask: string,
+  section: ReportSection,
+  subsectionHeaders: string[],
+  continuityContext: string,
+  relevantPriorContents: string,
 ): Promise<{ markdown: string; summary: string }> {
   const citationGuide = citationReferences.length
     ? citationReferences.map((reference) => citationReferencePromptLine(reference)).join("\n")
@@ -1876,45 +2122,71 @@ async function writeSection(
       content: {
         type: "text",
         text:
-          'Write the active report section established earlier in this session. Return strict JSON only: {"section_markdown":"...","section_summary":"..."}.\n' +
-          "The frontend owns all research source execution. Do not call tools, search, or introduce evidence outside the supplied context.\n" +
-          "Use only the provided context. The markdown should include the section heading.\n" +
-          "When citing evidence, use ONLY the global citation numbers listed below, such as [3]. Use uploaded-file citation numbers when relying on attachment chunks. Do not invent new citation numbers and do not restart citations from [1] for this section.\n" +
+          'Write one subtopic report for the larger research report. Return strict JSON only: {"section_markdown":"...","section_summary":"..."}.\n' +
+          "The frontend owns all research source execution. Do not call tools or search.\n" +
+          "Write only this section's main body: no report introduction, conclusion, references list, or table of contents.\n" +
+          "Write the active section title as one H2 heading and match the language of the research task.\n" +
+          "Use every required subsection header exactly once, in the listed order, as H3 headings. Do not rename, omit, reorder, or add other H3 headings.\n" +
+          "Make the analysis specific, evidence-led, and non-repetitive. Synthesize agreements, conflicts, uncertainty, dates, and quantitative details when the supplied evidence supports them.\n" +
+          "Use the prior-report material only to preserve terminology, maintain the argument's progression, and avoid repetition. It is not evidence for new claims. Use at most a brief transition from the previous section.\n" +
+          "Do not cover analysis reserved for later sections. Claims in this section must be grounded in the current web or attachment evidence.\n" +
+          "When citing evidence, use only Markdown URL citations in this exact upstream-style form: ([in-text citation](SOURCE_URL)). Copy SOURCE_URL exactly from the allowed source identifier list below.\n" +
+          "Never write numeric citations such as [1], never invent or shorten a URL, and never use a URL that is not in the allowed list. Uploaded-file evidence has an anna-attachment:// identifier and uses the same Markdown citation form.\n" +
+          "Place citations immediately after the sentence or paragraph they support. Do not cite headings, transitions, or claims drawn only from continuity material.\n" +
           `Uploaded-file evidence policy: ${ATTACHMENT_EVIDENCE_POLICY}\n\n` +
-          `Global citation map for this section:\n${citationGuide}\n\n` +
+          `Main research task:\n${researchTask}\n\n` +
+          `Current subtopic:\nTitle: ${section.title}\nTask and boundary: ${section.outline}\n\n` +
+          `${continuityContext}\n\n` +
+          `Relevant prior written passages selected for overlap control:\n${relevantPriorContents}\n\n` +
+          `Required subsection headers:\n${subsectionHeaders.map((header, index) => `${index + 1}. ${header}`).join("\n")}\n\n` +
+          `Allowed source identifiers for this section:\n${citationGuide}\n\n` +
           `Web context:\n${selectedContext}\n\nAttachment chunk context:\n${attachmentContext || "(none)"}`,
       },
     },
   ];
-  const text = await runSectionAgent(agentSession, messages, `Anna Agent returned an empty section for ${sectionTitle}.`);
+  const text = await runSectionAgent(agentSession, messages, `Anna Agent returned an empty section for ${section.title}.`);
   const parsed = parseJsonObject(text);
   const markdown = String(parsed?.section_markdown || "").trim();
   const summary = String(parsed?.section_summary || "").trim();
-  if (markdown) return { markdown, summary: summary || deriveSummary(markdown) };
+  if (markdown) {
+    return { markdown, summary: summary || deriveSummary(markdown) };
+  }
   const fallback = text.trim();
-  if (!fallback) throw new Error(`Anna LLM returned an empty section for ${sectionTitle}.`);
+  if (!fallback) throw new Error(`Anna LLM returned an empty section for ${section.title}.`);
   return { markdown: fallback, summary: deriveSummary(fallback) };
 }
 
-function formatIterationResearchUpdate(history: IterationEntry[], iteration: number): string {
-  const entries = history.filter((entry) => entry.iteration === iteration);
-  if (!entries.length) return "No results were returned for the previous iteration.";
-  return JSON.stringify(
-    entries.map((entry) => ({
-      source_id: entry.source_id,
-      source_name: entry.source_name,
-      queries: entry.queries,
-      results_count: entry.results_count,
-      calls: entry.source_calls.map((call) => ({
-        query: call.query,
-        results_count: call.results_count,
-        top_titles: call.top_titles,
-        error: call.error,
-      })),
-    })),
-    null,
-    2,
-  );
+function sectionFacets(job: ResearchJob, section: ReportSection): Array<{ id: string; task: string }> {
+  const sectionFacetIds = new Set(section.facet_ids || []);
+  return (job.outline_discovery?.facets || []).filter((facet) => sectionFacetIds.has(facet.id));
+}
+
+async function observeJobProgress<T>(
+  api: ResearchApi,
+  researchId: string,
+  task: Promise<T>,
+  onSnapshot: (job: ResearchJob) => void,
+): Promise<T> {
+  let polling = false;
+  let active = true;
+  const timer = window.setInterval(() => {
+    if (polling) return;
+    polling = true;
+    void api.getResearchJob(researchId)
+      .then((snapshot) => {
+        if (active && snapshot) onSnapshot(snapshot);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        polling = false;
+      });
+  }, 600);
+  try {
+    return await task;
+  } finally {
+    active = false;
+    window.clearInterval(timer);
+  }
 }
 
 function buildReportContinuityContext(outline: ReportSection[], priorResults: SectionRunResult[], currentSection: ReportSection): string {
@@ -1925,11 +2197,18 @@ function buildReportContinuityContext(outline: ReportSection[], priorResults: Se
       return `${index + 1}. [${position}] ${section.title}\n   Scope: ${section.outline}`;
     })
     .join("\n");
-  const existingReport = priorResults.length
+  const completedSectionSummaries = priorResults.length
     ? priorResults
-        .map((result) => stripCitationMarkersForContinuity(result.markdown).trim())
-        .filter(Boolean)
-        .join("\n\n")
+        .map((result) => {
+          const summary = stripCitationMarkersForContinuity(result.summary || deriveSummary(result.markdown)).trim();
+          return `- ${result.section.title}: ${summary}`;
+        })
+        .join("\n")
+    : "(none yet; this is the first report section)";
+  const existingSubsectionHeaders = priorResults.length
+    ? priorResults
+        .flatMap((result) => result.subsectionHeaders.map((header) => `- ${result.section.title}: ${header}`))
+        .join("\n") || "(none recorded)"
     : "(none yet; this is the first report section)";
 
   return [
@@ -1938,8 +2217,11 @@ function buildReportContinuityContext(outline: ReportSection[], priorResults: Se
     "Complete report outline (respect the boundary between previous, current, and upcoming sections):",
     outlineBlock,
     "",
-    "Existing report content written before this section:",
-    existingReport,
+    "Completed section summaries (continuity only, not evidence):",
+    completedSectionSummaries,
+    "",
+    "Subsection headers already used by previous sections:",
+    existingSubsectionHeaders,
     "",
     "Continuity rules:",
     "- Connect this section naturally to the existing report and keep terminology, timeframes, and conclusions consistent.",
@@ -1950,6 +2232,74 @@ function buildReportContinuityContext(outline: ReportSection[], priorResults: Se
   ].join("\n");
 }
 
+const MAX_RELEVANT_PRIOR_PASSAGES = 6;
+const MAX_RELEVANT_PRIOR_CHARS = 4_000;
+
+function selectRelevantPriorWrittenContents(
+  priorResults: SectionRunResult[],
+  currentSection: ReportSection,
+  subsectionHeaders: string[],
+): string {
+  if (!priorResults.length) return "(none; this is the first report section)";
+  const queryTokens = continuityTokens([currentSection.title, currentSection.outline, ...subsectionHeaders].join(" "));
+  const candidates = priorResults.flatMap((result, sectionIndex) =>
+    splitPriorWrittenPassages(result.markdown).map((passage, passageIndex) => ({
+      passage,
+      sectionTitle: result.section.title,
+      sectionIndex,
+      passageIndex,
+      score: overlapScore(queryTokens, continuityTokens(passage)),
+    })),
+  );
+  const selected = candidates
+    .filter((candidate) => candidate.score > 0)
+    .sort((left, right) =>
+      right.score - left.score ||
+      right.sectionIndex - left.sectionIndex ||
+      left.passageIndex - right.passageIndex,
+    )
+    .slice(0, MAX_RELEVANT_PRIOR_PASSAGES)
+    .sort((left, right) => left.sectionIndex - right.sectionIndex || left.passageIndex - right.passageIndex);
+  if (!selected.length) return "(none selected; rely on completed section summaries for continuity)";
+
+  const parts: string[] = [];
+  let remaining = MAX_RELEVANT_PRIOR_CHARS;
+  for (const candidate of selected) {
+    const label = `[Previous section: ${candidate.sectionTitle}]\n`;
+    const available = remaining - label.length;
+    if (available <= 0) break;
+    const passage = candidate.passage.slice(0, available).trim();
+    if (!passage) continue;
+    parts.push(`${label}${passage}`);
+    remaining -= label.length + passage.length;
+  }
+  return parts.join("\n\n") || "(none selected; rely on completed section summaries for continuity)";
+}
+
+function splitPriorWrittenPassages(markdown: string): string[] {
+  return stripCitationMarkersForContinuity(markdown)
+    .split(/\n\s*\n+/)
+    .map((passage) => passage.replace(/^#{1,6}\s+/gm, "").trim())
+    .filter((passage) => passage.length >= 40);
+}
+
+function continuityTokens(value: string): Set<string> {
+  const normalized = String(value || "").toLocaleLowerCase();
+  const tokens = new Set(normalized.match(/[a-z0-9][a-z0-9._%+-]{1,}|[\u3400-\u9fff]{2,}/g) || []);
+  for (const sequence of normalized.match(/[\u3400-\u9fff]{3,}/g) || []) {
+    for (let index = 0; index < sequence.length - 1; index++) tokens.add(sequence.slice(index, index + 2));
+  }
+  return tokens;
+}
+
+function overlapScore(queryTokens: Set<string>, passageTokens: Set<string>): number {
+  let score = 0;
+  for (const token of queryTokens) {
+    if (passageTokens.has(token)) score += token.length > 3 ? 2 : 1;
+  }
+  return score;
+}
+
 function stripCitationMarkersForContinuity(markdown: string): string {
   return String(markdown || "").replace(/\[\s*\d+(?:\s*[,，]\s*\d+)*\s*\]/g, "");
 }
@@ -1957,7 +2307,6 @@ function stripCitationMarkersForContinuity(markdown: string): string {
 async function generateReportFraming(
   api: ResearchApi,
   query: string,
-  focuses: string[],
   sections: ReportSection[],
   results: Array<{ section: ReportSection; summary: string }>,
 ): Promise<ReportFraming> {
@@ -1969,7 +2318,7 @@ async function generateReportFraming(
         text:
           'Generate report framing only. Return strict JSON only: {"title":"...","introduction":"...","conclusion":"..."}.\n' +
           "Do not rewrite section bodies.\n\n" +
-          `Task:\n${query}\n\nFocuses:\n${focuses.map((focus) => `- ${focus}`).join("\n")}\n\n` +
+          `Task:\n${query}\n\n` +
           `Outline titles:\n${sections.map((section) => `- ${section.title}`).join("\n")}\n\n` +
           `Section summaries:\n${results.map((result) => `- ${result.section.title}: ${result.summary}`).join("\n")}`,
       },
@@ -2056,9 +2405,16 @@ function registerAttachmentCitationReferences(registry: CitationSource[], items:
 
 function citationReferencePromptLine(reference: CitationReference): string {
   const source = reference.source;
-  if (source.kind === "url") return `[${reference.number}] ${source.url}`;
+  if (source.kind === "url") return `- ${source.url}`;
   const label = attachmentChunkLabelForPrompt(source);
-  return `[${reference.number}] Uploaded file: ${source.file_name}${label ? ` · ${label}` : ""}`;
+  return `- ${citationSourceIdentifier(source)} · Uploaded file: ${source.file_name}${label ? ` · ${label}` : ""}`;
+}
+
+function citationSourceIdentifier(source: CitationSource): string {
+  if (source.kind === "url") return source.url;
+  const file = encodeURIComponent(source.file_id || source.file_name || "file");
+  const chunk = encodeURIComponent(source.chunk_id || String(source.index || "document"));
+  return `anna-attachment://${file}/${chunk}`;
 }
 
 function attachmentChunkLabelForPrompt(source: Extract<CitationSource, { kind: "attachment" }>): string {
@@ -2077,6 +2433,147 @@ function isUrlCitationSource(source: CitationSource): source is Extract<Citation
   return source.kind === "url";
 }
 
+interface SourceCurationDecision {
+  candidateId: string;
+  decision: "include" | "exclude";
+  reason: string;
+}
+
+interface SourceCurationAudit {
+  mode: "llm";
+  version: "upstream-v1";
+  status: "completed" | "failed_open";
+  candidate_count: number;
+  included_count: number;
+  excluded_count: number;
+  decisions: SourceCurationDecision[];
+  error?: string;
+  curated_at: string;
+}
+
+export async function curateSelectedSources(
+  api: ResearchApi,
+  job: ResearchJob,
+  section: ReportSection,
+  candidates: SearchResult[],
+): Promise<{ sources: SearchResult[]; audit: SourceCurationAudit }> {
+  const now = new Date();
+  const curatedAt = now.toISOString();
+  const currentDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  if (candidates.length <= 1) {
+    return {
+      sources: candidates,
+      audit: {
+        mode: "llm",
+        version: "upstream-v1",
+        status: "completed",
+        candidate_count: candidates.length,
+        included_count: candidates.length,
+        excluded_count: 0,
+        decisions: candidates.map((_source, index) => ({ candidateId: `source-${index + 1}`, decision: "include", reason: "Only available candidate." })),
+        curated_at: curatedAt,
+      },
+    };
+  }
+
+  const sourceBlock = candidates
+    .map((source, index) => {
+      const content = String(source.content || "").trim().slice(0, 2200);
+      return [
+        `Candidate ID: source-${index + 1}`,
+        `Source: ${source.url}`,
+        `Title: ${source.title || "(untitled)"}`,
+        `Content: ${content || "(no usable content)"}`,
+      ].join("\n");
+    })
+    .join("\n\n");
+
+  try {
+    const text = await completeText(api, [
+      {
+        role: "system",
+        content: {
+          type: "text",
+          text: "You are an expert research source curator. Evaluate only the supplied candidates and return strict JSON.",
+        },
+      },
+      {
+        role: "user",
+        content: {
+          type: "text",
+          text:
+            `Current date: ${currentDate}. Judge whether information is recent, outdated, or future-dated relative to this date.\n\n` +
+            `Research task:\n${job.query || ""}\n\nReport section:\n${section.title}\n${section.outline}\n\n` +
+            "Evaluate and curate the retrieved source excerpts for this section. Prioritize relevant, credible, current, objective sources with statistics, dates, concrete data, or unique insights. Favor authoritative and primary sources where appropriate, but retain other useful perspectives unless they are clearly irrelevant, unusable, severely outdated for the task, duplicative without added value, or obviously untrustworthy. Err on the side of inclusion. Do not rewrite or summarize source content. Do not invent facts or candidate IDs.\n\n" +
+            'Return exactly one JSON object: {"sources":[{"candidate_id":"source-1","decision":"include|exclude","reason":"short explanation"}]}. ' +
+            "Return every candidate exactly once and in the original order.\n\n" +
+            `Candidates:\n${sourceBlock}`,
+        },
+      },
+    ]);
+    const parsed = parseJsonObject(text);
+    const values = Array.isArray(parsed?.sources) ? parsed.sources : [];
+    if (values.length !== candidates.length) throw new Error("Source curator returned an incomplete candidate list.");
+    const decisions: SourceCurationDecision[] = values.map((value, index) => {
+      const item = value as Record<string, unknown>;
+      const candidateId = String(item?.candidate_id || "");
+      const expectedId = `source-${index + 1}`;
+      const decision = String(item?.decision || "").toLowerCase();
+      if (candidateId !== expectedId || (decision !== "include" && decision !== "exclude")) {
+        throw new Error("Source curator returned an invalid candidate decision.");
+      }
+      return {
+        candidateId,
+        decision,
+        reason: String(item?.reason || "").trim().slice(0, 500),
+      } as SourceCurationDecision;
+    });
+    const included = candidates.filter((_source, index) => decisions[index].decision === "include");
+    if (!included.length) throw new Error("Source curator excluded every candidate.");
+    return {
+      sources: included,
+      audit: {
+        mode: "llm",
+        version: "upstream-v1",
+        status: "completed",
+        candidate_count: candidates.length,
+        included_count: included.length,
+        excluded_count: candidates.length - included.length,
+        decisions,
+        curated_at: curatedAt,
+      },
+    };
+  } catch (error) {
+    return {
+      sources: candidates,
+      audit: {
+        mode: "llm",
+        version: "upstream-v1",
+        status: "failed_open",
+        candidate_count: candidates.length,
+        included_count: candidates.length,
+        excluded_count: 0,
+        decisions: [],
+        error: error instanceof Error ? error.message.slice(0, 500) : "Source curation failed.",
+        curated_at: curatedAt,
+      },
+    };
+  }
+}
+
+function buildCuratedSelectedContext(sources: SearchResult[]): string {
+  return sources
+    .map((source, index) => {
+      const sourceLabel = source.source_name || source.source_id || "Unknown source";
+      return `[来源: ${sourceLabel}] [${index + 1}] ${source.title || source.url || "(untitled)"}\nURL: ${source.url || "(none)"}\nQuery: ${source.query || ""}\nContent: ${stripInternalChunkMarkers(source.content || "")}`;
+    })
+    .join("\n\n");
+}
+
+function sourceCurationModeFromJob(job: ResearchJob | null | undefined): SourceCurationMode {
+  return job?.research_options?.source_curation_mode === "llm" ? "llm" : "off";
+}
+
 export function normalizeSectionCitations(markdown: string, references: CitationReference[]): string {
   const normalized = markdown
     .replace(/\[\s*(\d+(?:\s*[,，]\s*\d+)+)\s*\]/g, (_match, group: string) =>
@@ -2089,11 +2586,28 @@ export function normalizeSectionCitations(markdown: string, references: Citation
   const allowed = new Set(references.map((reference) => reference.number));
   const invalid = Array.from(normalized.matchAll(/\[(\d+)\]/g), (match) => Number(match[1])).filter((number) => !allowed.has(number));
   if (invalid.length) {
-    throw new Error(
-      `Section contains citation numbers outside its current section citation map: ${Array.from(new Set(invalid)).join(", ")}.`,
-    );
+    throw new Error(`Section contains citation numbers outside its current section citation map: ${Array.from(new Set(invalid)).join(", ")}.`);
   }
   return normalized;
+}
+
+export function convertSectionUrlCitations(markdown: string, references: CitationReference[]): string {
+  let converted = String(markdown || "");
+  for (const reference of references) {
+    const identifier = citationSourceIdentifier(reference.source);
+    const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const link = new RegExp(`\\[([^\\]\\r\\n]+)\\]\\(\\s*${escaped}\\s*\\)`, "g");
+    converted = converted.replace(link, `[${reference.number}]`);
+  }
+  converted = converted.replace(/\(\s*(\[\d+\](?:\s*\[\d+\])*)\s*\)/g, "$1");
+  const unknownIdentifiers = Array.from(
+    converted.matchAll(/\[[^\]\r\n]+\]\(\s*((?:https?:\/\/|anna-attachment:\/\/)[^\s)]+)\s*\)/g),
+    (match) => match[1],
+  );
+  if (unknownIdentifiers.length) {
+    throw new Error(`Section contains citation URLs outside its allowed source identifier list: ${Array.from(new Set(unknownIdentifiers)).join(", ")}.`);
+  }
+  return normalizeSectionCitations(converted, references);
 }
 
 export function remapSelectedContextCitationLabels(context: string, references: CitationReference[]): string {
@@ -2101,6 +2615,14 @@ export function remapSelectedContextCitationLabels(context: string, references: 
     const reference = references[Number(localNumber) - 1];
     return reference ? `${prefix}[${reference.number}]` : match;
   });
+}
+
+function stripSelectedContextCitationLabels(context: string): string {
+  return String(context || "").replace(/^(\[来源:[^\]\r\n]+\]\s*)\[\d+\](?=\s)/gm, "$1");
+}
+
+export function stripInternalChunkMarkers(context: string): string {
+  return String(context || "").replace(/\[(?:Chunk|Chunks)\s+\d+(?:\s*-\s*\d+)?\][ \t]*(?:\r?\n)?/gi, "");
 }
 
 async function completeText(api: ResearchApi, messages: Parameters<ResearchApi["complete"]>[0]["messages"]): Promise<string> {
@@ -2144,15 +2666,6 @@ function normalizeRoleCandidate(item: unknown): RoleCandidate | null {
   return { server, agent_role_prompt: prompt, rationale: String(data?.rationale || "").trim() };
 }
 
-function normalizeSectionDraft(item: unknown, index: number): ReportSection | null {
-  const data = item as Record<string, unknown>;
-  const title = String(data?.title || "").trim();
-  const outline = String(data?.outline || data?.content || "").trim();
-  if (!title || !outline) return null;
-  const max = Math.max(1, Math.min(10, Number(data?.max_iterations || 5)));
-  return { id: `section-${index + 1}`, title, outline, allowed_source_ids: [], max_iterations: max };
-}
-
 function padRoles(roles: RoleCandidate[]): RoleCandidate[] {
   const out = [...roles];
   while (out.length < 3) {
@@ -2165,30 +2678,39 @@ function padRoles(roles: RoleCandidate[]): RoleCandidate[] {
   return out;
 }
 
-function padFocuses(focuses: FocusCandidate[]): FocusCandidate[] {
-  const out = [...focuses];
-  while (out.length < 5) out.push({ id: `focus-${out.length + 1}`, text: `Research focus ${out.length + 1}` });
-  return out;
-}
-
-function padSections(sections: ReportSection[]): ReportSection[] {
-  const out = [...sections];
-  while (out.length < 4) {
-    out.push({
-      id: `section-${out.length + 1}`,
-      title: `Section ${out.length + 1}`,
-      outline: "Cover the most relevant evidence for this part of the research task.",
-      allowed_source_ids: [],
-      max_iterations: 5,
-    });
-  }
-  return out.map((section, index) => ({ ...section, id: `section-${index + 1}` }));
-}
-
 function uniqueQueries(queries: unknown): string[] {
   if (!Array.isArray(queries)) return [];
   const cleanedQueries = queries.map((query) => String(query || "").trim()).filter(Boolean);
   return Array.from(new Set(cleanedQueries)).slice(0, 3);
+}
+
+function uniqueQueriesUnlimited(queries: unknown): string[] {
+  if (!Array.isArray(queries)) return [];
+  return Array.from(new Set(queries.map((query) => String(query || "").trim()).filter(Boolean)));
+}
+
+function uniqueTextValues(values: unknown[], limit: number): string[] {
+  const output: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const text = String(value || "").trim();
+    const key = text.toLocaleLowerCase();
+    if (!text || seen.has(key)) continue;
+    seen.add(key);
+    output.push(text);
+    if (output.length >= limit) break;
+  }
+  return output;
+}
+
+function mergeUniqueText(target: string[], additions: string[]): void {
+  const seen = new Set(target.map((item) => item.toLocaleLowerCase()));
+  for (const item of additions) {
+    const key = item.toLocaleLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    target.push(item);
+  }
 }
 
 function sortedUnique(items: string[]): string[] {

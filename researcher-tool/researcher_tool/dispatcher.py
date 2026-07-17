@@ -3,7 +3,8 @@ from __future__ import annotations
 import io
 import json
 import os
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable
 
 from .attachments import prepare_attachments
 from .context_selector import LexicalContextSelector
@@ -21,6 +22,7 @@ from .sources import (
     migrate_legacy_tavily_key,
 )
 from .sources.native.executor import NativeResearchSourceExecutor
+from .sources.extraction.tavily import enrich_tavily_items
 from .views import compact_job_view, source_view, status_view
 from .web_documents import WebDocumentStore
 
@@ -83,6 +85,7 @@ class AppDispatcher:
         native_executor: NativeResearchSourceExecutor | None = None,
         web_documents: WebDocumentStore | None = None,
         embeddings: Any = None,
+        tavily_enricher: Callable[..., list[dict[str, Any]]] | None = None,
     ):
         self.settings = settings or SettingsStore()
         self.jobs = jobs or JobStore()
@@ -99,6 +102,7 @@ class AppDispatcher:
             self.executor = ResearchSourceExecutor(token_provider=self._token_for)
         self.native_executor = native_executor or NativeResearchSourceExecutor()
         self.web_documents = web_documents or WebDocumentStore(self.jobs)
+        self.tavily_enricher = tavily_enricher or enrich_tavily_items
         if self.selector is None:
             self.selector = HybridContextSelector(embeddings=embeddings, documents=self.web_documents) if embeddings is not None else LexicalContextSelector()
         migrate_legacy_tavily_key(self.settings, self.credentials)
@@ -122,12 +126,6 @@ class AppDispatcher:
             if not isinstance(role, dict):
                 raise ValidationError("role must be an object")
             return {"job": status_view(self.jobs.save_confirmed_role(research_id, role))}
-        if method == "app_save_confirmed_research_focuses":
-            research_id = required_string(args, "research_id")
-            focuses = args.get("focuses")
-            if not isinstance(focuses, list):
-                raise ValidationError("focuses must be an array")
-            return {"job": status_view(self.jobs.save_confirmed_focuses(research_id, focuses))}
         if method == "app_save_confirmed_research_outline":
             research_id = required_string(args, "research_id")
             sections = args.get("sections")
@@ -342,11 +340,20 @@ class AppDispatcher:
         first_error: str | None = None
         executor = self._executor_for(definition)
         extraction_cache = self.web_documents.page_cache(research_id)
-        for query in accepted_queries:
+
+        def execute(query: str):
             if self._is_native_source(definition):
-                result = executor.call(definition, query, extraction_cache=extraction_cache)
-            else:
-                result = executor.call(definition, query)
+                return executor.call(definition, query, extraction_cache=extraction_cache)
+            return executor.call(definition, query)
+
+        max_workers = min(max(1, int(definition.get("max_parallel") or 1)), len(accepted_queries))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            query_results = list(pool.map(execute, accepted_queries))
+
+        self._enrich_tavily_query_results(research_id, definition, query_results)
+
+        for result in query_results:
+            usable_items = _usable_result_items(result.items)
             error_code = result.error if result.error not in (None, "empty_result") else None
             if error_code and first_error is None:
                 first_error = error_code
@@ -354,14 +361,15 @@ class AppDispatcher:
                 "source_id": result.source_id,
                 "source_name": result.source_name,
                 "query": result.query,
-                "results_count": len(result.items),
-                "top_titles": [str(item.get("title") or "") for item in result.items[:3]],
+                "results_count": len(usable_items),
+                "candidate_count": len(result.items),
+                "top_titles": [str(item.get("title") or "") for item in usable_items[:3]],
                 "duration_ms": result.duration_ms,
                 "error": result.error,
                 "items": result.items,
             }
             call_summaries.append(summary)
-            stored_items = self.web_documents.detach_contents(research_id, result.items) if self._is_native_source(definition) else result.items
+            stored_items = self.web_documents.detach_contents(research_id, result.items) if self._stores_web_documents(definition) else result.items
             summary["items"] = stored_items
             raw_results.extend(stored_items)
 
@@ -374,6 +382,7 @@ class AppDispatcher:
             queries=accepted_queries,
             source_calls=call_summaries,
             raw_results=raw_results,
+            research_decision=args.get("research_decision") if isinstance(args.get("research_decision"), dict) else None,
         )
         return {
             "job": status_view(job),
@@ -383,13 +392,150 @@ class AppDispatcher:
                 "source_name": str(definition.get("name") or source_id),
                 "queries": accepted_queries,
                 "skipped_queries": skipped_queries,
-                "results_count": len(raw_results),
-                "top_titles": [str(item.get("title") or "") for item in raw_results[:3]],
+                "results_count": len(_usable_result_items(raw_results)),
+                "candidate_count": len(raw_results),
+                "top_titles": [str(item.get("title") or "") for item in _usable_result_items(raw_results)[:3]],
                 "duration_ms": sum(int(c.get("duration_ms") or 0) for c in call_summaries),
                 "error": first_error,
                 "calls": [{k: v for k, v in c.items() if k != "items"} for c in call_summaries],
             },
         }
+
+    def _call_outline_discovery_source(self, args: dict[str, Any]) -> dict[str, Any]:
+        research_id = required_string(args, "research_id")
+        source_id = required_string(args, "source_id")
+        phase = str(args.get("phase") or "").strip()
+        if phase not in {"seed", "research"}:
+            raise ValidationError("phase must be seed or research")
+        query_ids = _normalize_query_ids(args.get("query_ids"))
+        if not query_ids:
+            raise ValidationError("query_ids is required")
+        job = self.jobs.load(research_id)
+        query_plan = _outline_query_plan(job)
+        unknown_query_ids = [query_id for query_id in query_ids if query_id not in query_plan]
+        if unknown_query_ids:
+            raise ValidationError("unknown outline query id", data={"query_ids": unknown_query_ids})
+        try:
+            definition = self.registry.get_definition(source_id)
+        except Exception as exc:
+            raise ValidationError(f"unknown source: {source_id}") from exc
+        self._ensure_source_credential(source_id, definition)
+
+        accepted_query_ids: list[str] = []
+        skipped_query_ids: list[str] = []
+        for query_id in query_ids:
+            if self.jobs.has_outline_discovery_called(research_id, phase, source_id, query_id):
+                skipped_query_ids.append(query_id)
+            else:
+                accepted_query_ids.append(query_id)
+        if not accepted_query_ids:
+            return {
+                "job": status_view(self.jobs.load(research_id)),
+                "source_call": {
+                    "phase": phase,
+                    "source_id": source_id,
+                    "source_name": str(definition.get("name") or source_id),
+                    "query_ids": [],
+                    "skipped_query_ids": skipped_query_ids,
+                    "results_count": 0,
+                    "top_titles": [],
+                    "duration_ms": 0,
+                    "error": None,
+                    "calls": [],
+                },
+            }
+
+        call_summaries: list[dict[str, Any]] = []
+        raw_results: list[dict[str, Any]] = []
+        first_error: str | None = None
+        executor = self._executor_for(definition)
+        max_workers = min(max(1, int(definition.get("max_parallel") or 1)), len(accepted_query_ids))
+
+        def execute(query_id: str):
+            query = query_plan[query_id]
+            if self._is_native_source(definition):
+                return query_id, executor.call(definition, query, extraction_cache=self.web_documents.page_cache(research_id))
+            return query_id, executor.call(definition, query)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            query_results = list(pool.map(execute, accepted_query_ids))
+
+        self._enrich_tavily_query_results(research_id, definition, [result for _query_id, result in query_results])
+
+        for query_id, result in query_results:
+            usable_items = _usable_result_items(result.items)
+            error_code = result.error if result.error not in (None, "empty_result") else None
+            if error_code and first_error is None:
+                first_error = error_code
+            summary = {
+                "source_id": result.source_id,
+                "source_name": result.source_name,
+                "query_id": query_id,
+                "results_count": len(usable_items),
+                "candidate_count": len(result.items),
+                "top_titles": [str(item.get("title") or "") for item in usable_items[:3]],
+                "duration_ms": result.duration_ms,
+                "error": result.error,
+                "items": result.items,
+            }
+            stored_items = self.web_documents.detach_contents(research_id, result.items) if self._stores_web_documents(definition) else result.items
+            stored_items = [{**{key: value for key, value in item.items() if key != "query"}, "query_id": query_id} for item in stored_items]
+            summary["items"] = stored_items
+            call_summaries.append(summary)
+            raw_results.extend(stored_items)
+
+        job = self.jobs.append_outline_discovery(
+            research_id,
+            phase=phase,
+            source_id=source_id,
+            source_name=str(definition.get("name") or source_id),
+            query_ids=accepted_query_ids,
+            source_calls=call_summaries,
+            raw_results=raw_results,
+        )
+        return {
+            "job": status_view(job),
+            "source_call": {
+                "phase": phase,
+                "source_id": source_id,
+                "source_name": str(definition.get("name") or source_id),
+                "query_ids": accepted_query_ids,
+                "skipped_query_ids": skipped_query_ids,
+                "results_count": len(_usable_result_items(raw_results)),
+                "candidate_count": len(raw_results),
+                "top_titles": [str(item.get("title") or "") for item in _usable_result_items(raw_results)[:3]],
+                "duration_ms": sum(int(call.get("duration_ms") or 0) for call in call_summaries),
+                "error": first_error,
+                "calls": [{key: value for key, value in call.items() if key != "items"} for call in call_summaries],
+            },
+        }
+
+    def _select_outline_discovery(self, args: dict[str, Any]) -> dict[str, Any]:
+        research_id = required_string(args, "research_id")
+        phase = str(args.get("phase") or "").strip()
+        if phase not in {"seed", "research"}:
+            raise ValidationError("phase must be seed or research")
+        job = self.jobs.load(research_id)
+        discovery = job.get("outline_discovery") or {}
+        entries = [discovery.get("seed") or {}] if phase == "seed" else discovery.get("research_calls") or []
+        query_plan = _outline_query_plan(job)
+        search_results = [item for entry in entries for item in entry.get("raw_results") or []]
+        query_ids = _unique_queries_in_order(query_id for entry in entries for query_id in entry.get("query_ids") or [])
+        search_queries = [query_plan[query_id] for query_id in query_ids if query_id in query_plan]
+        facet_queries = [
+            str(facet.get("task") or "").strip()
+            for facet in ((discovery.get("query_plan") or {}).get("facets") or [])
+            if isinstance(facet, dict) and str(facet.get("task") or "").strip()
+        ]
+        selected = self.selector.select(
+            query=str(args.get("query") or "").strip() or str(job.get("query") or ""),
+            search_queries=(facet_queries if phase == "seed" and facet_queries else normalize_queries(args.get("search_queries")) or search_queries or [job.get("query")]),
+            search_results=search_results,
+            research_id=research_id,
+            diversify_queries=phase == "seed",
+        )
+        self.jobs.save_outline_discovery_context(research_id, phase, selected)
+        return selected
 
     def _select_section_context(self, args: dict[str, Any]) -> dict[str, Any]:
         research_id = required_string(args, "research_id")
@@ -397,6 +543,15 @@ class AppDispatcher:
         job = self.jobs.load(research_id)
         section = _find_section(job, section_id)
         iterations = (job.get("section_iterations") or {}).get(section_id, []) or []
+        iteration_filter = args.get("iteration")
+        if iteration_filter is not None:
+            try:
+                requested_iteration = int(iteration_filter)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError("iteration must be an integer") from exc
+            if requested_iteration < 1:
+                raise ValidationError("iteration must be at least 1")
+            iterations = [entry for entry in iterations if int(entry.get("iteration") or 0) == requested_iteration]
         search_results = [
             item
             for iteration in iterations
@@ -446,12 +601,33 @@ class AppDispatcher:
     def _is_native_source(definition: dict[str, Any]) -> bool:
         return isinstance(definition.get("native"), dict)
 
+    @staticmethod
+    def _stores_web_documents(definition: dict[str, Any]) -> bool:
+        return AppDispatcher._is_native_source(definition) or str(definition.get("id") or "") == "tavily"
+
+    def _enrich_tavily_query_results(self, research_id: str, definition: dict[str, Any], results: list[Any]) -> None:
+        if str(definition.get("id") or "") != "tavily" or not results:
+            return
+        counts = [len(result.items) for result in results]
+        flattened = [item for result in results for item in result.items]
+        enriched = self.tavily_enricher(flattened, page_cache=self.web_documents.page_cache(research_id))
+        offset = 0
+        for result, count in zip(results, counts):
+            result.items = enriched[offset:offset + count]
+            if result.items and not _usable_result_items(result.items):
+                result.error = "empty_result"
+            offset += count
+
 
 def required_string(args: dict[str, Any], key: str) -> str:
     value = str(args.get(key) or "").strip()
     if not value:
         raise ValidationError(f"{key} is required")
     return value
+
+
+def _usable_result_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [item for item in items if str(item.get("extraction_status") or "success").lower() == "success"]
 
 
 def _find_section(job: dict[str, Any], section_id: str) -> dict[str, Any]:
@@ -471,6 +647,27 @@ def normalize_queries(value: Any) -> list[str]:
         if text and text not in queries:
             queries.append(text)
     return queries
+
+
+def _normalize_query_ids(value: Any) -> list[str]:
+    if value is None:
+        return []
+    raw = value if isinstance(value, list) else [value]
+    return list(dict.fromkeys(str(item or "").strip() for item in raw if str(item or "").strip()))
+
+
+def _outline_query_plan(job: dict[str, Any]) -> dict[str, str]:
+    discovery = job.get("outline_discovery") or {}
+    query_plan = discovery.get("query_plan") or {}
+    queries = query_plan.get("queries") or []
+    result = {
+        str(item.get("id") or "").strip(): str(item.get("text") or "").strip()
+        for item in queries
+        if isinstance(item, dict) and str(item.get("id") or "").strip() and str(item.get("text") or "").strip()
+    }
+    if not result:
+        raise ValidationError("outline query plan is missing")
+    return result
 
 
 def _unique_queries_in_order(values: Any) -> list[str]:

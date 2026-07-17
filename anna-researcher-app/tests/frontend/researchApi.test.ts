@@ -3,6 +3,41 @@ import { AnnaResearchApi } from "../../src/api/researchApi";
 import { TOOL_ID, type AnnaRuntimeApi } from "../../src/types";
 
 describe("AnnaResearchApi", () => {
+  it("loads a backend-generated outline without an HTTP transfer", async () => {
+    const calls: unknown[] = [];
+    const anna = {
+      tools: {
+        async invoke(request: unknown, options: unknown) {
+          calls.push([request, options]);
+          return {
+            success: true,
+            data: {
+              outline: [{ id: "section-1", title: "Market", outline: "Assess the market.", facet_ids: ["f1"], allowed_source_ids: [], max_iterations: 5 }],
+            },
+          };
+        },
+      },
+      llm: { async complete() { return {}; } },
+    } as unknown as AnnaRuntimeApi;
+    const oldFetch = globalThis.fetch;
+    let fetched = false;
+    globalThis.fetch = (async () => {
+      fetched = true;
+      throw new Error("outline generation must not use HTTP transfer");
+    }) as typeof fetch;
+    try {
+      const outline = await new AnnaResearchApi(anna).generateOutlineDraft({ research_id: "r1", source_ids: ["tavily"] });
+      expect(outline[0].title).toBe("Market");
+      expect(fetched).toBe(false);
+      expect(calls).toEqual([[
+        { tool_id: TOOL_ID, method: "app_generate_outline_draft", args: { research_id: "r1", source_ids: ["tavily"] }, timeoutMs: 300000 },
+        { timeoutMs: 300000 },
+      ]]);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
   it("creates an auto Agent session through the frontend runtime", async () => {
     const calls: unknown[] = [];
     const session = { async *run() {}, async delete() {} };

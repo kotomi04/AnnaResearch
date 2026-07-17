@@ -9,9 +9,8 @@ interface Props {
 
 export function PlanSummaryStrip({ summary, t, compact }: Props) {
   const hasRole = Boolean(summary.roleName);
-  const hasFocuses = summary.focuses.length > 0;
   const hasSections = summary.sectionCount > 0;
-  if (!hasRole && !hasFocuses && !hasSections) return null;
+  if (!hasRole && !hasSections) return null;
   return (
     <section className="plan-summary" data-compact={compact ? "true" : "false"}>
       {hasRole ? (
@@ -19,11 +18,6 @@ export function PlanSummaryStrip({ summary, t, compact }: Props) {
           <summary>{t("summaryRole", { role: summary.roleName })}</summary>
           <p>{summary.rolePrompt}</p>
         </details>
-      ) : null}
-      {hasFocuses ? (
-        <div className="summary-chip-row" aria-label={t("summaryFocuses")}>
-          {summary.focuses.map((focus) => <span key={focus}>{focus}</span>)}
-        </div>
       ) : null}
       {hasSections ? (
         <p className="summary-stat">

@@ -5,6 +5,8 @@ from collections.abc import Iterable
 
 from .models import ExtractedPage
 
+MAX_PARALLEL_BROWSER_PAGES = 4
+
 
 class BrowserFallbackError(RuntimeError):
     """Raised when optional crawl4ai browser fallback cannot extract content."""
@@ -93,19 +95,26 @@ async def _extract_with_crawl4ai(url: str, *, query: str, timeout: float) -> tup
 
 async def _extract_many_with_crawl4ai(urls: list[str], *, query: str, timeout: float) -> list[tuple[str, str, str] | ExtractedPage]:
     crawler_cls, config = _crawl4ai_runtime(query=query, timeout=timeout)
-    results: list[tuple[str, str, str] | ExtractedPage] = []
-    async with crawler_cls() as crawler:
-        for url in urls:
-            if not url:
-                results.append(ExtractedPage(url="", content_type="html", status="failed", error="empty_url"))
-                continue
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_BROWSER_PAGES)
+
+    async def crawl(url: str) -> tuple[str, str, str] | ExtractedPage:
+        if not url:
+            return ExtractedPage(url="", content_type="html", status="failed", error="empty_url")
+        async with semaphore:
             try:
-                results.append(await _crawl_one(crawler, url, config=config))
+                return await _crawl_one(crawler, url, config=config)
             except BrowserFallbackError as exc:
-                results.append(ExtractedPage(url=url, content_type="html", status="failed", error=str(exc)))
+                return ExtractedPage(url=url, content_type="html", status="failed", error=str(exc))
             except Exception as exc:  # noqa: BLE001
-                results.append(ExtractedPage(url=url, content_type="html", status="failed", error=f"browser_fallback_failed: {type(exc).__name__}: {exc}"))
-    return results
+                return ExtractedPage(
+                    url=url,
+                    content_type="html",
+                    status="failed",
+                    error=f"browser_fallback_failed: {type(exc).__name__}: {exc}",
+                )
+
+    async with crawler_cls() as crawler:
+        return list(await asyncio.gather(*(crawl(url) for url in urls)))
 
 
 def _crawl4ai_runtime(*, query: str, timeout: float):

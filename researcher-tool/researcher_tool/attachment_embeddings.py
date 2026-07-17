@@ -8,7 +8,7 @@ from .errors import ValidationError
 from .job_store import JobStore
 from .views import compact_job_view
 
-EMBEDDING_BATCH_SIZE = 2
+EMBEDDING_BATCH_SIZE = 1
 EMBEDDING_MODEL = "anna-managed-v1"
 EMBEDDING_TIMEOUT_SECONDS = 45.0
 MAX_EMBEDDING_RETRY_ROUNDS = 1

@@ -1,13 +1,12 @@
 import type { ResearchJob, ResearchResult } from "../types";
 
-export type GuidedStepId = "need" | "role" | "focus" | "outline" | "generate" | "report";
+export type GuidedStepId = "need" | "role" | "outline" | "generate" | "report";
 
 export interface GuidedStep {
   id: GuidedStepId;
   labelKey:
     | "stepNeed"
     | "stepRole"
-    | "stepFocus"
     | "stepOutline"
     | "stepGenerate"
     | "stepReport";
@@ -16,7 +15,6 @@ export interface GuidedStep {
 export const guidedSteps: GuidedStep[] = [
   { id: "need", labelKey: "stepNeed" },
   { id: "role", labelKey: "stepRole" },
-  { id: "focus", labelKey: "stepFocus" },
   { id: "outline", labelKey: "stepOutline" },
   { id: "generate", labelKey: "stepGenerate" },
   { id: "report", labelKey: "stepReport" },
@@ -63,20 +61,23 @@ function stepForPhase(phase: string, job?: ResearchJob | null, result?: Research
   if (phase === "completed" || job?.status === "completed" || result?.report_markdown) return "report";
   if (phase === "running" || phase === "loading_result") return "generate";
   if (phase === "outline_review" || phase === "generating_outline") return "outline";
-  if (phase === "focus_review" || phase === "generating_focuses") return "focus";
   if (phase === "role_review" || phase === "starting" || phase === "generating_roles") return "role";
+  if (phase === "failed") {
+    if ((job?.confirmed_outline || []).length) return "generate";
+    if (job?.confirmed_role) return "outline";
+    if (job?.research_id) return "role";
+  }
   return "need";
 }
 
 function isLockedPhase(phase: string): boolean {
-  return phase === "running" || phase === "generating_roles" || phase === "generating_focuses" || phase === "generating_outline";
+  return phase === "running" || phase === "generating_roles" || phase === "generating_outline";
 }
 
 function completedFor(input: StepProjectionInput, phaseStep: GuidedStepId): GuidedStepId[] {
   const completed: GuidedStepId[] = [];
   if (input.job?.research_id || phaseStep !== "need") completed.push("need");
-  if (input.job?.confirmed_role || ["focus", "outline", "generate", "report"].includes(phaseStep)) completed.push("role");
-  if ((input.job?.confirmed_focuses || []).length || ["outline", "generate", "report"].includes(phaseStep)) completed.push("focus");
+  if (input.job?.confirmed_role || ["outline", "generate", "report"].includes(phaseStep)) completed.push("role");
   if ((input.job?.confirmed_outline || []).length || ["generate", "report"].includes(phaseStep)) completed.push("outline");
   if (phaseStep === "report") completed.push("generate");
   return completed;
@@ -89,9 +90,6 @@ function availableFor(input: StepProjectionInput, phaseStep: GuidedStepId, locke
     if (input.job?.confirmed_role) {
       available.push("role");
     }
-    if ((input.job?.confirmed_focuses || []).length) {
-      available.push("focus");
-    }
     if ((input.job?.confirmed_outline || []).length) {
       available.push("outline", "generate");
     }
@@ -100,8 +98,7 @@ function availableFor(input: StepProjectionInput, phaseStep: GuidedStepId, locke
   }
   const available: GuidedStepId[] = ["need"];
   if (input.phase === "role_review" || input.job?.research_id) available.push("role");
-  if (input.phase === "focus_review" || input.job?.confirmed_role) available.push("focus");
-  if (input.phase === "outline_review" || (input.job?.confirmed_focuses || []).length) available.push("outline");
+  if (input.phase === "outline_review" || input.job?.confirmed_role) available.push("outline");
   if (input.job?.status === "completed" && (input.result || input.job.result)) available.push("report");
   return guidedSteps.map((step) => step.id).filter((id) => available.includes(id));
 }

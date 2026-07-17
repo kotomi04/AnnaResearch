@@ -58,6 +58,10 @@ interface ContextResponse extends JobResponse {
   context_transfer?: ResultTransferDescriptor;
 }
 
+interface OutlineDraftResponse extends JobResponse {
+  outline?: ReportSection[];
+}
+
 interface AttachmentContextResponse {
   selected_context?: string;
   selected_items?: Array<{
@@ -99,7 +103,12 @@ export interface ResearchApi {
   getResearchJob(researchId?: string): Promise<ResearchJob | null>;
   listResearchJobs(input?: { limit?: number }): Promise<ResearchJob[]>;
   saveConfirmedResearchRole(researchId: string, role: ConfirmedResearchRole): Promise<ResearchJob>;
-  saveConfirmedResearchFocuses(researchId: string, focuses: string[]): Promise<ResearchJob>;
+  generateOutlineDraft(input: {
+    research_id: string;
+    source_ids: string[];
+    instruction?: string;
+    reuse_discovery?: boolean;
+  }): Promise<ReportSection[]>;
   saveConfirmedResearchOutline(researchId: string, sections: ReportSection[]): Promise<ResearchJob>;
   callSectionResearchSource(input: {
     research_id: string;
@@ -107,13 +116,20 @@ export interface ResearchApi {
     iteration: number;
     source_id: string;
     queries: string[];
+    research_decision?: {
+      type: "call_source";
+      knowledge_gap?: string;
+      rationale?: string;
+      target_facet_ids?: string[];
+    };
   }): Promise<CallSourceResponse>;
-  selectSectionContext(input: { research_id: string; section_id: string; query?: string; search_queries?: string[] }): Promise<ContextResponse>;
+  selectSectionContext(input: { research_id: string; section_id: string; iteration?: number; query?: string; search_queries?: string[] }): Promise<ContextResponse>;
   saveSectionResult(input: {
     research_id: string;
     section_id: string;
     section_markdown: string;
     section_summary: string;
+    subsection_headers?: string[];
     source_urls?: string[];
     citation_sources?: CitationSource[];
     status?: string;
@@ -233,8 +249,15 @@ export class AnnaResearchApi implements ResearchApi {
     return requireJob(await this.call("app_save_confirmed_research_role", { research_id: researchId, role }));
   }
 
-  async saveConfirmedResearchFocuses(researchId: string, focuses: string[]): Promise<ResearchJob> {
-    return requireJob(await this.call("app_save_confirmed_research_focuses", { research_id: researchId, focuses }));
+  async generateOutlineDraft(input: {
+    research_id: string;
+    source_ids: string[];
+    instruction?: string;
+    reuse_discovery?: boolean;
+  }): Promise<ReportSection[]> {
+    const response = (await this.call("app_generate_outline_draft", input)) as OutlineDraftResponse;
+    if (!Array.isArray(response.outline) || !response.outline.length) throw new Error("Outline generation did not return any sections.");
+    return response.outline;
   }
 
   async saveConfirmedResearchOutline(researchId: string, sections: ReportSection[]): Promise<ResearchJob> {
@@ -247,11 +270,17 @@ export class AnnaResearchApi implements ResearchApi {
     iteration: number;
     source_id: string;
     queries: string[];
+    research_decision?: {
+      type: "call_source";
+      knowledge_gap?: string;
+      rationale?: string;
+      target_facet_ids?: string[];
+    };
   }): Promise<CallSourceResponse> {
     return (await this.call("app_call_section_research_source", input)) as CallSourceResponse;
   }
 
-  async selectSectionContext(input: { research_id: string; section_id: string; query?: string; search_queries?: string[] }): Promise<ContextResponse> {
+  async selectSectionContext(input: { research_id: string; section_id: string; iteration?: number; query?: string; search_queries?: string[] }): Promise<ContextResponse> {
     const response = (await this.call("app_select_section_context", input)) as ContextResponse;
     if (!response.context_transfer?.url) return response;
     const context = await fetchTransfer<ContextResponse>(response.context_transfer);
@@ -263,6 +292,7 @@ export class AnnaResearchApi implements ResearchApi {
     section_id: string;
     section_markdown: string;
     section_summary: string;
+    subsection_headers?: string[];
     source_urls?: string[];
     citation_sources?: CitationSource[];
     status?: string;
@@ -328,7 +358,8 @@ function toolTimeoutMs(method: string, args: Record<string, unknown>): number | 
   if (
     method === "app_embed_attachment_chunks" ||
     method === "app_summarize_attachments" ||
-    method === "app_select_section_context"
+    method === "app_select_section_context" ||
+    method === "app_generate_outline_draft"
   ) {
     return LONG_TOOL_TIMEOUT_MS;
   }
@@ -386,7 +417,7 @@ export function createStandaloneApi(): ResearchApi {
     getResearchJob: fail,
     listResearchJobs: fail,
     saveConfirmedResearchRole: fail,
-    saveConfirmedResearchFocuses: fail,
+    generateOutlineDraft: fail,
     saveConfirmedResearchOutline: fail,
     callSectionResearchSource: fail,
     selectSectionContext: fail,

@@ -1,5 +1,5 @@
 import type { MessageKey } from "../i18n/messages";
-import type { ReportSection, ResearchSourceView } from "../types";
+import type { ReportSection, ResearchSourceView, SourceCurationMode } from "../types";
 import { readySourceNameMap, sectionSourceNames, type PlanSummary } from "../workflow/planSummary";
 import { PlanSummaryStrip } from "./PlanSummaryStrip";
 import { RegenerationControl } from "./RegenerationControl";
@@ -10,6 +10,7 @@ interface Props {
   instruction: string;
   summary: PlanSummary;
   isBusy: boolean;
+  sourceCurationMode: SourceCurationMode;
   t(key: MessageKey, params?: Record<string, string | number | undefined>): string;
   onSectionChange(index: number, patch: Partial<ReportSection>): void;
   onAddSection(): void;
@@ -20,6 +21,7 @@ interface Props {
   onRegenerate(): void;
   onBack(): void;
   onStartGeneration(): void;
+  onSourceCurationModeChange(mode: SourceCurationMode): void;
 }
 
 export function OutlineReviewPage(props: Props) {
@@ -51,6 +53,27 @@ export function OutlineReviewPage(props: Props) {
         />
       </header>
       <PlanSummaryStrip summary={props.summary} t={props.t} compact />
+      <section className="source-curation-option" aria-label={props.t("sourceCurationTitle")}>
+        <div className="source-curation-copy">
+          <strong>{props.t("sourceCurationTitle")}</strong>
+          <small>{props.t("sourceCurationHint")}</small>
+        </div>
+        <label className="source-toggle compact-toggle" data-enabled={props.sourceCurationMode === "llm" ? "true" : "false"}>
+          <input
+            type="checkbox"
+            checked={props.sourceCurationMode === "llm"}
+            disabled={props.isBusy}
+            onChange={(event) => props.onSourceCurationModeChange(event.target.checked ? "llm" : "off")}
+            aria-label={props.t("sourceCurationLabel")}
+          />
+          <span className="source-toggle-track" aria-hidden="true">
+            <span className="source-toggle-thumb" />
+          </span>
+          <span className="source-toggle-text">
+            <strong>{props.t("sourceCurationLabel")}</strong>
+          </span>
+        </label>
+      </section>
       <div className="outline-review-list">
         {props.sections.map((section, index) => (
           <article className="outline-review-card" key={section.id}>

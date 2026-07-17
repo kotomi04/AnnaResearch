@@ -25,6 +25,8 @@ ALLOWED_UPDATE_FIELDS = {
     "active_section_index",
     "attachments",
     "attachment_context",
+    "research_options",
+    "section_source_curations",
 }
 
 SPLIT_JOB_FIELDS = {
@@ -40,6 +42,7 @@ SPLIT_JOB_FIELDS = {
     "report_markdown": "report_markdown.json",
     "attachments": "attachments.json",
     "attachment_context": "attachment_context.json",
+    "outline_discovery": "outline_discovery.json",
 }
 
 SPLIT_DEFAULTS = {
@@ -55,6 +58,7 @@ SPLIT_DEFAULTS = {
     "report_markdown": "",
     "attachments": [],
     "attachment_context": None,
+    "outline_discovery": None,
 }
 
 
@@ -78,7 +82,7 @@ class JobStore:
         now = utc_now()
         research_id = f"research_{uuid.uuid4().hex[:12]}"
         job = {
-            "schema_version": 4,
+            "schema_version": 5,
             "research_id": research_id,
             "query": clean_query,
             "query_domains": normalize_domains(query_domains),
@@ -105,7 +109,6 @@ class JobStore:
             "max_iterations": 5,
             "workflow": "sectioned_research",
             "confirmed_role": None,
-            "confirmed_focuses": [],
             "confirmed_outline": [],
             "active_section_index": None,
             "section_iterations": {},
@@ -115,6 +118,9 @@ class JobStore:
             "assembled_result": None,
             "attachments": [],
             "attachment_context": None,
+            "research_options": {},
+            "section_source_curations": {},
+            "outline_discovery": None,
         }
         self.save(job)
         return job
@@ -139,18 +145,8 @@ class JobStore:
         job["confirmed_role"] = {"server": server, "agent_role_prompt": prompt}
         job["agent_name"] = server
         job["agent_role_prompt"] = prompt
-        job["stage"] = "brainstorm_focus"
-        job["progress"] = max(int(job.get("progress") or 0), 15)
-        return self.save(job)
-
-    def save_confirmed_focuses(self, research_id: str, focuses: list[Any]) -> dict[str, Any]:
-        cleaned = [str(item).strip() for item in focuses if str(item or "").strip()]
-        if not 1 <= len(cleaned) <= 5:
-            raise ValidationError("confirmed_focuses must contain 1 to 5 entries")
-        job = self.load(research_id)
-        job["confirmed_focuses"] = cleaned
         job["stage"] = "plan_outline"
-        job["progress"] = max(int(job.get("progress") or 0), 25)
+        job["progress"] = max(int(job.get("progress") or 0), 15)
         return self.save(job)
 
     def save_confirmed_outline(self, research_id: str, sections: list[dict[str, Any]]) -> dict[str, Any]:
@@ -181,6 +177,7 @@ class JobStore:
         queries: list[str],
         source_calls: list[dict[str, Any]],
         raw_results: list[dict[str, Any]],
+        research_decision: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         job = self.load(research_id)
         section_id = _require_section(job, section_id)["id"]
@@ -195,6 +192,7 @@ class JobStore:
             "source_calls": compact_source_calls,
             "results_count": sum(_source_call_results_count(c) for c in compact_source_calls),
             "raw_results": [_compact_search_result(item) for item in raw_results],
+            "research_decision": _normalize_research_decision(research_decision),
             "appended_at": utc_now(),
         }
         merged = False
@@ -224,6 +222,112 @@ class JobStore:
                     return True
         return False
 
+    def save_outline_query_plan(
+        self,
+        research_id: str,
+        *,
+        anchor_query: str,
+        facets: list[dict[str, Any]],
+        sub_queries: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        job = self.load(research_id)
+        clean_anchor = " ".join(str(anchor_query or "").split())
+        if not clean_anchor:
+            raise ValidationError("anchor_query is required")
+        clean_facets = _normalize_outline_facets(facets)
+        clean_sub_queries = _normalize_outline_sub_queries(sub_queries, clean_facets)
+        current = dict(job.get("outline_discovery") or {})
+        current.update({
+            "version": "outline-discovery-v2",
+            "status": "planned" if clean_sub_queries else "anchor_planned",
+            "query_plan": {
+                "queries": [
+                    {"id": "anchor", "text": clean_anchor, "covers": [item["id"] for item in clean_facets]},
+                    *clean_sub_queries,
+                ],
+                "facets": clean_facets,
+                "updated_at": utc_now(),
+            },
+            "created_at": current.get("created_at") or utc_now(),
+            "updated_at": utc_now(),
+        })
+        current.setdefault("research_calls", [])
+        current.setdefault("selected_contexts", {})
+        job["outline_discovery"] = current
+        return self.save(job)
+
+    def reset_outline_discovery(self, research_id: str) -> dict[str, Any]:
+        job = self.load(research_id)
+        job["outline_discovery"] = None
+        return self.save(job)
+
+    def append_outline_discovery(
+        self,
+        research_id: str,
+        *,
+        phase: str,
+        source_id: str,
+        source_name: str,
+        query_ids: list[str],
+        source_calls: list[dict[str, Any]],
+        raw_results: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        job = self.load(research_id)
+        current = dict(job.get("outline_discovery") or {})
+        entry = {
+            "source_id": source_id,
+            "source_name": source_name,
+            "query_ids": list(query_ids),
+            "source_calls": [_compact_source_call(call) for call in source_calls],
+            "results_count": len(raw_results),
+            "raw_results": [_compact_search_result(item) for item in raw_results],
+            "appended_at": utc_now(),
+        }
+        if phase == "seed":
+            current["seed"] = entry
+        else:
+            calls = list(current.get("research_calls") or [])
+            calls.append(entry)
+            current["research_calls"] = calls
+        current.update({
+            "version": "outline-discovery-v2",
+            "status": "seed_searched" if phase == "seed" else "searched",
+            "created_at": current.get("created_at") or utc_now(),
+            "updated_at": utc_now(),
+        })
+        job["outline_discovery"] = current
+        return self.save(job)
+
+    def has_outline_discovery_called(self, research_id: str, phase: str, source_id: str, query_id: str) -> bool:
+        job = self.load(research_id)
+        discovery = job.get("outline_discovery") or {}
+        entries = [discovery.get("seed") or {}] if phase == "seed" else discovery.get("research_calls") or []
+        return any(
+            str(entry.get("source_id") or "") == source_id and query_id in (entry.get("query_ids") or [])
+            for entry in entries
+        )
+
+    def save_outline_discovery_context(self, research_id: str, phase: str, selected: dict[str, Any]) -> dict[str, Any]:
+        job = self.load(research_id)
+        current = dict(job.get("outline_discovery") or {})
+        selected_sources = selected.get("selected_sources") or []
+        contexts = dict(current.get("selected_contexts") or {})
+        contexts[phase] = {
+            "selected_sources": [_persist_selected_source(source, index=index) for index, source in enumerate(selected_sources, 1)],
+            "selected_sources_count": len(selected_sources),
+            "source_urls": selected.get("source_urls") or [],
+            "selected_at": utc_now(),
+        }
+        current.update({
+            "version": "outline-discovery-v2",
+            "status": "completed" if phase == "research" else "seed_selected",
+            "selected_contexts": contexts,
+            "created_at": current.get("created_at") or utc_now(),
+            "updated_at": utc_now(),
+        })
+        job["outline_discovery"] = current
+        return self.save(job)
+
     def save_section_selected_context(self, research_id: str, section_id: str, selected: dict[str, Any]) -> dict[str, Any]:
         job = self.load(research_id)
         section_id = _require_section(job, section_id)["id"]
@@ -248,11 +352,15 @@ class JobStore:
         summary = str(result.get("section_summary") or "").strip()
         status = str(result.get("status") or ("completed" if markdown else "failed"))
         results = dict(job.get("section_results") or {})
+        existing = results.get(section_id) or {}
         results[section_id] = {
             "section_id": section_id,
             "status": status,
             "section_markdown": markdown,
             "section_summary": summary,
+            "subsection_headers": _normalize_subsection_headers(
+                result.get("subsection_headers") if "subsection_headers" in result else existing.get("subsection_headers")
+            ),
             "source_urls": result.get("source_urls") or [],
             "citation_sources": result.get("citation_sources") or [],
             "error": result.get("error"),
@@ -435,8 +543,9 @@ class JobStore:
         if not research_id:
             raise StoreError("job is missing research_id")
         job.pop("source_previews", None)
+        job.pop("confirmed_focuses", None)
         job["updated_at"] = utc_now()
-        job["schema_version"] = 4
+        job["schema_version"] = 5
         path = self.path_for(research_id)
         job_dir = path.parent
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -511,6 +620,7 @@ def _normalize_section(section: dict[str, Any], idx: int) -> dict[str, Any]:
     outline = str(section.get("outline") or section.get("content") or "").strip()
     sources = section.get("allowed_source_ids") or section.get("allowed_sources") or []
     allowed = [str(source).strip() for source in sources if str(source or "").strip()]
+    facet_ids = list(dict.fromkeys(str(facet_id).strip() for facet_id in (section.get("facet_ids") or []) if str(facet_id).strip()))
     max_iterations = int(section.get("max_iterations") or 5)
     if not section_id:
         raise ValidationError("section id is required")
@@ -524,9 +634,97 @@ def _normalize_section(section: dict[str, Any], idx: int) -> dict[str, Any]:
         "id": section_id,
         "title": title,
         "outline": outline,
+        "facet_ids": facet_ids,
         "allowed_source_ids": sorted(set(allowed)),
         "max_iterations": max_iterations,
     }
+
+
+def _normalize_subsection_headers(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    headers: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        header = str(item or "").strip()
+        key = header.casefold()
+        if not header or key in seen:
+            continue
+        seen.add(key)
+        headers.append(header)
+        if len(headers) >= 5:
+            break
+    return headers
+
+
+def _normalize_research_decision(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    decision_type = str(value.get("type") or "call_source").strip()
+    knowledge_gap = " ".join(str(value.get("knowledge_gap") or "").split())[:1000]
+    rationale = " ".join(str(value.get("rationale") or "").split())[:1000]
+    target_facet_ids = list(dict.fromkeys(
+        str(item).strip() for item in (value.get("target_facet_ids") or []) if str(item).strip()
+    ))[:12]
+    return {
+        "type": decision_type if decision_type in {"call_source", "finish"} else "call_source",
+        "knowledge_gap": knowledge_gap,
+        "rationale": rationale,
+        "target_facet_ids": target_facet_ids,
+    }
+
+
+def _normalize_outline_facets(facets: list[dict[str, Any]]) -> list[dict[str, str]]:
+    if not isinstance(facets, list) or not facets:
+        raise ValidationError("facets must contain at least one entry")
+    normalized: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(facets, 1):
+        if not isinstance(item, dict):
+            raise ValidationError("each facet must be an object")
+        facet_id = str(item.get("id") or f"f{index}").strip()
+        task = " ".join(str(item.get("task") or "").split())
+        if not facet_id or facet_id in seen or not task:
+            raise ValidationError("each facet must have a unique id and non-empty task")
+        seen.add(facet_id)
+        normalized.append({"id": facet_id, "task": task})
+    return normalized
+
+
+def _normalize_outline_sub_queries(
+    sub_queries: list[dict[str, Any]],
+    facets: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    if not isinstance(sub_queries, list):
+        raise ValidationError("sub_queries must be an array")
+    if sub_queries and not 3 <= len(sub_queries) <= 6:
+        raise ValidationError("sub_queries must contain 3 to 6 entries")
+    facet_ids = {item["id"] for item in facets}
+    normalized: list[dict[str, Any]] = []
+    seen_ids: set[str] = {"anchor"}
+    seen_text: set[str] = set()
+    covered: set[str] = set()
+    for index, item in enumerate(sub_queries, 1):
+        if not isinstance(item, dict):
+            raise ValidationError("each sub-query must be an object")
+        query_id = str(item.get("id") or f"sub_{index}").strip()
+        text = " ".join(str(item.get("text") or "").split())
+        covers = list(dict.fromkeys(str(value).strip() for value in (item.get("covers") or []) if str(value).strip()))
+        if not query_id or query_id in seen_ids or not text:
+            raise ValidationError("each sub-query must have a unique id and non-empty text")
+        unknown = [facet_id for facet_id in covers if facet_id not in facet_ids]
+        if not covers or unknown:
+            raise ValidationError("each sub-query must cover known facets", data={"query_id": query_id, "unknown_facets": unknown})
+        normalized_text = normalize_query_for_dedup(text)
+        if normalized_text in seen_text:
+            raise ValidationError("sub-query texts must be distinct")
+        seen_ids.add(query_id)
+        seen_text.add(normalized_text)
+        covered.update(covers)
+        normalized.append({"id": query_id, "text": text, "covers": covers})
+    if normalized and covered != facet_ids:
+        raise ValidationError("sub_queries must cover every facet", data={"missing_facets": sorted(facet_ids - covered)})
+    return normalized
 
 
 def _require_section(job: dict[str, Any], section_id: str) -> dict[str, Any]:
@@ -555,6 +753,7 @@ def _merge_iteration_entry(existing: dict[str, Any], incoming: dict[str, Any]) -
         "source_calls": source_calls,
         "results_count": sum(_source_call_results_count(call) for call in source_calls),
         "raw_results": raw_results,
+        "research_decision": incoming.get("research_decision") or existing.get("research_decision"),
         "appended_at": incoming.get("appended_at") or existing.get("appended_at"),
     }
 

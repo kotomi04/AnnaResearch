@@ -12,10 +12,13 @@ interface Props {
   summary: PlanSummary;
   message: string;
   isError: boolean;
+  canContinue: boolean;
+  isBusy: boolean;
   t(key: MessageKey, params?: Record<string, string | number | undefined>): string;
+  onContinue(): void;
 }
 
-export function ReportGenerationPage({ job, events, previews, sources, summary, message, isError, t }: Props) {
+export function ReportGenerationPage({ job, events, previews, sources, summary, message, isError, canContinue, isBusy, t, onContinue }: Props) {
   const sections = job?.confirmed_outline || [];
   const activeIndex = Number(job?.active_section_index ?? 0);
   const activeSection = sections[activeIndex] || sections[0];
@@ -31,11 +34,38 @@ export function ReportGenerationPage({ job, events, previews, sources, summary, 
           <h2>{t("generationPageTitle")}</h2>
           <p data-error={isError ? "true" : "false"}>{message || t("generationActiveMessage")}</p>
         </div>
-        <div className="generation-count">
-          {t("sectionProgressLabel", { current: Math.min(activeIndex + 1, Math.max(1, sections.length)), total: sections.length || 1 })}
+        <div className="generation-hero-actions">
+          <div className="generation-count">
+            {t("sectionProgressLabel", { current: Math.min(activeIndex + 1, Math.max(1, sections.length)), total: sections.length || 1 })}
+          </div>
+          {canContinue ? (
+            <button type="button" className="primary-action compact" onClick={onContinue} disabled={isBusy}>
+              {t("continueGenerationButton")}
+            </button>
+          ) : null}
         </div>
       </header>
       <PlanSummaryStrip summary={summary} t={t} compact />
+      {sections.length ? (
+        <section className="section-progress-rail" aria-label={t("sectionProgressRail") }>
+          {sections.map((section, index) => {
+            const state = index < activeIndex || previews.some((preview) => preview.id === section.id)
+              ? "done"
+              : index === activeIndex
+                ? "active"
+                : "queued";
+            return (
+              <article key={section.id} data-state={state}>
+                <span className="section-rail-index">{state === "done" ? "✓" : index + 1}</span>
+                <div>
+                  <strong>{section.title}</strong>
+                  <span>{t(state === "done" ? "sectionStateDone" : state === "active" ? "sectionStateActive" : "sectionStateQueued")}</span>
+                </div>
+              </article>
+            );
+          })}
+        </section>
+      ) : null}
       {activeSection ? (
         <section className="active-section-panel">
           <div>

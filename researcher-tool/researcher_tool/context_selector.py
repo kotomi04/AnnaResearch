@@ -46,6 +46,7 @@ class LexicalContextSelector:
         search_queries: list[str],
         search_results: list[dict[str, Any]],
         research_id: str = "",
+        diversify_queries: bool = False,
     ) -> dict[str, Any]:
         query_terms = tokenize(" ".join([query, *search_queries]))
         seen_keys: set[tuple[str, str]] = set()

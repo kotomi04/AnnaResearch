@@ -53,12 +53,16 @@ def test_describe_v2_app_methods_only(tmp_path):
         assert init["result"]["capabilities"] == {"sampling": {}}
         describe = plugin.call("describe")
         assert describe["result"]["name"] == "tool-xhz-researcher-python-e7k8xa3s"
-        assert describe["result"]["version"] == "0.2.4"
+        assert describe["result"]["version"] == "0.2.5"
         assert describe["result"]["host_capabilities"] == ["llm.embed", "llm.sample"]
         tools = [tool["name"] for tool in describe["result"]["tools"]]
         assert "research" not in tools
         assert "app_search_web" not in tools
         assert "app_call_section_research_source" in tools
+        assert "app_generate_outline_draft" in tools
+        assert "app_call_outline_discovery_source" not in tools
+        assert "app_select_outline_discovery_context" not in tools
+        assert "app_save_outline_query_plan" not in tools
         assert "app_list_research_jobs" in tools
         assert "app_list_research_sources" in tools
         assert "app_test_research_source" in tools

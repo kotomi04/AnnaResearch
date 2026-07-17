@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
 import asyncio
 import threading
@@ -21,6 +22,7 @@ from researcher_tool.dispatcher import AppDispatcher
 from researcher_tool.embedding import MAX_PARALLEL_EMBEDDING_BATCHES, AnnaEmbeddingsClient, EmbeddingBatchOutcome, EmbeddingsError
 from researcher_tool.errors import NotFoundError, ValidationError
 from researcher_tool.job_store import JobStore, normalize_query_for_dedup
+from researcher_tool.outline_discovery import generate_outline_draft
 from researcher_tool.settings import SettingsStore, mask_secret
 from researcher_tool.sources import (
     BUILTIN_SOURCE_IDS,
@@ -41,6 +43,8 @@ from researcher_tool.sources.extraction import pdf as pdf_extraction
 from researcher_tool.sources.extraction.html import extract_html
 from researcher_tool.sources.extraction.models import ExtractedPage
 from researcher_tool.sources.extraction.pdf import extract_pdf
+from researcher_tool.sources.extraction.tavily import TAVILY_PREFETCH_MIN_CHARS, enrich_tavily_items
+from researcher_tool.sources.extraction.utils import same_url_without_fragment
 from researcher_tool.sources.native import duckduckgo as duckduckgo_native
 from researcher_tool.sources.native.executor import NativeResearchSourceExecutor
 from researcher_tool.views import compact_job_view
@@ -124,6 +128,37 @@ class FakeSampling:
                 ),
             }
         }
+
+
+class FakeOutlineSampling:
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls = []
+
+    def create_message(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"content": {"type": "text", "text": self.replies.pop(0)}}
+
+
+def outline_sampling_replies():
+    return [
+        json.dumps({"anchor_query": "NVIDIA recent decline outlook 2026", "facets": [{"task": "Explain the decline and assess the outlook"}]}),
+        json.dumps({
+            "queries": [
+                {"text": "NVIDIA decline catalysts 2026", "covers": ["f1"]},
+                {"text": "NVIDIA recent corporate actions 2026", "covers": ["f1"]},
+                {"text": "NVIDIA valuation and outlook 2026", "covers": ["f1"]},
+            ]
+        }),
+        json.dumps({
+            "sections": [
+                {"title": "Decline", "outline": "Explain recent catalysts.", "covers": ["f1"], "max_iterations": 5},
+                {"title": "Actions", "outline": "Review company actions.", "covers": [], "max_iterations": 5},
+                {"title": "Valuation", "outline": "Assess valuation and competition.", "covers": [], "max_iterations": 5},
+                {"title": "Outlook", "outline": "Develop the forward scenario.", "covers": [], "max_iterations": 5},
+            ]
+        }),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -362,13 +397,13 @@ def test_embed_attachment_chunks_batches_and_persists_vectors(tmp_path):
     embed_attachment_chunks(jobs=dispatcher.jobs, embeddings=fake, research_id=job["research_id"])
 
     loaded = dispatcher.jobs.load(job["research_id"])["attachment_context"]
-    assert [len(wave) for wave in fake.batch_calls] == [8, 1]
-    assert [len(call) for call in fake.calls] == [2] * 9
+    assert [len(wave) for wave in fake.batch_calls] == [8, 8, 2]
+    assert [len(call) for call in fake.calls] == [1] * 18
     assert loaded["embedding_status"] == "ready"
     assert all(chunk.get("embedding") for chunk in loaded["chunks"])
 
 
-def test_embedding_client_runs_at_most_eight_batches_and_preserves_order():
+def test_embedding_client_honors_concurrency_limit_and_preserves_order():
     class TrackingEmbeddingsClient(AnnaEmbeddingsClient):
         def __init__(self):
             self.lock = threading.Lock()
@@ -418,9 +453,9 @@ def test_embed_attachment_chunks_checkpoints_successes_and_retries_failures(tmp_
                     "data": [{"embedding": [1.0, float(index + 1)]} for index, _ in enumerate(batch)],
                     "_meta": {"dimensions": 2},
                 })
-                if batch_index == 0
+                if self.rounds > 1 or "chunk 3" not in batch
                 else EmbeddingBatchOutcome(result={"data": [], "_meta": {"dimensions": 2}})
-                for batch_index, batch in enumerate(batches)
+                for batch in batches
             ]
 
     dispatcher = make_dispatcher(tmp_path)
@@ -631,12 +666,98 @@ def test_get_research_job_falls_back_when_transfer_server_is_blocked(tmp_path):
     assert "job_transfer" not in loaded
 
 
+def test_outline_discovery_runs_sampling_and_search_entirely_in_backend(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANNA_RESEARCHER_FAKE_TAVILY", "1")
+    dispatcher = make_dispatcher(tmp_path)
+    job = dispatcher.dispatch("app_create_research_job", {"query": "NVIDIA recent decline, company actions, and outlook"})["job"]
+    research_id = job["research_id"]
+    dispatcher.dispatch(
+        "app_save_confirmed_research_role",
+        {"research_id": research_id, "role": {"server": "Analyst", "agent_role_prompt": "Use current market evidence."}},
+    )
+    dispatcher.jobs.update_metadata(research_id, {"attachment_context": {
+        "summary": "Uploaded earnings memo",
+        "files": [{
+            "id": "file-1",
+            "name": "earnings-memo.pdf",
+            "status": "ready",
+            "analysis": {
+                "summary": "The memo says Blackwell shipment timing remains uncertain.",
+                "key_points": ["Shipment timing needs independent confirmation."],
+                "relevance": "Directly relevant to recent company actions.",
+                "relevance_score": 0.9,
+                "payload": {"private_detail": "must not enter search planning"},
+            },
+        }],
+    }})
+    sampling = FakeOutlineSampling(outline_sampling_replies())
+
+    result = generate_outline_draft(
+        dispatcher=dispatcher,
+        sampling=sampling,
+        research_id=research_id,
+        source_ids=["tavily"],
+        invoke_id="invoke-outline",
+    )
+
+    assert len(result["outline"]) == 4
+    assert "selected_context" not in result
+    assert "context_transfer" not in result
+    assert len(sampling.calls) == 3
+    assert "Blackwell shipment timing remains uncertain" in sampling.calls[0]["messages"][0]["content"]["text"]
+    assert "prioritize missing context, independent corroboration" in sampling.calls[1]["messages"][0]["content"]["text"]
+    assert "private_detail" not in json.dumps(sampling.calls)
+    assert "Seed search context" in sampling.calls[1]["messages"][0]["content"]["text"]
+    assert "Selected web discovery context" in sampling.calls[2]["messages"][0]["content"]["text"]
+    assert all(call["metadata"]["executa_invoke_id"] == "invoke-outline" for call in sampling.calls)
+    discovery = dispatcher.jobs.load(research_id)["outline_discovery"]
+    assert discovery["status"] == "completed"
+    assert discovery["seed"]["raw_results"]
+    assert discovery["research_calls"][0]["raw_results"]
+    assert discovery["selected_contexts"]["research"]["selected_sources"]
+
+
+def test_outline_regeneration_reuses_persisted_discovery_without_http_context(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANNA_RESEARCHER_FAKE_TAVILY", "1")
+    dispatcher = make_dispatcher(tmp_path)
+    job = dispatcher.dispatch("app_create_research_job", {"query": "NVIDIA recent decline and outlook"})["job"]
+    research_id = job["research_id"]
+    dispatcher.dispatch(
+        "app_save_confirmed_research_role",
+        {"research_id": research_id, "role": {"server": "Analyst", "agent_role_prompt": "Use current market evidence."}},
+    )
+    generate_outline_draft(
+        dispatcher=dispatcher,
+        sampling=FakeOutlineSampling(outline_sampling_replies()),
+        research_id=research_id,
+        source_ids=["tavily"],
+    )
+    before = dispatcher.jobs.load(research_id)["outline_discovery"]
+    outline_reply = outline_sampling_replies()[-1]
+    sampling = FakeOutlineSampling([outline_reply])
+
+    result = generate_outline_draft(
+        dispatcher=dispatcher,
+        sampling=sampling,
+        research_id=research_id,
+        source_ids=["tavily"],
+        instruction="Emphasize scenario boundaries.",
+        reuse_discovery=True,
+    )
+
+    assert len(result["outline"]) == 4
+    assert len(sampling.calls) == 1
+    assert "Regeneration requirement: Emphasize scenario boundaries." in sampling.calls[0]["messages"][0]["content"]["text"]
+    after = dispatcher.jobs.load(research_id)["outline_discovery"]
+    assert len(after["research_calls"]) == len(before["research_calls"])
+
+
 def test_compact_job_view_exposes_v3_fields(tmp_path):
     dispatcher = make_dispatcher(tmp_path)
     job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
     immediate = dispatcher.dispatch("app_get_research_job", {"research_id": job["research_id"]})["job"]
     loaded = get_json(immediate["job_transfer"]["url"])["job"] if immediate.get("job_transfer") else immediate
-    assert loaded["schema_version"] == 4
+    assert loaded["schema_version"] == 5
     assert loaded["iterations"] == []
     assert loaded["research_log"] == []
     assert loaded["iteration"] == 0
@@ -655,6 +776,7 @@ def test_compact_job_view_omits_full_section_citation_sources(tmp_path):
             "status": "completed",
             "section_markdown": "## Section\n\nEvidence [1][2]",
             "section_summary": "Summary",
+            "subsection_headers": ["Evidence basis", "Risk analysis"],
             "source_urls": ["https://example.test/a"],
             "citation_sources": [
                 {"kind": "url", "url": "https://example.test/a", "title": "A", "content": "x" * 1000},
@@ -670,6 +792,7 @@ def test_compact_job_view_omits_full_section_citation_sources(tmp_path):
     assert "source_urls" not in section
     assert "citation_sources" not in section
     assert section["section_markdown_chars"] == len("## Section\n\nEvidence [1][2]")
+    assert section["subsection_headers"] == ["Evidence basis", "Risk analysis"]
     assert section["source_count"] == 1
     assert section["citation_source_count"] == 2
     assert section["attachment_citation_count"] == 1
@@ -1127,6 +1250,110 @@ def test_browser_fallback_uses_cleaned_html_when_markdown_is_empty():
     assert title == "Cleaned"
     assert icon == "https://example.com/icon.png"
     assert markdown == "<main>Cleaned page body</main>"
+
+
+def test_tavily_uses_long_summary_and_crawls_only_short_content():
+    crawl_calls = []
+
+    def browser_extractor(urls, **kwargs):
+        crawl_calls.append((urls, kwargs))
+        return [
+            ExtractedPage(
+                url=url,
+                title="Crawled title",
+                icon="https://short.example/favicon.ico",
+                raw_content="# Crawled full page\n\n" + ("Useful body with research evidence. " * 5),
+                content_type="html",
+            )
+            for url in urls
+        ]
+
+    long_summary = "L" * (TAVILY_PREFETCH_MIN_CHARS + 1)
+    exact_threshold = "S" * TAVILY_PREFETCH_MIN_CHARS
+    enriched = enrich_tavily_items(
+        [
+            {"url": "https://long.example/a", "title": "Long", "content": long_summary},
+            {"url": "https://short.example/b", "title": "Short", "content": exact_threshold},
+        ],
+        browser_extractor=browser_extractor,
+    )
+
+    assert enriched[0]["raw_content"] == long_summary
+    assert enriched[0]["content_type"] == "tavily_summary"
+    assert enriched[0]["extraction_status"] == "success"
+    assert enriched[1]["raw_content"].startswith("# Crawled full page")
+    assert enriched[1]["content_type"] == "html"
+    assert enriched[1]["title"] == "Short"
+    assert enriched[1]["icon"] == "https://short.example/favicon.ico"
+    assert crawl_calls == [(["https://short.example/b"], {"timeout": 15.0})]
+
+
+def test_tavily_falls_back_to_short_summary_when_browser_extraction_fails():
+    url = "https://short.example/fallback"
+    cache = {
+        same_url_without_fragment(url): ExtractedPage(
+            url=url,
+            content_type="html",
+            status="failed",
+            error="old failure",
+        )
+    }
+    crawl_calls = []
+
+    def browser_extractor(urls, **kwargs):
+        crawl_calls.append((urls, kwargs))
+        return [ExtractedPage(url=item, content_type="html", status="failed", error="timeout") for item in urls]
+
+    enriched = enrich_tavily_items(
+        [{"url": url, "title": "Short result", "content": "A useful but short Tavily summary."}],
+        page_cache=cache,
+        browser_extractor=browser_extractor,
+    )
+
+    assert crawl_calls == [([url], {"timeout": 15.0})]
+    assert enriched[0]["extraction_status"] == "success"
+    assert enriched[0]["content_type"] == "tavily_summary_fallback"
+    assert enriched[0]["raw_content"] == "A useful but short Tavily summary."
+    assert enriched[0]["extraction_fallback_reason"] == "timeout"
+    assert cache[same_url_without_fragment(url)].content_type == "tavily_summary_fallback"
+
+
+def test_tavily_does_not_cache_failed_browser_result_without_summary():
+    url = "https://empty.example/article"
+    cache = {}
+
+    enriched = enrich_tavily_items(
+        [{"url": url, "title": "Empty", "content": ""}],
+        page_cache=cache,
+        browser_extractor=lambda urls, **kwargs: [
+            ExtractedPage(url=item, content_type="html", status="failed", error="timeout") for item in urls
+        ],
+    )
+
+    assert enriched[0]["extraction_status"] == "failed"
+    assert enriched[0]["extraction_error"] == "timeout"
+    assert same_url_without_fragment(url) not in cache
+
+
+def test_tavily_reuses_existing_web_document_before_summary_threshold():
+    url = "https://cached.example/article#section"
+    cache = {
+        same_url_without_fragment(url): ExtractedPage(
+            url="https://cached.example/article",
+            title="Cached",
+            raw_content="Previously crawled full page",
+            content_type="html",
+        )
+    }
+
+    enriched = enrich_tavily_items(
+        [{"url": url, "title": "Tavily title", "content": "short"}],
+        page_cache=cache,
+        browser_extractor=lambda *_args, **_kwargs: pytest.fail("cached URL should not be crawled"),
+    )
+
+    assert enriched[0]["raw_content"] == "Previously crawled full page"
+    assert enriched[0]["content_type"] == "html"
 
 
 def test_fetch_url_marks_low_value_fallback_result_as_failed(monkeypatch):
@@ -1739,6 +1966,12 @@ def test_call_section_research_source_uses_native_duckduckgo(tmp_path):
             "iteration": 1,
             "source_id": "duckduckgo",
             "queries": ["anna background"],
+            "research_decision": {
+                "type": "call_source",
+                "knowledge_gap": "Missing background evidence",
+                "rationale": "Needed for the section",
+                "target_facet_ids": ["f1"],
+            },
         },
     )
 
@@ -1751,6 +1984,12 @@ def test_call_section_research_source_uses_native_duckduckgo(tmp_path):
     assert "items" not in stored_call
     assert stored_call["results_count"] == 1
     assert stored_call["top_titles"] == ["Section result"]
+    assert loaded["section_iterations"]["section-1"][0]["research_decision"] == {
+        "type": "call_source",
+        "knowledge_gap": "Missing background evidence",
+        "rationale": "Needed for the section",
+        "target_facet_ids": ["f1"],
+    }
     item = loaded["section_iterations"]["section-1"][0]["raw_results"][0]
     assert item["source_name"] == "DuckDuckGo"
     assert item["url"] == "https://duck.example/section"
@@ -2065,16 +2304,153 @@ def test_hybrid_selector_chunks_rrf_groups_and_does_not_persist_vectors(tmp_path
         ],
     )
 
-    assert sum(len(source["selected_chunks"]) for source in selected["selected_sources"]) <= 12
-    assert all(len(source["selected_chunks"]) <= 4 for source in selected["selected_sources"])
+    assert sum(len(source["selected_chunks"]) for source in selected["selected_sources"]) <= 16
     assert "[Chunk" in selected["selected_context"]
     assert any(source["source_id"] == "tavily" for source in selected["selected_sources"])
     assert all("rrf_score" in chunk for source in selected["selected_sources"] for chunk in source["selected_chunks"])
+    assert all("matched_queries" in chunk for source in selected["selected_sources"] for chunk in source["selected_chunks"])
     assert max(embeddings.batch_counts) <= 8
     assert 8 in embeddings.batch_counts
     assert len(embeddings.batch_counts) >= 3
     persisted = "".join(path.read_text(encoding="utf-8") for path in (jobs.job_dir_for(job["research_id"]) / "web_documents").glob("*.json"))
     assert "embedding" not in persisted
+
+
+class OrthogonalKeywordEmbeddings:
+    def create_batches(self, *, batches, model="anna-managed-v1", timeout=30.0):
+        return [
+            {
+                "data": [
+                    {
+                        "embedding": [
+                            1.0 if "alpha" in str(text).casefold() else 0.0,
+                            1.0 if "beta" in str(text).casefold() else 0.0,
+                        ]
+                    }
+                    for text in batch
+                ],
+                "_meta": {"dimensions": 2},
+            }
+            for batch in batches
+        ]
+
+
+def test_hybrid_selector_keeps_top_eight_independently_for_each_query(tmp_path):
+    jobs = JobStore(root=tmp_path / ".research")
+    job = jobs.create(query="alpha beta")
+    selector = HybridContextSelector(embeddings=OrthogonalKeywordEmbeddings(), documents=WebDocumentStore(jobs))
+    results = [
+        {
+            "url": f"https://alpha.example/{index}",
+            "title": f"Alpha {index}",
+            "source_id": "tavily",
+            "source_name": "Tavily",
+            "content": f"alpha evidence item {index}",
+        }
+        for index in range(10)
+    ] + [
+        {
+            "url": f"https://beta.example/{index}",
+            "title": f"Beta {index}",
+            "source_id": "tavily",
+            "source_name": "Tavily",
+            "content": f"beta evidence item {index}",
+        }
+        for index in range(10)
+    ] + [{
+        "url": "https://neutral.example/item",
+        "title": "Neutral",
+        "source_id": "tavily",
+        "source_name": "Tavily",
+        "content": "unrelated neutral material",
+    }]
+
+    selected = selector.select(
+        research_id=job["research_id"],
+        query="alpha beta",
+        search_queries=["alpha", "beta"],
+        search_results=results,
+    )
+
+    chunks = [chunk for source in selected["selected_sources"] for chunk in source["selected_chunks"]]
+    assert len(chunks) == 16
+    assert sum(any(match["query"] == "alpha" for match in chunk["matched_queries"]) for chunk in chunks) == 8
+    assert sum(any(match["query"] == "beta" for match in chunk["matched_queries"]) for chunk in chunks) == 8
+    assert max(chunk["rrf_score"] for chunk in chunks) == pytest.approx(2 / 61, abs=1e-8)
+
+
+def test_hybrid_selector_applies_embedding_similarity_threshold(tmp_path):
+    class ThresholdEmbeddings:
+        def create_batches(self, *, batches, model="anna-managed-v1", timeout=30.0):
+            vectors = []
+            for batch in batches:
+                data = []
+                for text in batch:
+                    value = str(text).casefold()
+                    vector = [1.0, 0.0] if value.strip() == "target" else [0.3, math.sqrt(0.91)]
+                    data.append({"embedding": vector})
+                vectors.append({"data": data, "_meta": {"dimensions": 2}})
+            return vectors
+
+    jobs = JobStore(root=tmp_path / ".research")
+    job = jobs.create(query="target")
+    selector = HybridContextSelector(embeddings=ThresholdEmbeddings(), documents=WebDocumentStore(jobs))
+    selected = selector.select(
+        research_id=job["research_id"],
+        query="target",
+        search_queries=["target"],
+        search_results=[{
+            "url": "https://example.com/unrelated",
+            "title": "Unrelated",
+            "source_id": "tavily",
+            "source_name": "Tavily",
+            "content": "orthogonal material without the search term",
+        }],
+    )
+
+    assert selected["selected_sources"] == []
+
+
+def test_hybrid_selector_seed_diversity_prefers_new_source_per_facet(tmp_path):
+    jobs = JobStore(root=tmp_path / ".research")
+    job = jobs.create(query="alpha beta gamma")
+    selector = HybridContextSelector(embeddings=KeywordEmbeddings(), documents=WebDocumentStore(jobs))
+
+    selected = selector.select(
+        research_id=job["research_id"],
+        query="alpha beta gamma",
+        search_queries=["alpha", "beta", "gamma"],
+        search_results=[
+            {
+                "url": "https://example.com/general",
+                "title": "General",
+                "source_id": "tavily",
+                "source_name": "Tavily",
+                "content": "alpha beta gamma " * 20,
+            },
+            {
+                "url": "https://example.com/beta",
+                "title": "Beta",
+                "source_id": "tavily",
+                "source_name": "Tavily",
+                "content": "beta evidence " * 20,
+            },
+            {
+                "url": "https://example.com/gamma",
+                "title": "Gamma",
+                "source_id": "tavily",
+                "source_name": "Tavily",
+                "content": "gamma evidence " * 20,
+            },
+        ],
+        diversify_queries=True,
+    )
+
+    assert selected["source_urls"][:3] == [
+        "https://example.com/general",
+        "https://example.com/beta",
+        "https://example.com/gamma",
+    ]
 
 
 def test_web_document_store_deduplicates_fragment_urls(tmp_path):

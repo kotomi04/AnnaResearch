@@ -4,11 +4,14 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import threading
+import time
 from typing import Any
 import uuid
 
 
 MAX_PARALLEL_EMBEDDING_BATCHES = 8
+FETCH_FAILED_MAX_RETRIES = 2
+FETCH_FAILED_RETRY_DELAY_SECONDS = 0.2
 
 
 class EmbeddingsError(Exception):
@@ -45,6 +48,16 @@ class AnnaEmbeddingsClient:
         if not inputs:
             raise EmbeddingsError(-32504, "texts must be non-empty")
 
+        for attempt in range(FETCH_FAILED_MAX_RETRIES + 1):
+            try:
+                return self._create_once(inputs=inputs, model=model, timeout=timeout)
+            except EmbeddingsError as exc:
+                if not _is_fetch_failed(exc) or attempt >= FETCH_FAILED_MAX_RETRIES:
+                    raise
+                time.sleep(FETCH_FAILED_RETRY_DELAY_SECONDS * (attempt + 1))
+        raise AssertionError("unreachable embedding retry state")
+
+    def _create_once(self, *, inputs: list[str], model: str, timeout: float) -> dict[str, Any]:
         req_id = uuid.uuid4().hex
         condition = threading.Condition()
         pending = _PendingEmbedding(condition=condition)
@@ -126,3 +139,7 @@ class AnnaEmbeddingsClient:
                 pending.response = msg.get("result") or {}
             pending.condition.notify()
         return True
+
+
+def _is_fetch_failed(error: EmbeddingsError) -> bool:
+    return "fetch failed" in str(error.message or "").casefold()

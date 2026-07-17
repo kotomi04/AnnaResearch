@@ -18,7 +18,6 @@ RESULT_PATH_RE = re.compile(r"^/research-results/([^/]+)$")
 ASSEMBLED_RESULT_PATH_RE = re.compile(r"^/assembled-research-results/([^/]+)$")
 JOB_PATH_RE = re.compile(r"^/jobs/([^/]+)$")
 REPORT_FRAMING_PATH_RE = re.compile(r"^/report-framings/([^/]+)$")
-CONTEXT_PATH_RE = re.compile(r"^/contexts/([^/]+)$")
 SECTION_CONTEXT_PATH_RE = re.compile(r"^/section-contexts/([^/]+)/([^/]+)$")
 SECTION_RESULT_PATH_RE = re.compile(r"^/section-results/([^/]+)/([^/]+)$")
 SOURCE_TEST_PATH_RE = re.compile(r"^/source-tests/([^/]+)$")
@@ -31,9 +30,6 @@ class LocalResultTransferServer:
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._source_tests: dict[str, dict[str, Any]] = {}
-
-    def descriptor(self, research_id: str) -> dict[str, str]:
-        return self.result_descriptor(research_id)
 
     def result_descriptor(self, research_id: str, *, method: str = "POST") -> dict[str, str]:
         server = self._ensure_started()
@@ -68,15 +64,6 @@ class LocalResultTransferServer:
         return {
             "method": "GET",
             "url": f"http://{host}:{port}/jobs/{research_id}",
-            "content_type": "application/json",
-        }
-
-    def context_descriptor(self, research_id: str) -> dict[str, str]:
-        server = self._ensure_started()
-        host, port = server.server_address[:2]
-        return {
-            "method": "GET",
-            "url": f"http://{host}:{port}/contexts/{research_id}",
             "content_type": "application/json",
         }
 
@@ -145,9 +132,7 @@ class LocalResultTransferServer:
                     return
                 try:
                     body = self._read_json_body()
-                    if route["kind"] == "result":
-                        result = save_http_result(jobs, route["research_id"], body)
-                    elif route["kind"] == "assembled_result":
+                    if route["kind"] == "assembled_result":
                         result = save_http_assembled_result(jobs, route["research_id"], body)
                     elif route["kind"] == "report_framing":
                         result = save_http_report_framing(jobs, route["research_id"], body)
@@ -177,8 +162,6 @@ class LocalResultTransferServer:
                         result = get_http_result(jobs, route["research_id"])
                     elif route["kind"] == "job":
                         result = get_http_job(jobs, route["research_id"])
-                    elif route["kind"] == "context":
-                        result = get_http_context(jobs, route["research_id"])
                     elif route["kind"] == "section_context":
                         result = get_http_section_context(jobs, route["research_id"], route["section_id"])
                     elif route["kind"] == "section_result":
@@ -221,7 +204,6 @@ class LocalResultTransferServer:
                     ("result", RESULT_PATH_RE),
                     ("job", JOB_PATH_RE),
                     ("report_framing", REPORT_FRAMING_PATH_RE),
-                    ("context", CONTEXT_PATH_RE),
                 ):
                     match = pattern.match(path)
                     if match:
@@ -279,24 +261,6 @@ class LocalResultTransferServer:
         return ResultTransferHandler
 
 
-def save_http_result(jobs: JobStore, research_id: str, body: dict[str, Any]) -> dict[str, Any]:
-    existing = jobs.load(research_id)
-    report = str(body.get("report_markdown") or "")
-    if not report.strip():
-        raise ValidationError("report_markdown is required for a completed result")
-    result = {
-        "report_markdown": report,
-        "source_urls": body.get("source_urls") or existing.get("source_urls") or [],
-        "citation_sources": body.get("citation_sources") or existing.get("citation_sources") or [],
-        "status": "completed",
-        "stage": "completed",
-        "progress": 100,
-        "error": None,
-    }
-    job = jobs.save_result(research_id, result)
-    return {"job": compact_job_view(job), "result": compact_result_view(job)}
-
-
 def save_http_assembled_result(jobs: JobStore, research_id: str, body: dict[str, Any]) -> dict[str, Any]:
     existing = jobs.load(research_id)
     report = str(body.get("report_markdown") or "")
@@ -324,6 +288,7 @@ def save_http_report_framing(jobs: JobStore, research_id: str, body: dict[str, A
 
 
 def save_http_section_result(jobs: JobStore, research_id: str, section_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    existing = ((jobs.load(research_id).get("section_results") or {}).get(section_id) or {})
     status = str(body.get("status") or "completed")
     markdown = str(body.get("section_markdown") or "")
     if status == "completed" and not markdown.strip():
@@ -332,6 +297,7 @@ def save_http_section_result(jobs: JobStore, research_id: str, section_id: str, 
         "status": status,
         "section_markdown": markdown,
         "section_summary": body.get("section_summary"),
+        "subsection_headers": body.get("subsection_headers") if "subsection_headers" in body else existing.get("subsection_headers"),
         "source_urls": body.get("source_urls") or [],
         "citation_sources": body.get("citation_sources") or [],
         "error": body.get("error"),
@@ -350,15 +316,6 @@ def get_http_result(jobs: JobStore, research_id: str) -> dict[str, Any]:
 
 def get_http_job(jobs: JobStore, research_id: str) -> dict[str, Any]:
     return {"job": compact_job_view(jobs.load(research_id))}
-
-
-def get_http_context(jobs: JobStore, research_id: str) -> dict[str, Any]:
-    job = jobs.load(research_id)
-    return {
-        "selected_context": job.get("selected_context") or "",
-        "selected_sources": job.get("selected_sources") or [],
-        "source_urls": job.get("source_urls") or [],
-    }
 
 
 def get_http_section_context(jobs: JobStore, research_id: str, section_id: str) -> dict[str, Any]:

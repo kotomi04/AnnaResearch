@@ -566,7 +566,7 @@ function reportMarkdownComponents({
   onHideCitation(): void;
 }): Parameters<typeof ReactMarkdown>[0]["components"] {
   const text = selectedText.trim();
-  const wrap = (tag: "p" | "li" | "h1" | "h2" | "h3" | "h4" | "blockquote", children: ReactNode) => {
+  const wrap = (tag: "p" | "li" | "h1" | "h2" | "h3" | "h4" | "blockquote" | "th" | "td", children: ReactNode) => {
     const blockText = textContentOf(children);
     const highlighted = text ? highlightReactText(children, text) : children;
     const content = renderCitationButtons(highlighted, blockText, citationSources, onShowCitation, onHideCitation);
@@ -581,6 +581,8 @@ function reportMarkdownComponents({
     h3: ({ children }) => wrap("h3", children),
     h4: ({ children }) => wrap("h4", children),
     blockquote: ({ children }) => wrap("blockquote", children),
+    th: ({ children }) => wrap("th", children),
+    td: ({ children }) => wrap("td", children),
     table: ({ children }) => (
       <div className="report-table-scroll" role="region" aria-label="Markdown table" tabIndex={0}>
         <table>{children}</table>
