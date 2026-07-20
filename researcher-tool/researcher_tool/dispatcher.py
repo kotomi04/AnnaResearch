@@ -3,15 +3,16 @@ from __future__ import annotations
 import io
 import json
 import os
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 from .attachments import prepare_attachments
-from .context_selector import LexicalContextSelector
+from .aps_transfer import ApsJsonTransferStore, research_transfer_prefix, source_test_transfer_prefix
+from .context_selector import LexicalContextSelector, build_selected_context
 from .errors import ConfigurationError, ValidationError
 from .hybrid_context_selector import HybridContextSelector
 from .job_store import JobStore, normalize_query_for_dedup
-from .result_transfer import LocalResultTransferServer
 from .settings import SettingsStore, default_research_root
 from .sources import (
     CredentialStore,
@@ -23,7 +24,7 @@ from .sources import (
 )
 from .sources.native.executor import NativeResearchSourceExecutor
 from .sources.extraction.tavily import enrich_tavily_items
-from .views import compact_job_view, source_view, status_view
+from .views import compact_job_view, result_view, section_result_view, source_view, status_view
 from .web_documents import WebDocumentStore
 
 class _FakeResponse:
@@ -78,7 +79,7 @@ class AppDispatcher:
         settings: SettingsStore | None = None,
         jobs: JobStore | None = None,
         selector: LexicalContextSelector | None = None,
-        transfer_server: LocalResultTransferServer | None = None,
+        transfers: ApsJsonTransferStore | None = None,
         registry: ResearchSourceRegistry | None = None,
         credentials: CredentialStore | None = None,
         executor: ResearchSourceExecutor | None = None,
@@ -90,7 +91,7 @@ class AppDispatcher:
         self.settings = settings or SettingsStore()
         self.jobs = jobs or JobStore()
         self.selector = selector
-        self.transfer_server = transfer_server or LocalResultTransferServer(self.jobs)
+        self.transfers = transfers
         root = self.settings.root if hasattr(self.settings, "root") else default_research_root()
         self.credentials = credentials or CredentialStore(root)
         self.registry = registry or ResearchSourceRegistry(root, credentials=self.credentials)
@@ -135,16 +136,20 @@ class AppDispatcher:
         if method == "app_get_research_job":
             research_id = str(args.get("research_id") or "").strip()
             job = self.jobs.load(research_id) if research_id else next(iter(self.jobs.list_jobs(limit=1)), None)
-            if not job:
-                return {"job": None}
-            view = compact_job_view(job)
-            try:
-                view["job_transfer"] = self.transfer_server.job_descriptor(str(job.get("research_id")))
-                if job.get("report_markdown"):
-                    view["result_transfer"] = self.transfer_server.result_descriptor(str(job.get("research_id")), method="GET")
-            except OSError:
-                pass
-            return {"job": view}
+            return {"job": compact_job_view(job) if job else None}
+        if method == "app_get_research_job_payload":
+            research_id = required_string(args, "research_id")
+            job = self.jobs.load(research_id)
+            payload: dict[str, Any] = {"job": compact_job_view(job, include_section_markdown=True)}
+            if job.get("report_markdown"):
+                payload["result"] = result_view(job, include_sources=True)
+            return {
+                "transfer": self._require_transfers().upload(
+                    prefix=research_transfer_prefix(research_id),
+                    kind="job-payload",
+                    payload=payload,
+                )
+            }
         if method == "app_list_research_jobs":
             limit = int(args.get("limit") or 50)
             return {"jobs": [status_view(job) for job in self.jobs.list_jobs(limit=limit)]}
@@ -166,14 +171,12 @@ class AppDispatcher:
             return self._select_section_context(args)
         if method == "app_save_section_result":
             return self._save_section_result(args)
+        if method == "app_get_section_result":
+            return self._get_section_result(args)
         if method == "app_save_report_framing":
-            research_id = required_string(args, "research_id")
-            self.jobs.load(research_id)
-            return {"transfer": self.transfer_server.report_framing_descriptor(research_id)}
+            return self._save_report_framing(args)
         if method == "app_save_assembled_research_result":
-            research_id = required_string(args, "research_id")
-            self.jobs.load(research_id)
-            return {"transfer": self.transfer_server.assembled_result_descriptor(research_id)}
+            return self._save_assembled_result(args)
         raise ValidationError(f"unknown app method: {method}")
 
     def _token_for(self, source_id: str) -> str:
@@ -282,7 +285,13 @@ class AppDispatcher:
             "extracted": result.extracted,
             "error": result.error,
         }
-        return {"test_transfer": self.transfer_server.source_test_descriptor(test)}
+        test_id = uuid.uuid4().hex
+        transfer = self._require_transfers().upload(
+            prefix=source_test_transfer_prefix(test_id),
+            kind="source-test",
+            payload={"test": test},
+        )
+        return {"test_transfer": transfer}
 
     def _call_section_source(self, args: dict[str, Any]) -> dict[str, Any]:
         research_id = required_string(args, "research_id")
@@ -567,16 +576,105 @@ class AppDispatcher:
             research_id=research_id,
         )
         job = self.jobs.save_section_selected_context(research_id, section_id, selected)
+        stored_context = (job.get("section_selected_context") or {}).get(section_id) or {}
+        selected_sources = stored_context.get("selected_sources") or []
+        context_payload = {
+            "selected_context": build_selected_context(selected_sources),
+            "selected_sources": selected_sources,
+            "source_urls": stored_context.get("source_urls") or [],
+            "selected_at": stored_context.get("selected_at"),
+        }
         return {
             "job": status_view(job),
-            "context_transfer": self.transfer_server.section_context_descriptor(research_id, section_id),
+            "context_transfer": self._require_transfers().upload(
+                prefix=research_transfer_prefix(research_id),
+                kind=f"section-context-{section_id}",
+                payload=context_payload,
+            ),
         }
 
     def _save_section_result(self, args: dict[str, Any]) -> dict[str, Any]:
         research_id = required_string(args, "research_id")
         section_id = required_string(args, "section_id")
-        _find_section(self.jobs.load(research_id), section_id)
-        return {"transfer": self.transfer_server.section_result_descriptor(research_id, section_id)}
+        existing_job = self.jobs.load(research_id)
+        _find_section(existing_job, section_id)
+        descriptor = args.get("payload_transfer")
+        body = self._require_transfers().download_json(descriptor, expected_prefix=research_transfer_prefix(research_id))
+        if str(body.get("research_id") or "") != research_id or str(body.get("section_id") or "") != section_id:
+            raise ValidationError("section result payload identifiers do not match the control request")
+        existing = ((existing_job.get("section_results") or {}).get(section_id) or {})
+        status = str(body.get("status") or "completed")
+        markdown = str(body.get("section_markdown") or "")
+        if status == "completed" and not markdown.strip():
+            raise ValidationError("section_markdown is required for a completed section result")
+        result = {
+            "status": status,
+            "section_markdown": markdown,
+            "section_summary": body.get("section_summary"),
+            "subsection_headers": body.get("subsection_headers") if "subsection_headers" in body else existing.get("subsection_headers"),
+            "source_urls": body.get("source_urls") or [],
+            "citation_sources": body.get("citation_sources") or [],
+            "error": body.get("error"),
+        }
+        job = self.jobs.save_section_result(research_id, section_id, result)
+        self._require_transfers().delete_best_effort(descriptor)
+        section = (job.get("section_results") or {}).get(section_id) or {}
+        return {"job": compact_job_view(job), "section_result": section_result_view(section, include_markdown=True)}
+
+    def _get_section_result(self, args: dict[str, Any]) -> dict[str, Any]:
+        research_id = required_string(args, "research_id")
+        section_id = required_string(args, "section_id")
+        job = self.jobs.load(research_id)
+        section = (job.get("section_results") or {}).get(section_id)
+        if not isinstance(section, dict):
+            raise ValidationError(f"section result not found: {section_id}")
+        transfer = self._require_transfers().upload(
+            prefix=research_transfer_prefix(research_id),
+            kind=f"section-result-{section_id}",
+            payload={"section_result": section_result_view(section, include_markdown=True)},
+        )
+        return {"transfer": transfer}
+
+    def _save_report_framing(self, args: dict[str, Any]) -> dict[str, Any]:
+        research_id = required_string(args, "research_id")
+        descriptor = args.get("payload_transfer")
+        body = self._require_transfers().download_json(descriptor, expected_prefix=research_transfer_prefix(research_id))
+        if str(body.get("research_id") or "") != research_id:
+            raise ValidationError("report framing payload research_id does not match the control request")
+        framing = body.get("framing")
+        if not isinstance(framing, dict):
+            raise ValidationError("framing must be an object")
+        job = self.jobs.save_report_framing(research_id, framing)
+        self._require_transfers().delete_best_effort(descriptor)
+        return {"job": compact_job_view(job)}
+
+    def _save_assembled_result(self, args: dict[str, Any]) -> dict[str, Any]:
+        research_id = required_string(args, "research_id")
+        existing = self.jobs.load(research_id)
+        descriptor = args.get("payload_transfer")
+        body = self._require_transfers().download_json(descriptor, expected_prefix=research_transfer_prefix(research_id))
+        if str(body.get("research_id") or "") != research_id:
+            raise ValidationError("assembled result payload research_id does not match the control request")
+        report = str(body.get("report_markdown") or "")
+        if not report.strip():
+            raise ValidationError("report_markdown is required for a completed assembled result")
+        result = {
+            "report_markdown": report,
+            "source_urls": body.get("source_urls") or existing.get("source_urls") or [],
+            "citation_sources": body.get("citation_sources") or existing.get("citation_sources") or [],
+            "status": "completed",
+            "stage": "completed",
+            "progress": 100,
+            "error": None,
+        }
+        job = self.jobs.save_assembled_result(research_id, result)
+        self._require_transfers().delete_best_effort(descriptor)
+        return {"job": compact_job_view(job), "result": result_view(job, include_sources=True)}
+
+    def _require_transfers(self) -> ApsJsonTransferStore:
+        if self.transfers is None:
+            raise ValidationError("APS Files transfer capability is unavailable")
+        return self.transfers
 
     def _source_exists(self, source_id: str) -> bool:
         try:

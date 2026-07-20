@@ -10,6 +10,7 @@ from typing import Any
 
 from researcher_tool.attachment_embeddings import embed_attachment_chunks
 from researcher_tool.attachment_summary import select_attachment_context, summarize_attachment_context
+from researcher_tool.aps_transfer import AnnaApsFilesClient, ApsFilesError, ApsJsonTransferStore
 from researcher_tool.dispatcher import AppDispatcher
 from researcher_tool.embedding import AnnaEmbeddingsClient, EmbeddingsError
 from researcher_tool.errors import ResearcherToolError, ValidationError
@@ -18,7 +19,7 @@ from researcher_tool.sampling import AnnaSamplingClient, SamplingError
 from researcher_tool.sources.native.executor import NativeResearchSourceExecutor
 
 TOOL_ID = "tool-xhz-researcher-python-e7k8xa3s"
-VERSION = "0.2.6"
+VERSION = "0.3.0"
 APP_METHODS = [
     "app_get_settings",
     "app_create_research_job",
@@ -31,6 +32,7 @@ APP_METHODS = [
     "app_generate_outline_draft",
     "app_save_confirmed_research_outline",
     "app_get_research_job",
+    "app_get_research_job_payload",
     "app_list_research_jobs",
     "app_list_research_sources",
     "app_update_research_source_credential",
@@ -41,6 +43,7 @@ APP_METHODS = [
     "app_call_section_research_source",
     "app_select_section_context",
     "app_save_section_result",
+    "app_get_section_result",
     "app_save_report_framing",
     "app_save_assembled_research_result",
 ]
@@ -51,7 +54,7 @@ MANIFEST: dict[str, Any] = {
     "version": VERSION,
     "description": "Standalone backend tool for the Anna Researcher app.",
     "author": "Anna Research",
-    "host_capabilities": ["llm.embed", "llm.sample"],
+    "host_capabilities": ["llm.embed", "llm.sample", "storage.app"],
     "tools": [
         {
             "name": method,
@@ -66,6 +69,7 @@ MANIFEST: dict[str, Any] = {
 _stdout_lock = threading.Lock()
 embeddings: AnnaEmbeddingsClient
 sampling: AnnaSamplingClient
+aps_files: AnnaApsFilesClient
 
 
 def write_frame(msg: dict[str, Any]) -> None:
@@ -77,9 +81,14 @@ def write_frame(msg: dict[str, Any]) -> None:
 
 embeddings = AnnaEmbeddingsClient(write_frame=write_frame)
 sampling = AnnaSamplingClient(write_frame=write_frame)
+aps_files = AnnaApsFilesClient(write_frame=write_frame)
 
 
-dispatcher = AppDispatcher(native_executor=NativeResearchSourceExecutor(), embeddings=embeddings)
+dispatcher = AppDispatcher(
+    native_executor=NativeResearchSourceExecutor(),
+    embeddings=embeddings,
+    transfers=ApsJsonTransferStore(aps_files),
+)
 
 
 def make_response(req_id: Any, *, result: Any = None, error: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -99,7 +108,7 @@ def handle_initialize(req_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         result={
             "protocolVersion": negotiated,
             "serverInfo": {"name": TOOL_ID, "version": VERSION},
-            "client_capabilities": {"embeddings": {}},
+            "client_capabilities": {"embeddings": {}, "storage": {}},
             "capabilities": {"sampling": {}},
         },
     )
@@ -159,6 +168,8 @@ def handle_invoke(req_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         return make_response(req_id, result={"success": False, "tool": tool, "error": exc.message, "data": {"code": "embedding_error", "embedding_code": exc.code, **exc.data}})
     except SamplingError as exc:
         return make_response(req_id, result={"success": False, "tool": tool, "error": exc.message, "data": {"code": "sampling_error", "sampling_code": exc.code, **exc.data}})
+    except ApsFilesError as exc:
+        return make_response(req_id, result={"success": False, "tool": tool, "error": exc.message, "data": {"code": "aps_files_error", "storage_code": exc.code, **exc.data}})
     except ResearcherToolError as exc:
         return make_response(req_id, result={"success": False, "tool": tool, "error": exc.message, "data": {"code": exc.code, **exc.data}})
     except Exception as exc:  # noqa: BLE001
@@ -171,7 +182,7 @@ def handle_message(line: str) -> None:
     except json.JSONDecodeError as exc:
         write_frame(make_response(None, error={"code": -32700, "message": f"parse error: {exc}"}))
         return
-    if "method" not in msg and (embeddings.dispatch_response(msg) or sampling.dispatch_response(msg)):
+    if "method" not in msg and (embeddings.dispatch_response(msg) or sampling.dispatch_response(msg) or aps_files.dispatch_response(msg)):
         return
 
     method = msg.get("method")
@@ -203,7 +214,7 @@ def main() -> None:
             except json.JSONDecodeError:
                 pool.submit(handle_message, line)
                 continue
-            if "method" not in msg and (embeddings.dispatch_response(msg) or sampling.dispatch_response(msg)):
+            if "method" not in msg and (embeddings.dispatch_response(msg) or sampling.dispatch_response(msg) or aps_files.dispatch_response(msg)):
                 continue
             pool.submit(handle_message, line)
 

@@ -49,17 +49,19 @@ def test_describe_v2_app_methods_only(tmp_path):
     try:
         init = plugin.call("initialize", {"protocolVersion": "2.0"})
         assert init["result"]["protocolVersion"] == "2.0"
-        assert init["result"]["client_capabilities"] == {"embeddings": {}}
+        assert init["result"]["client_capabilities"] == {"embeddings": {}, "storage": {}}
         assert init["result"]["capabilities"] == {"sampling": {}}
         describe = plugin.call("describe")
         assert describe["result"]["name"] == "tool-xhz-researcher-python-e7k8xa3s"
-        assert describe["result"]["version"] == "0.2.6"
-        assert describe["result"]["host_capabilities"] == ["llm.embed", "llm.sample"]
+        assert describe["result"]["version"] == "0.3.0"
+        assert describe["result"]["host_capabilities"] == ["llm.embed", "llm.sample", "storage.app"]
         tools = [tool["name"] for tool in describe["result"]["tools"]]
         assert "research" not in tools
         assert "app_search_web" not in tools
         assert "app_call_section_research_source" in tools
         assert "app_generate_outline_draft" in tools
+        assert "app_get_section_result" in tools
+        assert "app_get_research_job_payload" in tools
         assert "app_call_outline_discovery_source" not in tools
         assert "app_select_outline_discovery_context" not in tools
         assert "app_save_outline_query_plan" not in tools

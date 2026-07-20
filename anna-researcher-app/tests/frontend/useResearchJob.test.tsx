@@ -1,6 +1,6 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { MAX_RESEARCH_ITERATIONS, buildAttachmentSearchBaseline, convertSectionUrlCitations, curateSelectedSources, normalizeSectionCitations, remapSelectedContextCitationLabels, stripInternalChunkMarkers, useResearchJob } from "../../src/hooks/useResearchJob";
+import { MAX_RESEARCH_ITERATIONS, buildAttachmentSearchBaseline, convertSectionUrlCitations, curateSelectedSources, normalizeSectionCitations, remapSelectedContextCitationLabels, sanitizeEvidenceContextUrls, stripInternalChunkMarkers, useResearchJob } from "../../src/hooks/useResearchJob";
 import type { ResearchApi } from "../../src/api/researchApi";
 import type { ConfirmedResearchRole, ReportFraming, ReportSection, ResearchSourceView, SourceCallResult } from "../../src/types";
 
@@ -34,6 +34,13 @@ describe("normalizeSectionCitations", () => {
     )).toThrow("outside its allowed source identifier list: https://unknown.example/report");
   });
 
+  it("accepts an allowed URL when the writer adds a stray closing bracket to the link destination", () => {
+    expect(convertSectionUrlCitations(
+      "Claim ([source](https://example.com/12])).",
+      references,
+    )).toBe("Claim [12].");
+  });
+
   it("replaces only local source header numbers with global citation numbers", () => {
     const context = "[来源: Tavily] [1] First\nURL: https://example.com/12\nContent: Keep body marker [2].\n\n[来源: Tavily] [2] Second";
     expect(remapSelectedContextCitationLabels(context, references)).toBe(
@@ -65,6 +72,28 @@ describe("stripInternalChunkMarkers", () => {
       "",
       "Second selected passage with citation [12].",
     ].join("\n"));
+  });
+});
+
+describe("sanitizeEvidenceContextUrls", () => {
+  it("keeps the canonical source URL line but removes URLs embedded in evidence content", () => {
+    const context = [
+      "[来源: Tavily] [1] NVIDIA results",
+      "URL: https://nvidianews.nvidia.com/results",
+      "Content: [](https://www.nvidia.com/en-us) Share [Facebook](http://facebook.com/share) and https://tracking.example/pixel.",
+    ].join("\n");
+    expect(sanitizeEvidenceContextUrls(context)).toBe([
+      "[来源: Tavily] NVIDIA results",
+      "URL: https://nvidianews.nvidia.com/results",
+      "Content:  Share Facebook and [embedded URL omitted]",
+    ].join("\n"));
+  });
+
+  it("removes canonical URLs as well for intermediate session learnings", () => {
+    expect(sanitizeEvidenceContextUrls(
+      "URL: https://candidate.example/report\nContent: Evidence without another link.",
+      false,
+    )).toBe("URL: [embedded URL omitted]\nContent: Evidence without another link.");
   });
 });
 
@@ -239,6 +268,12 @@ function makeApi(options: ApiOptions = {}) {
         return (options.historyJobs || []).find((job) => job.research_id === researchId) ?? options.latestJob ?? null;
       }
       return options.latestJob ?? null;
+    },
+    async getResearchJobPayload(researchId) {
+      calls.push(["getResearchJobPayload", researchId]);
+      const selected = (options.historyJobs || []).find((job) => job.research_id === researchId) ?? options.latestJob;
+      if (!selected) throw new Error("Research job was not found.");
+      return selected;
     },
     async listResearchJobs(input) {
       calls.push(["listResearchJobs", input]);
@@ -614,7 +649,7 @@ describe("useResearchJob (iterative loop)", () => {
     expect(result.current.phase).toBe("completed");
     expect(result.current.job?.research_id).toBe("done-2");
     expect(result.current.result?.report_markdown).toBe("# History");
-    expect(calls).toContainEqual(["getResearchJob", "done-2"]);
+    expect(calls).toContainEqual(["getResearchJobPayload", "done-2"]);
   });
 
   it("confirms a role and generates a task-covered outline directly", async () => {
@@ -698,9 +733,10 @@ describe("useResearchJob (iterative loop)", () => {
     expect(calls.some((call) => Array.isArray(call) && call[0] === "saveSectionResult")).toBe(true);
     expect(calls.some((call) => Array.isArray(call) && call[0] === "saveReportFraming")).toBe(true);
     expect(calls.some((call) => Array.isArray(call) && call[0] === "saveAssembledResearchResult")).toBe(true);
-    expect(agentSessions).toHaveLength(4);
+    expect(agentSessions).toHaveLength(8);
     expect(agentSessions.every((session) => session.deleted)).toBe(true);
-    expect(agentSessions[0].prompts).toHaveLength(6);
+    expect(agentSessions[0].prompts).toHaveLength(4);
+    expect(agentSessions[1].prompts).toHaveLength(2);
     expect(agentSessions[0].prompts[0]).toContain("Do not call tools");
     expect(agentSessions[0].prompts[0]).toMatch(/Current date: \d{4}-\d{2}-\d{2}/);
     expect(agentSessions[0].prompts[0]).toContain('Interpret "recent" and "latest" relative to this date');
@@ -711,34 +747,36 @@ describe("useResearchJob (iterative loop)", () => {
     expect(agentSessions[0].prompts[0]).not.toContain("Complete report outline");
     expect(agentSessions[0].prompts[1]).toContain("Process the selected contents from the latest SERP searches");
     expect(agentSessions[0].prompts[1]).toContain("<query>\nanna query\n</query>");
+    expect(agentSessions[0].prompts[1]).not.toContain("https://example.com/section-1");
     expect(agentSessions[0].prompts[2]).toContain("Learnings from previous research:\n- The selected evidence contains a concrete section finding.");
     expect(agentSessions[0].prompts[2]).toContain("Already executed queries (do not repeat):\n- anna query");
-    expect(agentSessions[0].prompts[4]).toContain("Plan the subsection structure");
-    expect(agentSessions[0].prompts[4]).toContain("Selected web evidence:\nFULL CONTEXT section-1");
-    expect(agentSessions[0].prompts[4]).toContain("Complete report outline");
-    expect(agentSessions[0].prompts[5]).toContain("Required subsection headers:\n1. Evidence analysis");
-    expect(agentSessions[0].prompts[5]).toContain("Allowed source identifiers for this section");
-    expect(agentSessions[0].prompts[5]).toContain("([in-text citation](SOURCE_URL))");
-    expect(agentSessions[0].prompts[5]).not.toContain("[1] https://example.com/section-1");
-    expect(agentSessions[0].prompts[5]).toContain("Web context:\nFULL CONTEXT section-1");
-    expect(agentSessions[0].prompts[5]).toContain("Complete report outline");
-    expect(agentSessions[0].prompts[4]).toContain("(none yet; this is the first report section)");
-    expect(agentSessions[1].prompts[0]).not.toContain("Existing report content written before this section");
-    expect(agentSessions[1].prompts[2]).toContain("Completed section summaries (continuity only, not evidence)");
-    expect(agentSessions[1].prompts[2]).toContain("Section One: section summary");
-    expect(agentSessions[1].prompts[2]).not.toContain("Uses FULL CONTEXT");
-    expect(agentSessions[1].prompts[2]).toContain("[PREVIOUS] Section One");
-    expect(agentSessions[1].prompts[2]).toContain("[CURRENT] Section Two");
-    expect(agentSessions[1].prompts[2]).toContain("[UPCOMING] Section Three");
-    expect(agentSessions[1].prompts[2]).toContain("Subsection headers already used by previous sections");
-    expect(agentSessions[1].prompts[2]).toContain("Section One: Evidence analysis");
-    expect(agentSessions[1].prompts[3]).toContain("Main research task:\nanna");
-    expect(agentSessions[1].prompts[3]).toContain("Current subtopic:\nTitle: Section Two\nTask and boundary: Cover two.");
-    expect(agentSessions[1].prompts[3]).toContain("Complete report outline");
-    expect(agentSessions[1].prompts[3]).toContain("Section One: section summary");
-    expect(agentSessions[1].prompts[3]).toContain("Relevant prior written passages selected for overlap control:\n(none selected");
-    expect(agentSessions[1].prompts[3]).not.toContain("Uses FULL CONTEXT [1]");
-    expect(agentSessions[1].prompts[3]).toContain("Allowed source identifiers for this section");
+    expect(agentSessions[1].prompts[0]).toContain("Plan the subsection structure");
+    expect(agentSessions[1].prompts[0]).toContain("Selected web evidence:\nFULL CONTEXT section-1");
+    expect(agentSessions[1].prompts[0]).not.toContain("https://example.com/section-1");
+    expect(agentSessions[1].prompts[0]).toContain("Complete report outline");
+    expect(agentSessions[1].prompts[1]).toContain("Required subsection headers:\n1. Evidence analysis");
+    expect(agentSessions[1].prompts[1]).toContain("Allowed source identifiers for this section");
+    expect(agentSessions[1].prompts[1]).toContain("https://example.com/section-1");
+    expect(agentSessions[1].prompts[1]).toContain("([in-text citation](SOURCE_URL))");
+    expect(agentSessions[1].prompts[1]).not.toContain("[1] https://example.com/section-1");
+    expect(agentSessions[1].prompts[1]).toContain("Web context:\nFULL CONTEXT section-1");
+    expect(agentSessions[1].prompts[1]).toContain("Complete report outline");
+    expect(agentSessions[1].prompts[0]).toContain("(none yet; this is the first report section)");
+    expect(agentSessions[3].prompts[0]).toContain("Completed section summaries (continuity only, not evidence)");
+    expect(agentSessions[3].prompts[0]).toContain("Section One: section summary");
+    expect(agentSessions[3].prompts[0]).not.toContain("Uses FULL CONTEXT");
+    expect(agentSessions[3].prompts[0]).toContain("[PREVIOUS] Section One");
+    expect(agentSessions[3].prompts[0]).toContain("[CURRENT] Section Two");
+    expect(agentSessions[3].prompts[0]).toContain("[UPCOMING] Section Three");
+    expect(agentSessions[3].prompts[0]).toContain("Subsection headers already used by previous sections");
+    expect(agentSessions[3].prompts[0]).toContain("Section One: Evidence analysis");
+    expect(agentSessions[3].prompts[1]).toContain("Main research task:\nanna");
+    expect(agentSessions[3].prompts[1]).toContain("Current subtopic:\nTitle: Section Two\nTask and boundary: Cover two.");
+    expect(agentSessions[3].prompts[1]).toContain("Complete report outline");
+    expect(agentSessions[3].prompts[1]).toContain("Section One: section summary");
+    expect(agentSessions[3].prompts[1]).toContain("Relevant prior written passages selected for overlap control:\n(none selected");
+    expect(agentSessions[3].prompts[1]).not.toContain("Uses FULL CONTEXT [1]");
+    expect(agentSessions[3].prompts[1]).toContain("Allowed source identifiers for this section");
     const sectionSave = calls.find((call) => Array.isArray(call) && call[0] === "saveSectionResult") as unknown[];
     expect(sectionSave[1]).toMatchObject({ subsection_headers: ["Evidence analysis"] });
     expect(llmCalls).toHaveLength(3);
@@ -873,8 +911,8 @@ describe("useResearchJob (iterative loop)", () => {
     expect(agentSessions[0].prompts[0]).not.toContain("FULL SELECTED ATTACHMENT EVIDENCE");
     expect(agentSessions[0].prompts[2]).toContain("provided at depth 1 in this session");
     expect(agentSessions[0].prompts[2]).not.toContain("The memo already describes the baseline market reaction.");
-    expect(agentSessions[0].prompts[4]).toContain("Selected attachment evidence:\nFULL SELECTED ATTACHMENT EVIDENCE");
-    expect(agentSessions[0].prompts[5]).toContain("Attachment chunk context:\nFULL SELECTED ATTACHMENT EVIDENCE");
+    expect(agentSessions[1].prompts[0]).toContain("Selected attachment evidence:\nFULL SELECTED ATTACHMENT EVIDENCE");
+    expect(agentSessions[1].prompts[1]).toContain("Attachment chunk context:\nFULL SELECTED ATTACHMENT EVIDENCE");
     const sectionOneAttachmentCalls = calls.filter((call) =>
       Array.isArray(call) &&
       call[0] === "selectAttachmentContext" &&
@@ -1008,10 +1046,11 @@ describe("useResearchJob (iterative loop)", () => {
 
     expect(result.current.phase).toBe("failed");
     expect(String(result.current.error)).toContain("did not return valid subsection headers");
-    expect(agentSessions).toHaveLength(1);
-    expect(agentSessions[0].prompts).toHaveLength(6);
-    expect(agentSessions[0].prompts[4]).toContain("Plan the subsection structure");
-    expect(agentSessions[0].prompts[5]).toContain("previous subsection header response was invalid");
+    expect(agentSessions).toHaveLength(2);
+    expect(agentSessions[0].prompts).toHaveLength(4);
+    expect(agentSessions[1].prompts).toHaveLength(2);
+    expect(agentSessions[1].prompts[0]).toContain("Plan the subsection structure");
+    expect(agentSessions[1].prompts[1]).toContain("previous subsection header response was invalid");
     expect(calls.some((call) => Array.isArray(call) && call[0] === "saveSectionResult")).toBe(false);
   });
 
@@ -1055,18 +1094,18 @@ describe("useResearchJob (iterative loop)", () => {
     });
 
     expect(result.current.phase).toBe("completed");
-    expect(agentSessions).toHaveLength(1);
-    expect(agentSessions[0].deleted).toBe(true);
+    expect(agentSessions).toHaveLength(2);
+    expect(agentSessions.every((session) => session.deleted)).toBe(true);
     expect(agentSessions[0].prompts[0]).not.toContain("## Done");
-    expect(agentSessions[0].prompts[2]).toContain("Done: Saved summary");
-    expect(agentSessions[0].prompts[2]).not.toContain("## Done");
-    expect(agentSessions[0].prompts[2]).toContain("[PREVIOUS] Done");
-    expect(agentSessions[0].prompts[2]).toContain("[CURRENT] Pending");
-    expect(agentSessions[0].prompts[3]).not.toContain("## Done");
-    expect(agentSessions[0].prompts[3]).toContain("Done: Saved summary");
-    expect(agentSessions[0].prompts[3]).toContain("The pending evidence baseline was already established");
-    expect(agentSessions[0].prompts[3]).not.toContain("completed section [1]");
-    expect(agentSessions[0].prompts[3]).toContain("Allowed source identifiers for this section");
+    expect(agentSessions[1].prompts[0]).toContain("Done: Saved summary");
+    expect(agentSessions[1].prompts[0]).not.toContain("## Done");
+    expect(agentSessions[1].prompts[0]).toContain("[PREVIOUS] Done");
+    expect(agentSessions[1].prompts[0]).toContain("[CURRENT] Pending");
+    expect(agentSessions[1].prompts[1]).not.toContain("## Done");
+    expect(agentSessions[1].prompts[1]).toContain("Done: Saved summary");
+    expect(agentSessions[1].prompts[1]).toContain("The pending evidence baseline was already established");
+    expect(agentSessions[1].prompts[1]).not.toContain("completed section [1]");
+    expect(agentSessions[1].prompts[1]).toContain("Allowed source identifiers for this section");
   });
 
   it("uses a Chinese conclusion heading for Chinese reports", async () => {

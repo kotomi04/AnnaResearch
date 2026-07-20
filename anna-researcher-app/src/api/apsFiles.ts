@@ -1,4 +1,4 @@
-import type { AnnaAgentApi, AnnaFilesApi, AttachmentImageAnalysis, AttachmentPrepareInput, ResearchAttachment } from "../types";
+import type { AnnaAgentApi, AnnaFilesApi, ApsTransferDescriptor, AttachmentImageAnalysis, AttachmentPrepareInput, ResearchAttachment } from "../types";
 import { collectAgentText } from "./agentSession";
 
 export interface UploadedResearchFile {
@@ -8,6 +8,79 @@ export interface UploadedResearchFile {
   size_bytes: number;
   etag: string;
   uploaded_at: string;
+}
+
+const MAX_TRANSFER_BYTES = 32 * 1024 * 1024;
+
+export async function uploadJsonTransfer(input: {
+  filesApi: AnnaFilesApi | null | undefined;
+  prefix: string;
+  kind: string;
+  payload: unknown;
+}): Promise<ApsTransferDescriptor> {
+  if (!input.filesApi) throw new Error("Anna files API is unavailable for APS transfer.");
+  const bytes = new TextEncoder().encode(JSON.stringify(input.payload));
+  if (bytes.byteLength > MAX_TRANSFER_BYTES) throw new Error("APS transfer payload exceeds 32 MiB.");
+  const path = `${input.prefix.replace(/\/+$/, "")}/transfers/${sanitizeFilename(input.kind)}-${transferNonce()}.json`;
+  const init = await input.filesApi.upload_init({ path, content_type: "application/json", size: bytes.byteLength });
+  const response = await fetch(init.put_url, { method: "PUT", headers: init.headers || {}, body: bytes });
+  if (!response.ok) throw new Error(`APS transfer upload failed with HTTP ${response.status}.`);
+  const etag = (response.headers.get("ETag") || "").replace(/"/g, "") || init.upload_id || "";
+  const finalized = await input.filesApi.upload_finalize({ path, etag, size_bytes: bytes.byteLength });
+  return {
+    path: finalized.path || path,
+    content_type: "application/json",
+    size_bytes: finalized.size_bytes ?? bytes.byteLength,
+    etag: finalized.etag || etag,
+    sha256: await sha256Hex(bytes),
+    delete_after_read: true,
+  };
+}
+
+export async function downloadJsonTransfer<T>(input: {
+  filesApi: AnnaFilesApi | null | undefined;
+  transfer: ApsTransferDescriptor;
+}): Promise<T> {
+  if (!input.filesApi) throw new Error("Anna files API is unavailable for APS transfer.");
+  validateApsTransferDescriptor(input.transfer);
+  const link = await input.filesApi.download_url({ path: input.transfer.path });
+  const url = String(link.get_url || link.url || "");
+  if (!url) throw new Error("Anna files download_url did not return a URL for APS transfer.");
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`APS transfer download failed with HTTP ${response.status}.`);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.byteLength !== input.transfer.size_bytes) throw new Error("APS transfer size mismatch.");
+  if (await sha256Hex(bytes) !== input.transfer.sha256.toLowerCase()) throw new Error("APS transfer sha256 mismatch.");
+  let data: unknown;
+  try {
+    data = JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    throw new Error("APS transfer did not contain valid JSON.");
+  }
+  await deleteTransferBestEffort(input.filesApi, input.transfer);
+  return data as T;
+}
+
+export async function deleteTransferBestEffort(filesApi: AnnaFilesApi | null | undefined, transfer: ApsTransferDescriptor): Promise<void> {
+  if (!filesApi?.delete || !transfer.delete_after_read || !transfer.path.includes("/transfers/")) return;
+  await filesApi.delete({ path: transfer.path }).catch(() => undefined);
+}
+
+function validateApsTransferDescriptor(transfer: ApsTransferDescriptor): void {
+  if (!transfer?.path || !transfer.path.includes("/transfers/") || !transfer.path.endsWith(".json")) throw new Error("APS transfer path is invalid.");
+  if (transfer.content_type !== "application/json") throw new Error("APS transfer content type is invalid.");
+  if (transfer.delete_after_read !== true) throw new Error("APS transfer delete_after_read flag is invalid.");
+  if (!Number.isInteger(transfer.size_bytes) || transfer.size_bytes < 0 || transfer.size_bytes > MAX_TRANSFER_BYTES) throw new Error("APS transfer size is invalid.");
+  if (!/^[0-9a-f]{64}$/i.test(transfer.sha256 || "")) throw new Error("APS transfer sha256 is invalid.");
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", Uint8Array.from(bytes).buffer);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function transferNonce(): string {
+  return typeof crypto.randomUUID === "function" ? crypto.randomUUID().replace(/-/g, "") : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 export async function uploadResearchFilesToAps(input: {

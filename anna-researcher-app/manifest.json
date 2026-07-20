@@ -7,7 +7,7 @@
   "required_executas": [
     {
       "tool_id": "bundled:researcher",
-      "min_version": "0.2.6",
+      "min_version": "0.3.0",
       "version": "latest"
     }
   ],
@@ -54,9 +54,7 @@
     "csp_overrides": {
       "connect-src": [
         "'self'",
-        "https:",
-        "http://127.0.0.1:*",
-        "http://localhost:*"
+        "https:"
       ],
       "img-src": ["'self'", "data:", "blob:", "https:"],
       "font-src": ["'self'", "data:"],

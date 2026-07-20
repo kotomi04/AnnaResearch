@@ -87,7 +87,7 @@ Research Source 是统一的检索抽象。Tavily 是第一个 Built-in Research
 
 所有 Research Source 都输出同一种规范化结果，后续进入同一个 Lexical Context Selector。用户配置的 source 有意保持小边界：GET 或 POST JSON API、一个 token placeholder、有上限的 pagination、JSON response、固定 result mapping。OAuth、HMAC 签名、脚本、multipart body 和 streaming response 都不在当前范围内。
 
-### 本地存储和结果传输
+### 本地存储和 APS 结果传输
 
 Researcher Tool Backend 默认把本地状态写到：
 
@@ -97,7 +97,7 @@ Researcher Tool Backend 默认把本地状态写到：
 
 这里包含 settings、source definitions、source credentials、job records 和 latest-job metadata。测试或本地隔离时可以设置 `ANNA_RESEARCHER_WORKSPACE` 改变根目录。
 
-较大的 payload，例如 selected context、section markdown、report framing 和完整报告，通过一个临时的 loopback HTTP transfer server 传输。这个服务只绑定 `127.0.0.1`。App Tool Methods 仍然是控制面，只返回 transfer descriptor；本地 HTTP 服务不是公开 API。
+较大的 payload，例如 selected context、section markdown、report framing 和完整报告，通过 Anna APS Files 的 App 私有 scope 传输。App Tool Methods 仍然是控制面，只返回带逻辑 path、大小和摘要的 transfer descriptor；短期 presigned URL 不写入 job。成功消费的 transfer 对象会被删除，Researcher Tool 的本地 job store 仍是业务数据源。
 
 ## 环境要求
 
@@ -213,7 +213,7 @@ ANNA_RESEARCHER_WORKSPACE=/tmp/anna-researcher-workspace
 
 - `CONTEXT.md`：领域词汇和推荐/避免使用的术语。
 - `docs/adr/0001-frontend-owned-researcher-tool-backend.md`：frontend-owned orchestration 边界。
-- `docs/adr/0002-temporary-local-result-transfer-server.md`：loopback transfer server 的原因和限制。
+- `docs/adr/0010-aps-files-large-payload-transfer.md`：当前 APS Files 大载荷传输边界（supersede ADR-0002）。
 - `docs/adr/0003-unified-research-source-abstraction.md`：Research Source 模型。
 - `docs/adr/0004-constrained-configurable-research-source-envelope.md`：用户配置 API 的能力边界。
 - `docs/adr/0006-guided-sectioned-research-workflow.md`：当前 guided sectioned workflow。

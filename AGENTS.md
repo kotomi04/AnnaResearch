@@ -121,7 +121,7 @@ researcher-tool/
     ├── attachment_embeddings.py   # Anna-managed embedding checkpointing
     ├── context_selector.py        # Lexical Context Selector
     ├── hybrid_context_selector.py # Hybrid Context Selector
-    ├── result_transfer.py         # 大结果本地 transfer 边界
+    ├── aps_transfer.py            # APS Files 大 JSON transfer 边界
     ├── settings.py                # 本地 Researcher Tool Settings
     ├── sources/                   # Built-in / User-Configured Research Sources
     └── errors.py                  # 稳定错误类型
@@ -247,7 +247,7 @@ anna-app dev
 - Lexical / Hybrid Context Selector 的排序、去重、source diversity 和预算。
 - 前端 role/outline/section workflow、Agent frame normalization、失败恢复和报告组装。
 - manifest / bundle contract：Host API grants、tool id/method、静态资源和 legacy contract absence。
-- 大结果 transfer 的 compact inline fallback 和完整 payload 路径。
+- APS 大结果 transfer 的上传、下载、完整性校验、成功删除、失败保留和无 loopback fallback 路径。
 
 测试验证外部行为，不要锁死私有实现细节。默认测试不得依赖真实 Anna runtime、真实 LLM、真实 Tavily 或公网。
 
@@ -257,7 +257,7 @@ anna-app dev
 - credential 只能通过 Anna 注入的安全 context、Researcher Tool Settings 或专用 credential store 流转。
 - 完整 credential 不得返回前端；只返回配置状态和 mask。
 - Sampling/Agent metadata 只携带必要的非敏感关联信息。在线 reference 当前可能不会持久化 sampling metadata，因此不能把它当成唯一审计机制。
-- Local Result Transfer Server 只能绑定 loopback，使用不可预测的临时授权信息，并限制 method、path、payload 大小和生命周期。
+- APS transfer 只使用 App 私有 scope 和 `transfers/` 路径；校验大小与 SHA-256，成功消费后删除，且绝不清理 `uploads/` 附件。
 - User-Configured Research Source 的 URL、模板、字段路径和响应体必须按受限 envelope 校验，防止 credential 泄漏、SSRF 和无界抓取。
 
 ## 进一步阅读

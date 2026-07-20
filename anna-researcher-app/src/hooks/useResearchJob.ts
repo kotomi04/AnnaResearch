@@ -132,7 +132,8 @@ export function useResearchJob(api: ResearchApi) {
         if (cancelled) return;
         setSettings(nextSettings);
         setSources(nextSources);
-        const latest = await api.getResearchJob();
+        let latest = await api.getResearchJob();
+        if (latest?.status === "completed" && latest.research_id) latest = await api.getResearchJobPayload(latest.research_id);
         const history = await api.listResearchJobs({ limit: 50 }).catch(() => []);
         if (cancelled) return;
         setError(null);
@@ -173,7 +174,7 @@ export function useResearchJob(api: ResearchApi) {
 
   const openResearchJob = useCallback(
     async (researchId: string) => {
-      const selected = await api.getResearchJob(researchId);
+      const selected = await api.getResearchJobPayload(researchId);
       setError(null);
       setJob(selected);
       setResult(selected?.result || null);
@@ -792,7 +793,7 @@ export function useResearchJob(api: ResearchApi) {
     async (researchId?: string) => {
       setError(null);
       try {
-        const baseJob = researchId ? await api.getResearchJob(researchId) : job;
+        const baseJob = researchId ? await api.getResearchJobPayload(researchId) : job;
         if (!baseJob) throw new Error("Research job was not found.");
         const hydratedJob = await hydrateCompletedSectionResults(api, baseJob);
         const sections = hydratedJob.confirmed_outline?.length ? hydratedJob.confirmed_outline : outlineDraft;
@@ -1664,10 +1665,16 @@ async function runSection(input: {
   if (!allowedSources.length) throw new Error(`Section has no configured allowed source: ${input.section.title}`);
   const continuityContext = buildReportContinuityContext(input.reportOutline, input.priorSectionResults, input.section);
   const session = await input.api.createAgentSession();
-  try {
-    return await runSectionInSession({ ...input, allowedSources, continuityContext, session });
-  } finally {
+  let researchSessionDeleted = false;
+  const closeResearchSession = async () => {
+    if (researchSessionDeleted) return;
+    researchSessionDeleted = true;
     await session.delete().catch(() => undefined);
+  };
+  try {
+    return await runSectionInSession({ ...input, allowedSources, continuityContext, session, closeResearchSession });
+  } finally {
+    await closeResearchSession();
   }
 }
 
@@ -1685,6 +1692,7 @@ async function runSectionInSession(
     allowedSources: ResearchSourceView[];
     continuityContext: string;
     session: AnnaAgentSession;
+    closeResearchSession: () => Promise<void>;
   },
 ): Promise<{ markdown: string; summary: string; subsectionHeaders: string[]; sourceUrls: string[]; citationSources: CitationSource[] }> {
   const { api, job, section, role, citationRegistry, onEvent, allowedSources, continuityContext, session } = input;
@@ -1695,7 +1703,8 @@ async function runSectionInSession(
   let selected: Awaited<ReturnType<ResearchApi["selectSectionContext"]>> | null = null;
   const executedQueries: string[] = [];
   const attachmentSelection = await selectAttachmentContextForSection(api, job, section);
-  const attachmentBaseline = buildAttachmentSearchBaseline(job, attachmentSelection);
+  const attachmentContext = sanitizeEvidenceContextUrls(attachmentSelection.context);
+  const attachmentBaseline = sanitizeEvidenceContextUrls(buildAttachmentSearchBaseline(job, attachmentSelection));
   for (let iteration = 1; iteration <= section.max_iterations; iteration++) {
     await updateJob(api, job, { stage: "section_research", iteration, progress: progressForIteration(iteration, section.max_iterations) });
     onEvent?.({
@@ -1759,7 +1768,7 @@ async function runSectionInSession(
       agentSession: session,
       section,
       queryPlan: plan.queries.filter((item) => queries.includes(item.query)),
-      selectedContext: stripInternalChunkMarkers(selected.selected_context || ""),
+      selectedContext: sanitizeEvidenceContextUrls(stripInternalChunkMarkers(selected.selected_context || ""), false),
       numLearnings: 3,
       numFollowUpQuestions: nextBreadth,
     });
@@ -1780,9 +1789,9 @@ async function runSectionInSession(
     ? await curateSelectedSources(api, job, section, selected.selected_sources || [])
     : null;
   const selectedSources = curation?.sources || selected.selected_sources || [];
-  const selectedContext = stripInternalChunkMarkers(
+  const selectedContext = sanitizeEvidenceContextUrls(stripInternalChunkMarkers(
     curation ? buildCuratedSelectedContext(selectedSources) : selected.selected_context || "",
-  );
+  ));
   const selectedSourceUrls = curation ? selectedSources.map((source) => source.url).filter(Boolean) : selected.source_urls || [];
   if (curation) {
     await api.updateResearchJob(requiredResearchId(job), {
@@ -1803,60 +1812,66 @@ async function runSectionInSession(
     count: selectedSourceUrls.length,
   });
   const sourceUrls = selectedSourceUrls;
-  onEvent?.({
-    kind: "decision",
-    sectionId: section.id,
-    sectionTitle: section.title,
-    title: "Planning subsection structure",
-    detail: "Up to 5 evidence-grounded headers",
-  });
-  const subsectionHeaders = await generateSubsectionHeaders({
-    agentSession: session,
-    query: job.query || "",
-    section,
-    continuityContext,
-    selectedContext,
-    attachmentContext: attachmentSelection.context,
-  });
-  const webReferences = registerCitationReferences(citationRegistry, sourceUrls);
-  const attachmentReferences = registerAttachmentCitationReferences(citationRegistry, attachmentSelection.items);
-  const citationReferences = [...webReferences, ...attachmentReferences];
-  const relevantPriorContents = selectRelevantPriorWrittenContents(
-    input.priorSectionResults,
-    section,
-    subsectionHeaders,
-  );
-  const writer = await writeSection(
-    session,
-    stripSelectedContextCitationLabels(selectedContext),
-    citationReferences,
-    attachmentSelection.context,
-    job.query || "",
-    section,
-    subsectionHeaders,
-    continuityContext,
-    relevantPriorContents,
-  );
-  const markdown = convertSectionUrlCitations(writer.markdown, citationReferences);
-  const sectionCitationSources = citationReferences.map((reference) => reference.source);
-  await api.saveSectionResult({
-    research_id: requiredResearchId(job),
-    section_id: section.id,
-    section_markdown: markdown,
-    section_summary: writer.summary,
-    subsection_headers: subsectionHeaders,
-    source_urls: sourceUrls,
-    citation_sources: sectionCitationSources,
-    status: "completed",
-  });
-  onEvent?.({
-    kind: "section_written",
-    sectionId: section.id,
-    sectionTitle: section.title,
-    title: "Section written",
-    detail: writer.summary,
-  });
-  return { ...writer, markdown, subsectionHeaders, sourceUrls, citationSources: sectionCitationSources };
+  await input.closeResearchSession();
+  const writerSession = await api.createAgentSession();
+  try {
+    onEvent?.({
+      kind: "decision",
+      sectionId: section.id,
+      sectionTitle: section.title,
+      title: "Planning subsection structure",
+      detail: "Up to 5 evidence-grounded headers",
+    });
+    const subsectionHeaders = await generateSubsectionHeaders({
+      agentSession: writerSession,
+      query: job.query || "",
+      section,
+      continuityContext,
+      selectedContext,
+      attachmentContext,
+    });
+    const webReferences = registerCitationReferences(citationRegistry, sourceUrls);
+    const attachmentReferences = registerAttachmentCitationReferences(citationRegistry, attachmentSelection.items);
+    const citationReferences = [...webReferences, ...attachmentReferences];
+    const relevantPriorContents = selectRelevantPriorWrittenContents(
+      input.priorSectionResults,
+      section,
+      subsectionHeaders,
+    );
+    const writer = await writeSection(
+      writerSession,
+      stripSelectedContextCitationLabels(selectedContext),
+      citationReferences,
+      attachmentContext,
+      job.query || "",
+      section,
+      subsectionHeaders,
+      continuityContext,
+      relevantPriorContents,
+    );
+    const markdown = convertSectionUrlCitations(writer.markdown, citationReferences);
+    const sectionCitationSources = citationReferences.map((reference) => reference.source);
+    await api.saveSectionResult({
+      research_id: requiredResearchId(job),
+      section_id: section.id,
+      section_markdown: markdown,
+      section_summary: writer.summary,
+      subsection_headers: subsectionHeaders,
+      source_urls: sourceUrls,
+      citation_sources: sectionCitationSources,
+      status: "completed",
+    });
+    onEvent?.({
+      kind: "section_written",
+      sectionId: section.id,
+      sectionTitle: section.title,
+      title: "Section written",
+      detail: writer.summary,
+    });
+    return { ...writer, markdown, subsectionHeaders, sourceUrls, citationSources: sectionCitationSources };
+  } finally {
+    await writerSession.delete().catch(() => undefined);
+  }
 }
 
 async function generateSectionSerpQueries(input: {
@@ -2593,12 +2608,23 @@ export function normalizeSectionCitations(markdown: string, references: Citation
 
 export function convertSectionUrlCitations(markdown: string, references: CitationReference[]): string {
   let converted = String(markdown || "");
+  const identifierNumbers = new Map(
+    references.map((reference) => [citationSourceIdentifier(reference.source), reference.number]),
+  );
   for (const reference of references) {
     const identifier = citationSourceIdentifier(reference.source);
     const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const link = new RegExp(`\\[([^\\]\\r\\n]+)\\]\\(\\s*${escaped}\\s*\\)`, "g");
     converted = converted.replace(link, `[${reference.number}]`);
   }
+  converted = converted.replace(
+    /\[([^\]\r\n]+)\]\(\s*((?:https?:\/\/|anna-attachment:\/\/)[^\s)]+)\s*\)/g,
+    (match, _label: string, rawIdentifier: string) => {
+      const normalizedIdentifier = rawIdentifier.replace(/\]+$/, "");
+      const number = identifierNumbers.get(normalizedIdentifier);
+      return number && normalizedIdentifier !== rawIdentifier ? `[${number}]` : match;
+    },
+  );
   converted = converted.replace(/\(\s*(\[\d+\](?:\s*\[\d+\])*)\s*\)/g, "$1");
   const unknownIdentifiers = Array.from(
     converted.matchAll(/\[[^\]\r\n]+\]\(\s*((?:https?:\/\/|anna-attachment:\/\/)[^\s)]+)\s*\)/g),
@@ -2623,6 +2649,20 @@ function stripSelectedContextCitationLabels(context: string): string {
 
 export function stripInternalChunkMarkers(context: string): string {
   return String(context || "").replace(/\[(?:Chunk|Chunks)\s+\d+(?:\s*-\s*\d+)?\][ \t]*(?:\r?\n)?/gi, "");
+}
+
+export function sanitizeEvidenceContextUrls(context: string, preserveCanonicalUrlLines = true): string {
+  return String(context || "")
+    .replace(/^(\[来源:[^\]\r\n]+\])\s*\[\d+\]\s*/gm, "$1 ")
+    .split(/\r?\n/)
+    .map((line) => {
+      if (preserveCanonicalUrlLines && /^URL:\s*/i.test(line)) return line;
+      return line
+        .replace(/\[([^\]\r\n]*)\]\(\s*https?:\/\/[^\s)]+\s*\)/gi, "$1")
+        .replace(/<https?:\/\/[^>\s]+>/gi, "[embedded URL omitted]")
+        .replace(/https?:\/\/[^\s<>"']+/gi, "[embedded URL omitted]");
+    })
+    .join("\n");
 }
 
 async function completeText(api: ResearchApi, messages: Parameters<ResearchApi["complete"]>[0]["messages"]): Promise<string> {

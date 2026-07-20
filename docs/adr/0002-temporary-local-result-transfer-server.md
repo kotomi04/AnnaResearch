@@ -1,5 +1,7 @@
 # Temporary Local Result Transfer Server For Large Research Results
 
+**Status: Superseded by ADR-0010.** This document records the former loopback design and is not an implementation contract.
+
 The Anna Researcher app temporarily moves large research payloads through a local HTTP transfer server owned by the Researcher Tool Backend because the Executa stdio protocol can terminate when large payloads flow through `anna.tools.invoke`. `app_save_research_result` remains the control-plane App Tool Method, but it returns a local `POST http://127.0.0.1:<port>/research-results/<research_id>` transfer descriptor; the Anna App Shell sends only the completed report markdown and source URLs through that HTTP endpoint, and the backend continues persisting the existing `<research_id>.json` job record.
 
 The same transfer boundary also applies to sectioned workflow payloads that can grow beyond safe stdio size: report-level selected context, section selected context, section writer output, assembled sectioned results, and completed result recovery. App Tool Methods remain control-plane calls that return descriptors and lightweight job state; full context or markdown is read or written through loopback HTTP.

@@ -1,11 +1,11 @@
 {
   "slug": "anna-researcher-executa",
   "name": "Researcher Executa",
-  "version": "0.2.6",
+  "version": "0.3.0",
   "executa_type": "tool",
   "description": "A Python Executa for the Anna Researcher App.",
   "tool_id": "tool-xhz-researcher-python-e7k8xa3s",
   "type": "python",
-  "host_capabilities": ["llm.embed", "llm.sample"],
+  "host_capabilities": ["llm.embed", "llm.sample", "storage.app"],
   "enabled": true
 }

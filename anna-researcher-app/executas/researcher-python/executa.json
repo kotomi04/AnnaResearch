@@ -1,11 +1,11 @@
 {
   "slug": "researcher-python",
   "name": "Researcher Python Executa",
-  "version": "0.2.6",
+  "version": "0.3.0",
   "tool_id": "tool-xhz-researcher-python-e7k8xa3s",
   "type": "python",
   "enabled": true,
-  "host_capabilities": ["llm.embed", "llm.sample"],
+  "host_capabilities": ["llm.embed", "llm.sample", "storage.app"],
   "distribution": {
     "active": "local",
     "profiles": {

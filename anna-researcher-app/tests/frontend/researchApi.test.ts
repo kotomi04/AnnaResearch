@@ -1,585 +1,171 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { AnnaResearchApi } from "../../src/api/researchApi";
-import { TOOL_ID, type AnnaRuntimeApi } from "../../src/types";
+import { TOOL_ID, type AnnaRuntimeApi, type ApsTransferDescriptor } from "../../src/types";
+
+const originalFetch = globalThis.fetch;
+
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+});
 
 describe("AnnaResearchApi", () => {
-  it("loads a backend-generated outline without an HTTP transfer", async () => {
+  it("loads a backend-generated outline without APS transfer", async () => {
     const calls: unknown[] = [];
-    const anna = {
-      tools: {
-        async invoke(request: unknown, options: unknown) {
-          calls.push([request, options]);
-          return {
-            success: true,
-            data: {
-              outline: [{ id: "section-1", title: "Market", outline: "Assess the market.", facet_ids: ["f1"], allowed_source_ids: [], max_iterations: 5 }],
-            },
-          };
-        },
-      },
-      llm: { async complete() { return {}; } },
-    } as unknown as AnnaRuntimeApi;
-    const oldFetch = globalThis.fetch;
-    let fetched = false;
-    globalThis.fetch = (async () => {
-      fetched = true;
-      throw new Error("outline generation must not use HTTP transfer");
-    }) as typeof fetch;
-    try {
-      const outline = await new AnnaResearchApi(anna).generateOutlineDraft({ research_id: "r1", source_ids: ["tavily"] });
-      expect(outline[0].title).toBe("Market");
-      expect(fetched).toBe(false);
-      expect(calls).toEqual([[
-        { tool_id: TOOL_ID, method: "app_generate_outline_draft", args: { research_id: "r1", source_ids: ["tavily"] }, timeoutMs: 300000 },
-        { timeoutMs: 300000 },
-      ]]);
-    } finally {
-      globalThis.fetch = oldFetch;
-    }
+    const anna = minimalRuntime(async (request, options) => {
+      calls.push([request, options]);
+      return { success: true, data: { outline: [{ id: "section-1", title: "Market", outline: "Assess.", facet_ids: ["f1"], allowed_source_ids: [], max_iterations: 5 }] } };
+    });
+    const outline = await new AnnaResearchApi(anna).generateOutlineDraft({ research_id: "r1", source_ids: ["tavily"] });
+    expect(outline[0].title).toBe("Market");
+    expect(calls).toEqual([[
+      { tool_id: TOOL_ID, method: "app_generate_outline_draft", args: { research_id: "r1", source_ids: ["tavily"] }, timeoutMs: 300000 },
+      { timeoutMs: 300000 },
+    ]]);
   });
 
-  it("creates an auto Agent session through the frontend runtime", async () => {
-    const calls: unknown[] = [];
+  it("creates an auto Agent session and rejects when Agent API is unavailable", async () => {
     const session = { async *run() {}, async delete() {} };
-    const anna = {
-      tools: { async invoke() {} },
-      llm: { async complete() { return {}; } },
-      agent: {
-        async session(input: unknown) {
-          calls.push(input);
-          return session;
-        },
-      },
-    } as unknown as AnnaRuntimeApi;
+    const anna = minimalRuntime(async () => ({}));
+    anna.agent = { async session(input) { expect(input).toEqual({ submode: "auto" }); return session; } };
+    await expect(new AnnaResearchApi(anna).createAgentSession()).resolves.toBe(session);
+    await expect(new AnnaResearchApi(minimalRuntime(async () => ({}))).createAgentSession()).rejects.toThrow("Agent API is unavailable");
+  });
 
+  it("keeps compact job reads off APS and downloads full job, context, section, and source-test payloads", async () => {
+    const aps = makeApsHarness();
+    globalThis.fetch = aps.fetch;
+    const jobTransfer = await aps.seed("research-jobs/r1/transfers/job.json", { job: { research_id: "r1", status: "completed", section_results: {} }, result: { report_markdown: "# Restored", source_urls: [] } });
+    const contextTransfer = await aps.seed("research-jobs/r1/transfers/context.json", { selected_context: "evidence", selected_sources: [], source_urls: [] });
+    const sectionTransfer = await aps.seed("research-jobs/r1/transfers/section.json", { section_result: { section_id: "section-1", section_markdown: "## Saved" } });
+    const testTransfer = await aps.seed("research-source-tests/t1/transfers/test.json", { test: { source_id: "tavily", source_name: "Tavily", query: "anna", duration_ms: 1, pages: [], extracted: [], error: null } });
+    const anna = runtimeWithAps(aps, async (request) => {
+      if (request.method === "app_get_research_job") return { success: true, data: { job: { research_id: "r1", status: "completed" } } };
+      if (request.method === "app_get_research_job_payload") return { success: true, data: { transfer: jobTransfer } };
+      if (request.method === "app_select_section_context") return { success: true, data: { job: { research_id: "r1" }, context_transfer: contextTransfer } };
+      if (request.method === "app_get_section_result") return { success: true, data: { transfer: sectionTransfer } };
+      if (request.method === "app_test_research_source") return { success: true, data: { test_transfer: testTransfer } };
+      return { success: true, data: {} };
+    });
     const api = new AnnaResearchApi(anna);
-    await expect(api.createAgentSession()).resolves.toBe(session);
-    expect(calls).toEqual([{ submode: "auto" }]);
+    expect((await api.getResearchJob("r1"))?.result).toBeUndefined();
+    expect((await api.getResearchJobPayload("r1")).result?.report_markdown).toBe("# Restored");
+    expect((await api.selectSectionContext({ research_id: "r1", section_id: "section-1" })).selected_context).toBe("evidence");
+    expect((await api.getSectionResult("r1", "section-1"))?.section_markdown).toBe("## Saved");
+    expect((await api.testResearchSource({ id: "tavily", definition: { id: "tavily" }, query: "anna" })).source_id).toBe("tavily");
+    expect(aps.deleted).toEqual(expect.arrayContaining([jobTransfer.path, contextTransfer.path, sectionTransfer.path, testTransfer.path]));
   });
 
-  it("rejects section session creation when the Agent API is unavailable", async () => {
-    const anna = {
-      tools: { async invoke() {} },
-      llm: { async complete() { return {}; } },
-    } as unknown as AnnaRuntimeApi;
-
-    await expect(new AnnaResearchApi(anna).createAgentSession()).rejects.toThrow("Anna Agent API is unavailable for section generation.");
-  });
-
-  it("uses the production app tool methods", async () => {
-    const calls: unknown[] = [];
-    const anna: AnnaRuntimeApi = {
-      tools: {
-        async invoke(request, options) {
-          calls.push(options ? [request, options] : request);
-          if (request.method === "app_get_settings") {
-            return { success: true, data: { settings: { tavily: { configured: true, masked: "***test" } } } };
-          }
-          if (request.method === "app_list_research_sources") {
-            return {
-              success: true,
-              data: {
-                sources: [
-                  {
-                    id: "tavily",
-                    name: "Tavily",
-                    kind: "builtin",
-                    enabled: true,
-                    max_parallel: 3,
-                    credential_status: "configured",
-                    credential: "tvly-test",
-                  },
-                ],
-              },
-            };
-          }
-          if (request.method === "app_update_research_source_credential") {
-            return {
-              success: true,
-              data: {
-                source: {
-                  id: "tavily",
-                  name: "Tavily",
-                  kind: "builtin",
-                  enabled: true,
-                  max_parallel: 3,
-                  credential_status: "configured",
-                  credential: "tvly-test",
-                },
-              },
-            };
-          }
-          if (request.method === "app_get_research_job") {
-            return {
-              success: true,
-              data: {
-                job: {
-                  research_id: "r1",
-                  status: "running",
-                  job_transfer: { method: "GET", url: "http://127.0.0.1:43123/jobs/r1", content_type: "application/json" },
-                },
-              },
-            };
-          }
-          if (request.method === "app_list_research_jobs") {
-            return { success: true, data: { jobs: [{ research_id: "r1", status: "running" }] } };
-          }
-          if (request.method === "app_test_research_source") {
-            return {
-              success: true,
-              data: {
-                test_transfer: { method: "GET", url: "http://127.0.0.1:43123/source-tests/t1", content_type: "application/json" },
-              },
-            };
-          }
-          if (request.method === "app_select_section_context") {
-            return {
-              success: true,
-              data: {
-                job: { research_id: "r1" },
-                context_transfer: { method: "GET", url: "http://127.0.0.1:43123/section-contexts/r1/section-1", content_type: "application/json" },
-              },
-            };
-          }
-          if (request.method === "app_save_report_framing") {
-            return {
-              success: true,
-              data: { transfer: { method: "POST", url: "http://127.0.0.1:43123/report-framings/r1", content_type: "application/json" } },
-            };
-          }
-          return { success: true, data: { job: { research_id: "r1", status: "running" } } };
-        },
-      },
-      llm: {
-        async complete() {
-          return { content: { type: "text", text: "{}" } };
-        },
-      },
-    };
-
+  it("uploads section, framing, and assembled payloads to APS before invoking the tool", async () => {
+    const aps = makeApsHarness();
+    globalThis.fetch = aps.fetch;
+    const calls: Array<{ method?: string; args?: Record<string, unknown> }> = [];
+    const anna = runtimeWithAps(aps, async (request) => {
+      calls.push(request);
+      if (request.method === "app_save_assembled_research_result") return { success: true, data: { job: { research_id: "r1", status: "completed" }, result: { report_markdown: "# Final" } } };
+      return { success: true, data: { job: { research_id: "r1", status: "running" } } };
+    });
     const api = new AnnaResearchApi(anna);
-    const oldFetch = globalThis.fetch;
-    const fetchCalls: unknown[] = [];
-    globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
-      fetchCalls.push([url, init]);
-      if (String(url).includes("/jobs/")) {
-        return new Response(JSON.stringify({ job: { research_id: "r1", status: "running", iterations: [], source_urls: [] } }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      if (String(url).includes("/report-framings/")) {
-        return new Response(JSON.stringify({ job: { research_id: "r1", status: "running", stage: "assemble_report", progress: 96 } }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      if (String(url).includes("/source-tests/")) {
-        return new Response(
-          JSON.stringify({
-            test: {
-              source_id: "tavily",
-              source_name: "Tavily",
-              query: "anna",
-              duration_ms: 1,
-              pages: [],
-              extracted: [],
-              error: null,
-            },
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
-      }
-      return new Response(
-        JSON.stringify({ result: { report_markdown: "# Report", source_urls: ["https://example.com"] } }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
-    }) as typeof fetch;
-    try {
-      await api.getSettings();
-      await api.listResearchSources();
-      await api.updateResearchSourceCredential({ id: "tavily", credential: "tvly-test" });
-      await api.createResearchJob({ query: "anna" });
-      await api.updateResearchJob("r1", { stage: "plan_queries" });
-      await api.prepareAttachments("r1", [
-        {
-          name: "brief.md",
-          path: "research-jobs/r1/uploads/brief.md",
-          content_type: "text/markdown",
-          size_bytes: 12,
-          download_url: "https://files.example/brief.md",
-        },
-      ]);
-      await api.embedAttachmentChunks("r1");
-      await api.getResearchJob("r1");
-      await api.listResearchJobs({ limit: 20 });
-      await api.testResearchSource({ id: "tavily", definition: { id: "tavily" }, query: "anna" });
-      await api.saveReportFraming({
-        research_id: "r1",
-        framing: { title: "Report", introduction: "large intro", conclusion: "large conclusion" },
-      });
-      expect(calls).toEqual([
-        { tool_id: TOOL_ID, method: "app_get_settings", args: {} },
-        { tool_id: TOOL_ID, method: "app_list_research_sources", args: {} },
-        { tool_id: TOOL_ID, method: "app_update_research_source_credential", args: { id: "tavily", credential: "tvly-test" } },
-        { tool_id: TOOL_ID, method: "app_create_research_job", args: { query: "anna" } },
-        { tool_id: TOOL_ID, method: "app_update_research_job", args: { research_id: "r1", updates: { stage: "plan_queries" } } },
-        {
-          tool_id: TOOL_ID,
-          method: "app_prepare_attachments",
-          args: {
-            research_id: "r1",
-            attachments: [
-              {
-                name: "brief.md",
-                path: "research-jobs/r1/uploads/brief.md",
-                content_type: "text/markdown",
-                size_bytes: 12,
-                download_url: "https://files.example/brief.md",
-              },
-            ],
-          },
-        },
-        [
-          {
-            tool_id: TOOL_ID,
-            method: "app_embed_attachment_chunks",
-            args: { research_id: "r1" },
-            timeoutMs: 300000,
-          },
-          { timeoutMs: 300000 },
-        ],
-        { tool_id: TOOL_ID, method: "app_get_research_job", args: { research_id: "r1" } },
-        { tool_id: TOOL_ID, method: "app_list_research_jobs", args: { limit: 20 } },
-        { tool_id: TOOL_ID, method: "app_test_research_source", args: { id: "tavily", definition: { id: "tavily" }, query: "anna" } },
-        { tool_id: TOOL_ID, method: "app_save_report_framing", args: { research_id: "r1" } },
-      ]);
-      expect(JSON.stringify(calls)).not.toContain("large intro");
-      expect(fetchCalls).toHaveLength(3);
-      expect(fetchCalls[0]).toEqual(["http://127.0.0.1:43123/jobs/r1", { method: "GET" }]);
-      expect(fetchCalls[1]).toEqual(["http://127.0.0.1:43123/source-tests/t1", { method: "GET" }]);
-      expect(fetchCalls[2]).toEqual([
-        "http://127.0.0.1:43123/report-framings/r1",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            research_id: "r1",
-            framing: { title: "Report", introduction: "large intro", conclusion: "large conclusion" },
-          }),
-        },
-      ]);
-    } finally {
-      globalThis.fetch = oldFetch;
+    await api.saveSectionResult({ research_id: "r1", section_id: "section-1", section_markdown: "## Section", section_summary: "Summary" });
+    await api.saveReportFraming({ research_id: "r1", framing: { title: "Title", introduction: "Intro", conclusion: "End" } });
+    await api.saveAssembledResearchResult({ research_id: "r1", report_markdown: "# Final" });
+    expect(calls.map((call) => call.method)).toEqual(["app_save_section_result", "app_save_report_framing", "app_save_assembled_research_result"]);
+    expect(JSON.stringify(calls)).not.toContain("## Section");
+    expect(JSON.stringify(calls)).not.toContain("# Final");
+    for (const call of calls) {
+      const transfer = call.args?.payload_transfer as ApsTransferDescriptor;
+      expect(transfer.path).toContain("research-jobs/r1/transfers/");
+      expect(transfer.sha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(aps.objects.has(transfer.path)).toBe(true);
     }
   });
 
-  it("keeps the result transfer after loading a compact transferred job", async () => {
-    const anna: AnnaRuntimeApi = {
-      tools: {
-        async invoke(request) {
-          expect(request).toEqual({ tool_id: TOOL_ID, method: "app_get_research_job", args: {} });
-          return {
-            success: true,
-            data: {
-              job: {
-                research_id: "r1",
-                status: "completed",
-                job_transfer: { method: "GET", url: "http://127.0.0.1:43123/jobs/r1", content_type: "application/json" },
-                result_transfer: { method: "GET", url: "http://127.0.0.1:43123/research-results/r1", content_type: "application/json" },
-              },
-            },
-          };
-        },
-      },
-      llm: {
-        async complete() {
-          return { content: { type: "text", text: "{}" } };
-        },
-      },
-    };
-    const oldFetch = globalThis.fetch;
-    const fetchCalls: string[] = [];
-    globalThis.fetch = (async (url: RequestInfo | URL) => {
-      fetchCalls.push(String(url));
-      if (String(url).includes("/jobs/")) {
-        return new Response(JSON.stringify({ job: { research_id: "r1", status: "completed", iterations: [], source_urls: [] } }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      return new Response(JSON.stringify({ result: { report_markdown: "# Restored", source_urls: ["https://example.com"] } }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
-    }) as typeof fetch;
-
-    try {
-      const api = new AnnaResearchApi(anna);
-      const job = await api.getResearchJob();
-
-      expect(fetchCalls).toEqual([
-        "http://127.0.0.1:43123/jobs/r1",
-        "http://127.0.0.1:43123/research-results/r1",
-      ]);
-      expect(job?.result?.report_markdown).toBe("# Restored");
-    } finally {
-      globalThis.fetch = oldFetch;
-    }
+  it("surfaces APS integrity failures without a localhost fallback", async () => {
+    const aps = makeApsHarness();
+    globalThis.fetch = aps.fetch;
+    const transfer = await aps.seed("research-jobs/r1/transfers/job.json", { job: { research_id: "r1" } });
+    transfer.sha256 = "0".repeat(64);
+    const anna = runtimeWithAps(aps, async () => ({ success: true, data: { transfer } }));
+    await expect(new AnnaResearchApi(anna).getResearchJobPayload("r1")).rejects.toThrow("sha256 mismatch");
+    expect(aps.deleted).not.toContain(transfer.path);
   });
 
-  it("opens an inline completed job when transfer URLs are unavailable", async () => {
-    const anna: AnnaRuntimeApi = {
-      tools: {
-        async invoke(request) {
-          expect(request).toEqual({ tool_id: TOOL_ID, method: "app_get_research_job", args: { research_id: "r1" } });
-          return {
-            success: true,
-            data: {
-              job: {
-                research_id: "r1",
-                status: "completed",
-                confirmed_outline: [],
-                result: { research_id: "r1", report_markdown: "# Inline", source_urls: ["https://example.com"] },
-                job_transfer: { method: "GET", url: "http://127.0.0.1:43123/jobs/r1", content_type: "application/json" },
-                result_transfer: { method: "GET", url: "http://127.0.0.1:43123/research-results/r1", content_type: "application/json" },
-              },
-            },
-          };
-        },
-      },
-      llm: {
-        async complete() {
-          return { content: { type: "text", text: "{}" } };
-        },
-      },
-    };
-    const oldFetch = globalThis.fetch;
-    const oldWarn = console.warn;
-    const warnings: unknown[] = [];
-    globalThis.fetch = (async () => {
-      throw new TypeError("Failed to fetch");
-    }) as typeof fetch;
-    console.warn = (...args: unknown[]) => {
-      warnings.push(args);
-    };
-
-    try {
-      const api = new AnnaResearchApi(anna);
-      const job = await api.getResearchJob("r1");
-
-      expect(job?.research_id).toBe("r1");
-      expect(job?.result?.report_markdown).toBe("# Inline");
-      expect(warnings.length).toBeGreaterThan(0);
-    } finally {
-      globalThis.fetch = oldFetch;
-      console.warn = oldWarn;
-    }
+  it("coalesces concurrent compact and payload reads independently", async () => {
+    const aps = makeApsHarness();
+    globalThis.fetch = aps.fetch;
+    const transfer = await aps.seed("research-jobs/r1/transfers/job.json", { job: { research_id: "r1", status: "running" } });
+    const calls: string[] = [];
+    const anna = runtimeWithAps(aps, async (request) => {
+      calls.push(request.method);
+      await Promise.resolve();
+      return request.method === "app_get_research_job_payload"
+        ? { success: true, data: { transfer } }
+        : { success: true, data: { job: { research_id: "r1", status: "running" } } };
+    });
+    const api = new AnnaResearchApi(anna);
+    await Promise.all([api.getResearchJob("r1"), api.getResearchJob("r1"), api.getResearchJobPayload("r1"), api.getResearchJobPayload("r1")]);
+    expect(calls.filter((method) => method === "app_get_research_job")).toHaveLength(1);
+    expect(calls.filter((method) => method === "app_get_research_job_payload")).toHaveLength(1);
+    expect(aps.deleted.filter((path) => path === transfer.path)).toHaveLength(1);
   });
 
-  it("keeps section and assembled large payloads out of tool invoke arguments", async () => {
+  it("adds extended timeouts for attachment processing and DuckDuckGo", async () => {
     const calls: unknown[] = [];
-    const anna: AnnaRuntimeApi = {
-      tools: {
-        async invoke(request) {
-          calls.push(request);
-          if (request.method === "app_select_section_context") {
-            return {
-              success: true,
-              data: {
-                job: { research_id: "r1" },
-                context_transfer: { method: "GET", url: "http://127.0.0.1:43123/section-contexts/r1/section-1", content_type: "application/json" },
-              },
-            };
-          }
-          if (request.method === "app_save_section_result") {
-            return {
-              success: true,
-              data: {
-                transfer: { method: "POST", url: "http://127.0.0.1:43123/section-results/r1/section-1", content_type: "application/json" },
-              },
-            };
-          }
-          if (request.method === "app_save_assembled_research_result") {
-            return {
-              success: true,
-              data: {
-                transfer: { method: "POST", url: "http://127.0.0.1:43123/assembled-research-results/r1", content_type: "application/json" },
-              },
-            };
-          }
-          return { success: true, data: { job: { research_id: "r1" } } };
-        },
-      },
-      llm: {
-        async complete() {
-          return { content: { type: "text", text: "{}" } };
-        },
-      },
-    };
-    const oldFetch = globalThis.fetch;
-    const fetchCalls: unknown[] = [];
-    globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
-      fetchCalls.push([url, init]);
-      if (String(url).includes("/section-contexts/")) {
-        return new Response(JSON.stringify({ selected_context: "section context", selected_sources: [], source_urls: ["https://example.com/s"] }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      return new Response(
-        JSON.stringify({
-          job: { research_id: "r1", status: "completed" },
-          result: { report_markdown: "# Final", source_urls: ["https://example.com/s"] },
-          section_result: { section_markdown: "## Section", section_summary: "summary" },
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
-    }) as typeof fetch;
-
-    try {
-      const api = new AnnaResearchApi(anna);
-      await api.selectSectionContext({ research_id: "r1", section_id: "section-1" });
-      await api.saveSectionResult({
-        research_id: "r1",
-        section_id: "section-1",
-        section_markdown: "## Section",
-        section_summary: "summary",
-        source_urls: ["https://example.com/s"],
-        status: "completed",
-      });
-      await api.saveAssembledResearchResult({ research_id: "r1", report_markdown: "# Final", source_urls: ["https://example.com/s"] });
-
-      expect(JSON.stringify(calls)).not.toContain("## Section");
-      expect(JSON.stringify(calls)).not.toContain("# Final");
-      expect(JSON.stringify(fetchCalls)).toContain("## Section");
-      expect(JSON.stringify(fetchCalls)).toContain("# Final");
-    } finally {
-      globalThis.fetch = oldFetch;
-    }
-  });
-
-  it("adds an extended invoke timeout for attachment processing and DuckDuckGo source calls", async () => {
-    const calls: unknown[] = [];
-    const anna: AnnaRuntimeApi = {
-      tools: {
-        async invoke(request, options) {
-          calls.push(options ? [request, options] : request);
-          if (request.method === "app_test_research_source") {
-            return {
-              success: true,
-              data: {
-                test_transfer: { method: "GET", url: "http://127.0.0.1:43123/source-tests/t1", content_type: "application/json" },
-              },
-            };
-          }
-          return {
-            success: true,
-            data: {
-              job: { research_id: "r1" },
-              source_call: {
-                source_id: "duckduckgo",
-                source_name: "DuckDuckGo",
-                queries: ["anna"],
-                results_count: 0,
-                top_titles: [],
-                duration_ms: 0,
-                error: null,
-                calls: [],
-              },
-            },
-          };
-        },
-      },
-      llm: {
-        async complete() {
-          return { content: { type: "text", text: "{}" } };
-        },
-      },
-    };
-    const oldFetch = globalThis.fetch;
-    globalThis.fetch = (async () =>
-      new Response(
-        JSON.stringify({
-          selected_context: "",
-          selected_sources: [],
-          source_urls: [],
-          test: {
-            source_id: "duckduckgo",
-            source_name: "DuckDuckGo",
-            query: "anna",
-            duration_ms: 1,
-            pages: [],
-            extracted: [],
-            error: null,
-          },
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      )) as typeof fetch;
-
-    try {
-      const api = new AnnaResearchApi(anna);
-      await api.embedAttachmentChunks("r1");
-      await api.summarizeAttachments("r1", { query: "anna", top_k: 6 });
-      await api.selectSectionContext({ research_id: "r1", section_id: "section-1" });
-      await api.callSectionResearchSource({
-        research_id: "r1",
-        section_id: "section-1",
-        iteration: 1,
-        source_id: "duckduckgo",
-        queries: ["anna"],
-      });
-      await api.testResearchSource({ id: "duckduckgo", definition: { id: "duckduckgo" }, query: "anna" });
-
-      expect(calls).toEqual([
-        [
-          {
-            tool_id: TOOL_ID,
-            method: "app_embed_attachment_chunks",
-            args: { research_id: "r1" },
-            timeoutMs: 300000,
-          },
-          { timeoutMs: 300000 },
-        ],
-        [
-          {
-            tool_id: TOOL_ID,
-            method: "app_summarize_attachments",
-            args: { research_id: "r1", query: "anna", top_k: 6 },
-            timeoutMs: 300000,
-          },
-          { timeoutMs: 300000 },
-        ],
-        [
-          {
-            tool_id: TOOL_ID,
-            method: "app_select_section_context",
-            args: { research_id: "r1", section_id: "section-1" },
-            timeoutMs: 300000,
-          },
-          { timeoutMs: 300000 },
-        ],
-        [
-          {
-            tool_id: TOOL_ID,
-            method: "app_call_section_research_source",
-            args: { research_id: "r1", section_id: "section-1", iteration: 1, source_id: "duckduckgo", queries: ["anna"] },
-            timeoutMs: 300000,
-          },
-          { timeoutMs: 300000 },
-        ],
-        [
-          {
-            tool_id: TOOL_ID,
-            method: "app_test_research_source",
-            args: { id: "duckduckgo", definition: { id: "duckduckgo" }, query: "anna" },
-            timeoutMs: 300000,
-          },
-          { timeoutMs: 300000 },
-        ],
-      ]);
-    } finally {
-      globalThis.fetch = oldFetch;
-    }
+    const anna = minimalRuntime(async (request, options) => {
+      calls.push(options ? [request, options] : request);
+      if (request.method === "app_test_research_source") return { success: true, data: { test: { source_id: "duckduckgo", source_name: "DuckDuckGo", query: "anna", duration_ms: 1, pages: [], extracted: [], error: null } } };
+      return { success: true, data: { job: { research_id: "r1" }, selected_context: "", selected_sources: [], source_urls: [] } };
+    });
+    const api = new AnnaResearchApi(anna);
+    await api.embedAttachmentChunks("r1");
+    await api.summarizeAttachments("r1", { query: "anna" });
+    await api.callSectionResearchSource({ research_id: "r1", section_id: "section-1", iteration: 1, source_id: "duckduckgo", queries: ["anna"] });
+    await api.testResearchSource({ id: "duckduckgo", definition: { id: "duckduckgo" }, query: "anna" });
+    expect(JSON.stringify(calls).match(/300000/g)?.length).toBeGreaterThanOrEqual(8);
   });
 });
+
+function minimalRuntime(invoke: (request: any, options?: any) => Promise<any>): AnnaRuntimeApi {
+  return { tools: { invoke }, llm: { async complete() { return { content: { type: "text", text: "{}" } }; } } } as AnnaRuntimeApi;
+}
+
+function runtimeWithAps(aps: ReturnType<typeof makeApsHarness>, invoke: (request: any, options?: any) => Promise<any>): AnnaRuntimeApi {
+  return { ...minimalRuntime(invoke), files: aps.files } as AnnaRuntimeApi;
+}
+
+function makeApsHarness() {
+  const objects = new Map<string, Uint8Array>();
+  const deleted: string[] = [];
+  const pathFromUrl = (url: string) => decodeURIComponent(url.split("/").pop() || "");
+  const files = {
+    async upload_init({ path }: { path: string }) { return { put_url: `https://aps.test/put/${encodeURIComponent(path)}`, upload_id: "upload-1", headers: {} }; },
+    async upload_finalize({ path, etag, size_bytes }: { path: string; etag?: string; size_bytes?: number }) { return { path, etag, size_bytes }; },
+    async download_url({ path }: { path: string }) { return { get_url: `https://aps.test/get/${encodeURIComponent(path)}` }; },
+    async list() { return { items: [] }; },
+    async delete({ path }: { path: string }) { deleted.push(path); objects.delete(path); },
+  };
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    const path = pathFromUrl(url);
+    if (url.includes("/put/")) {
+      const body = init?.body;
+      const bytes = body instanceof Uint8Array ? body : new Uint8Array(await new Response(body).arrayBuffer());
+      objects.set(path, Uint8Array.from(bytes));
+      return new Response(null, { status: 200, headers: { ETag: "etag-1" } });
+    }
+    const payload = objects.get(path);
+    return payload ? new Response(payload, { status: 200 }) : new Response("missing", { status: 404 });
+  }) as typeof globalThis.fetch;
+  return {
+    objects,
+    deleted,
+    files,
+    fetch,
+    async seed(path: string, payload: unknown): Promise<ApsTransferDescriptor> {
+      const bytes = new TextEncoder().encode(JSON.stringify(payload));
+      objects.set(path, bytes);
+      const digest = await crypto.subtle.digest("SHA-256", Uint8Array.from(bytes).buffer);
+      const sha256 = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+      return { path, content_type: "application/json", size_bytes: bytes.byteLength, sha256, delete_after_read: true };
+    },
+  };
+}

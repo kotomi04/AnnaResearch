@@ -95,7 +95,7 @@ describe("App Anna runtime integration", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Open latest" }));
 
     await waitFor(() =>
-      expect(calls).toContainEqual({ tool_id: TOOL_ID, method: "app_get_research_job", args: { research_id: "research_recent" } }),
+      expect(calls).toContainEqual({ tool_id: TOOL_ID, method: "app_get_research_job_payload", args: { research_id: "research_recent" } }),
     );
   });
 });

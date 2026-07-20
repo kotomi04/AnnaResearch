@@ -353,8 +353,6 @@ export interface ResearchJob {
   assembled_result?: Record<string, unknown> | null;
   attachments?: ResearchAttachment[];
   attachment_context?: AttachmentContext | null;
-  job_transfer?: ResultTransferDescriptor;
-  result_transfer?: ResultTransferDescriptor;
 }
 
 export interface ResearchResult {
@@ -370,10 +368,13 @@ export interface ResearchResult {
   updated_at?: string;
 }
 
-export interface ResultTransferDescriptor {
-  method: "POST" | string;
-  url: string;
-  content_type?: string;
+export interface ApsTransferDescriptor {
+  path: string;
+  content_type: "application/json";
+  size_bytes: number;
+  etag?: string;
+  sha256: string;
+  delete_after_read: true;
 }
 
 export interface StartResearchInput {

@@ -140,9 +140,9 @@ _Avoid_: Full LLM provider rewrite, OpenAI-compatible proxy
 The shape of a Research Result persisted by the Researcher Tool Backend: the completed markdown report, source URL evidence, job status, failure summary when relevant, and basic timestamps. It excludes generated document exports, full internal research context, and full history management from the default user-facing result.
 _Avoid_: File export bundle, debug context dump
 
-**Local Result Transfer Server**:
-A local transfer boundary used by the Anna App Shell and Researcher Tool Backend when a research payload is too large for the Researcher Tool Protocol. It covers completed Research Results, selected context, Section Writer Output, and assembled sectioned reports. It keeps App Tool Methods for control messages while leaving the Executa Local Job Store as the owner of persisted job records and results.
-_Avoid_: public web API, replacement backend, direct file access from the app shell
+**APS JSON Transfer Boundary**:
+The App-private APS Files boundary used by the Anna App Shell and Researcher Tool Backend when a JSON research payload is too large for the Researcher Tool Protocol. App Tool Methods carry logical descriptors while the iframe uses `anna.files.*` and Executa uses `files/*` reverse RPC. Successful consumers delete intermediate transfer objects; the Executa Local Job Store remains the owner of persisted jobs and results.
+_Avoid_: loopback transfer server, presigned URL persistence, user-scope intermediate files, attachment cleanup
 
 **Polling Job Observation**:
 The previous MVP communication pattern where the Anna App Shell repeatedly invoked a backend dispatcher to advance or read a backend-owned job. In the refactored adapter, frontend-owned orchestration should use App Tool Methods for specific persisted data and backend work instead.

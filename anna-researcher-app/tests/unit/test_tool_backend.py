@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import math
 import os
@@ -9,6 +10,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 import pytest
 
@@ -57,6 +59,7 @@ def make_dispatcher(tmp_path):
         settings=SettingsStore(root=root),
         jobs=JobStore(root=root),
         selector=LexicalContextSelector(max_sources=4, context_budget=4000),
+        transfers=MemoryTransfers(),
     )
 
 
@@ -73,12 +76,25 @@ def get_json(url: str):
         return json.loads(response.read().decode("utf-8"))
 
 
-class FailingTransferServer:
-    def job_descriptor(self, research_id: str):
-        raise PermissionError("socket creation blocked")
+class MemoryTransfers:
+    def __init__(self):
+        self.payloads = {}
+        self.deleted = []
 
-    def result_descriptor(self, research_id: str, *, method: str = "GET"):
-        raise PermissionError("socket creation blocked")
+    def upload(self, *, prefix, kind, payload):
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        path = f"{prefix}/transfers/{kind}-{uuid.uuid4().hex}.json"
+        self.payloads[path] = payload
+        return {"path": path, "content_type": "application/json", "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), "delete_after_read": True}
+
+    def download_json(self, descriptor, *, expected_prefix):
+        assert descriptor["path"].startswith(expected_prefix + "/transfers/")
+        return self.payloads[descriptor["path"]]
+
+    def delete_best_effort(self, descriptor):
+        path = descriptor.get("path")
+        self.deleted.append(path)
+        self.payloads.pop(path, None)
 
 
 class FakeEmbeddings:
@@ -219,8 +235,9 @@ def test_job_create_update_latest_and_not_found(tmp_path):
     assert job["research_id"].startswith("research_")
     latest_status = dispatcher.dispatch("app_get_research_job", {})["job"]
     assert latest_status["research_id"] == job["research_id"]
-    if latest_status.get("job_transfer"):
-        assert get_json(latest_status["job_transfer"]["url"])["job"]["research_id"] == job["research_id"]
+    assert "job_transfer" not in latest_status
+    payload = dispatcher.transfers.read(dispatcher.dispatch("app_get_research_job_payload", {"research_id": job["research_id"]})["transfer"])
+    assert payload["job"]["research_id"] == job["research_id"]
     updated = dispatcher.dispatch(
         "app_update_research_job",
         {
@@ -650,20 +667,16 @@ def test_select_attachment_context_skips_irrelevant_files(tmp_path):
     assert "GPU supply chain" not in selected["selected_context"]
 
 
-def test_get_research_job_falls_back_when_transfer_server_is_blocked(tmp_path):
+def test_get_research_job_requires_aps_transfer_capability(tmp_path):
     root = tmp_path / ".research"
     dispatcher = AppDispatcher(
         settings=SettingsStore(root=root),
         jobs=JobStore(root=root),
         selector=LexicalContextSelector(max_sources=4, context_budget=4000),
-        transfer_server=FailingTransferServer(),
     )
     job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
-
-    loaded = dispatcher.dispatch("app_get_research_job", {"research_id": job["research_id"]})["job"]
-
-    assert loaded["research_id"] == job["research_id"]
-    assert "job_transfer" not in loaded
+    with pytest.raises(ValidationError, match="APS Files transfer capability is unavailable"):
+        dispatcher.dispatch("app_get_research_job", {"research_id": job["research_id"]})
 
 
 def test_outline_discovery_runs_sampling_and_search_entirely_in_backend(tmp_path, monkeypatch):
@@ -756,7 +769,7 @@ def test_compact_job_view_exposes_v3_fields(tmp_path):
     dispatcher = make_dispatcher(tmp_path)
     job = dispatcher.dispatch("app_create_research_job", {"query": "anna"})["job"]
     immediate = dispatcher.dispatch("app_get_research_job", {"research_id": job["research_id"]})["job"]
-    loaded = get_json(immediate["job_transfer"]["url"])["job"] if immediate.get("job_transfer") else immediate
+    loaded = immediate
     assert loaded["schema_version"] == 5
     assert loaded["iterations"] == []
     assert loaded["research_log"] == []

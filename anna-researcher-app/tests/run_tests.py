@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-import urllib.request
+import uuid
 from pathlib import Path
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -41,7 +42,41 @@ def assert_true(value, message):
 
 def make_dispatcher(tmp_path: Path) -> AppDispatcher:
     root = tmp_path / ".research"
-    return AppDispatcher(settings=SettingsStore(root=root), jobs=JobStore(root=root), selector=LexicalContextSelector(max_sources=4, context_budget=4000))
+    return AppDispatcher(settings=SettingsStore(root=root), jobs=JobStore(root=root), selector=LexicalContextSelector(max_sources=4, context_budget=4000), transfers=MemoryTransfers())
+
+
+class MemoryTransfers:
+    def __init__(self):
+        self.payloads = {}
+        self.deleted = []
+
+    def upload(self, *, prefix, kind, payload):
+        return self.put(prefix=prefix, kind=kind, payload=payload)
+
+    def put(self, *, prefix, kind, payload):
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        path = f"{prefix}/transfers/{kind}-{uuid.uuid4().hex}.json"
+        descriptor = {
+            "path": path,
+            "content_type": "application/json",
+            "size_bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "delete_after_read": True,
+        }
+        self.payloads[path] = payload
+        return descriptor
+
+    def read(self, descriptor):
+        return self.payloads[descriptor["path"]]
+
+    def download_json(self, descriptor, *, expected_prefix):
+        assert descriptor["path"].startswith(expected_prefix + "/transfers/")
+        return self.read(descriptor)
+
+    def delete_best_effort(self, descriptor):
+        path = descriptor.get("path")
+        self.deleted.append(path)
+        self.payloads.pop(path, None)
 
 
 class FakeEmbeddings:
@@ -141,7 +176,9 @@ def test_job_shell(tmp_path: Path):
     loaded_status = dispatcher.dispatch("app_get_research_job", {})["job"]
     assert_true(loaded_status["schema_version"] == 5, "get job without id should return the most recently updated compact job")
     assert_true(all("raw_results" not in it for it in loaded_status["iterations"]), "compact stdio job should not expose raw_results")
-    loaded = get_json(loaded_status["job_transfer"]["url"])["job"] if loaded_status.get("job_transfer") else loaded_status
+    assert_true("job_transfer" not in loaded_status and "result_transfer" not in loaded_status, "compact job reads must not create APS transfers")
+    loaded_descriptor = dispatcher.dispatch("app_get_research_job_payload", {"research_id": job["research_id"]})["transfer"]
+    loaded = dispatcher.transfers.read(loaded_descriptor)["job"]
     assert_true(loaded["research_id"] == job["research_id"], "latest job should load")
     assert_true(loaded["schema_version"] == 5, "loaded job should advertise v5")
     updated = dispatcher.dispatch(
@@ -456,7 +493,7 @@ def test_section_large_payload_transfer(tmp_path: Path):
     )
     selected = dispatcher.dispatch("app_select_section_context", {"research_id": research_id, "section_id": "section-1"})
     assert_true("selected_context" not in selected, "section context should not return through stdio")
-    section_context = get_json(selected["context_transfer"]["url"])
+    section_context = dispatcher.transfers.read(selected["context_transfer"])
     assert_true(bool(section_context["selected_context"]), "section context transfer should return context")
     assert_true(bool(section_context["selected_sources"]), "section context transfer should return selected source metadata")
     assert_true(
@@ -476,50 +513,50 @@ def test_section_large_payload_transfer(tmp_path: Path):
         "stored section selected_sources should include content for resume rebuild",
     )
     assert_true("section_selected_context" not in selected["job"], "section context stdio job should be status-only")
-    section_transfer = dispatcher.dispatch("app_save_section_result", {"research_id": research_id, "section_id": "section-1"})["transfer"]
-    section_saved = post_json(
-        section_transfer["url"],
-        {
+    section_transfer = dispatcher.transfers.put(
+        prefix=f"research-jobs/{research_id}", kind="section-result-input", payload={
+            "research_id": research_id,
+            "section_id": "section-1",
             "section_markdown": "## Section One\n\n" + ("large section. " * 200),
             "section_summary": "large section summary",
             "subsection_headers": ["Evidence basis", "Risk analysis"],
             "source_urls": section_context["source_urls"],
             "status": "completed",
-        },
+        }
     )
+    section_saved = dispatcher.dispatch("app_save_section_result", {"research_id": research_id, "section_id": "section-1", "payload_transfer": section_transfer})
     assert_true(section_saved["section_result"]["section_markdown"].startswith("## Section One"), "section result transfer should save markdown")
     assert_true(section_saved["section_result"]["subsection_headers"] == ["Evidence basis", "Risk analysis"], "section result transfer should save subsection headers")
-    framing_transfer = dispatcher.dispatch(
-        "app_save_report_framing",
-        {"research_id": research_id},
-    )["transfer"]
-    assert_true(framing_transfer["method"] == "POST", "report framing should return transfer descriptor")
-    framing_saved = post_json(
-        framing_transfer["url"],
-        {
+    framing_transfer = dispatcher.transfers.put(
+        prefix=f"research-jobs/{research_id}", kind="framing-input", payload={
+            "research_id": research_id,
             "framing": {
                 "title": "Final",
                 "introduction": "Intro " + ("large intro. " * 200),
                 "conclusion": "Conclusion " + ("large conclusion. " * 200),
             },
-        },
+        }
     )
+    framing_saved = dispatcher.dispatch("app_save_report_framing", {"research_id": research_id, "payload_transfer": framing_transfer})
     assert_true(framing_saved["job"]["stage"] == "assemble_report", "report framing transfer should update stage")
     assert_true(framing_saved["job"]["report_framing"]["title"] == "Final", "report framing transfer should save framing")
     loaded_immediate = dispatcher.dispatch("app_get_research_job", {"research_id": research_id})["job"]
-    loaded = get_json(loaded_immediate["job_transfer"]["url"])["job"]
-    assert_true("section_markdown" not in loaded["section_results"]["section-1"], "job view should not include section markdown")
+    assert_true("job_transfer" not in loaded_immediate, "compact section status refresh should not create APS transfers")
+    loaded_payload = dispatcher.transfers.read(dispatcher.dispatch("app_get_research_job_payload", {"research_id": research_id})["transfer"])
+    loaded = loaded_payload["job"]
+    assert_true("section_markdown" in loaded["section_results"]["section-1"], "full APS job view should include section markdown")
     assert_true(loaded["section_results"]["section-1"]["subsection_headers"] == ["Evidence basis", "Risk analysis"], "compact job should retain subsection headers")
-    assembled_transfer = dispatcher.dispatch("app_save_assembled_research_result", {"research_id": research_id})["transfer"]
-    assembled = post_json(
-        assembled_transfer["url"],
-        {"report_markdown": "# Final\n\n" + ("assembled report. " * 200), "source_urls": section_context["source_urls"]},
+    assembled_transfer = dispatcher.transfers.put(
+        prefix=f"research-jobs/{research_id}", kind="assembled-input", payload={"research_id": research_id, "report_markdown": "# Final\n\n" + ("assembled report. " * 200), "source_urls": section_context["source_urls"]},
     )
+    assembled = dispatcher.dispatch("app_save_assembled_research_result", {"research_id": research_id, "payload_transfer": assembled_transfer})
     assert_true(assembled["result"]["report_markdown"].startswith("# Final"), "assembled result transfer should save final report")
     final_immediate = dispatcher.dispatch("app_get_research_job", {"research_id": research_id})["job"]
-    final_job = get_json(final_immediate["job_transfer"]["url"])["job"]
+    final_payload = dispatcher.transfers.read(dispatcher.dispatch("app_get_research_job_payload", {"research_id": research_id})["transfer"])
+    final_job = final_payload["job"]
     assert_true("report_markdown" not in final_job["result"], "final job view should not include full report")
-    assert_true(final_immediate["result_transfer"]["method"] == "GET", "final job should expose result read transfer")
+    assert_true(final_payload["result"]["report_markdown"].startswith("# Final"), "one APS payload should include the complete report")
+    assert_true("job_transfer" not in final_immediate and "result_transfer" not in final_immediate, "completed compact reads must remain APS-free")
 
 
 def test_section_context_can_filter_one_deep_research_iteration(tmp_path: Path):
@@ -534,7 +571,7 @@ def test_section_context_can_filter_one_deep_research_iteration(tmp_path: Path):
     root = tmp_path / ".research"
     jobs = JobStore(root=root)
     selector = CapturingSelector()
-    dispatcher = AppDispatcher(settings=SettingsStore(root=root), jobs=jobs, selector=selector)
+    dispatcher = AppDispatcher(settings=SettingsStore(root=root), jobs=jobs, selector=selector, transfers=MemoryTransfers())
     job = jobs.create(query="deep section")
     research_id = job["research_id"]
     jobs.save_confirmed_outline(
@@ -659,8 +696,8 @@ def test_source_test_transfer(tmp_path: Path):
     )
     assert_true("test" not in result, "source test should not return debug payload through stdio")
     transfer = result["test_transfer"]
-    assert_true(transfer["method"] == "GET", "source test should return read transfer")
-    test = get_json(transfer["url"])["test"]
+    assert_true(transfer["path"].startswith("research-source-tests/"), "source test should return APS transfer")
+    test = dispatcher.transfers.read(transfer)["test"]
     assert_true(test["source_id"] == "tavily", "source test transfer should return result")
     assert_true("pages" in test, "source test transfer should include debug pages")
 
@@ -796,15 +833,17 @@ def test_plugin_contract(tmp_path: Path):
     try:
         init = plugin.call("initialize", {"protocolVersion": "2.0"})
         assert_true(init["result"]["protocolVersion"] == "2.0", "initialize should negotiate v2")
-        assert_true(init["result"].get("client_capabilities") == {"embeddings": {}}, "tool should declare embeddings")
-        assert_true(init["result"].get("capabilities") == {"sampling": {}}, "tool should declare sampling capability")
+        assert_true(init["result"].get("client_capabilities") == {"embeddings": {}, "storage": {}}, "tool should negotiate embeddings and APS storage clients")
+        assert_true(init["result"].get("capabilities") == {"sampling": {}}, "tool should declare host sampling capability")
         describe = plugin.call("describe")
         tools = [tool["name"] for tool in describe["result"]["tools"]]
         assert_true(describe["result"]["name"] == "tool-xhz-researcher-python-e7k8xa3s", "describe should advertise tool")
-        assert_true(describe["result"]["version"] == "0.2.6", "describe should advertise the current tool version")
+        assert_true(describe["result"]["version"] == "0.3.0", "describe should advertise the current tool version")
         assert_true("research" not in tools, "legacy research method should be absent")
         assert_true("app_search_web" not in tools, "legacy app_search_web must be removed")
         assert_true("app_call_section_research_source" in tools, "section source method must be advertised")
+        assert_true("app_get_section_result" in tools, "section result APS read method must be advertised")
+        assert_true("app_get_research_job_payload" in tools, "full job APS read method must be advertised")
         assert_true("app_generate_outline_draft" in tools, "backend outline orchestration method must be advertised")
         assert_true("app_call_outline_discovery_source" not in tools, "internal outline search must not be advertised")
         assert_true("app_select_outline_discovery_context" not in tools, "outline context HTTP method must be removed")
@@ -831,24 +870,11 @@ def test_plugin_contract(tmp_path: Path):
         plugin.close()
 
 
-def post_json(url: str, payload: dict):
-    data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(url, data=data, method="POST", headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=5) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def get_json(url: str):
-    request = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(request, timeout=5) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
 def test_bundle_contract():
     bundle_js = "\n".join(path.read_text(encoding="utf-8") for path in (APP_ROOT / "bundle").glob("assets/*.js"))
     manifest = json.loads((APP_ROOT / "manifest.json").read_text(encoding="utf-8"))
     assert_true(manifest["required_executas"][0]["tool_id"] == "bundled:researcher", "manifest should reference bundled researcher tool")
-    assert_true(manifest["required_executas"][0]["min_version"] == "0.2.6", "manifest should require tool 0.2.6")
+    assert_true(manifest["required_executas"][0]["min_version"] == "0.3.0", "manifest should require tool 0.3.0")
     assert_true(manifest["ui"]["host_api"]["llm"] == ["complete", "embed"], "manifest should authorize completion and Executa-backed embeddings")
     assert_true(manifest["ui"]["host_api"]["agent"]["session"]["auto"] is True, "manifest should authorize agent auto sessions")
     assert_true(manifest["ui"]["host_api"]["agent"]["tools"] == [], "section sessions should not receive researcher tools")
